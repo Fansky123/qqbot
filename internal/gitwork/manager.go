@@ -164,7 +164,7 @@ func (m Manager) Remove(ctx context.Context, repoPath, worktree string) error {
 	if err != nil {
 		return fmt.Errorf("resolve repository: %w", err)
 	}
-	if _, err := runGit(ctx, repo, "worktree", "remove", worktree); err != nil {
+	if _, err := runGit(ctx, repo, "worktree", "remove", "--force", worktree); err != nil {
 		return fmt.Errorf("remove worktree: %w", err)
 	}
 	return nil

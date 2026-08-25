@@ -58,6 +58,7 @@ func TestManagerPrepareAndRemove(t *testing.T) {
 		t.Fatalf("Git common dir = %q, want %q", first.GitCommonDir, wantCommonDir)
 	}
 
+	writeFile(t, filepath.Join(first.Path, "untracked.txt"), "unfinished task output\n")
 	if err := manager.Remove(ctx, fixture.project.RepoPath, first.Path); err != nil {
 		t.Fatal(err)
 	}
@@ -67,9 +68,37 @@ func TestManagerPrepareAndRemove(t *testing.T) {
 	if _, err := os.Stat(second.Path); err != nil {
 		t.Fatalf("second worktree was affected: %v", err)
 	}
+	assertWorktree(t, fixture.worktreeRoot, second)
 	listed := git(t, fixture.project.RepoPath, "worktree", "list", "--porcelain")
 	if strings.Contains(listed, first.Path) {
 		t.Fatalf("removed worktree remains registered:\n%s", listed)
+	}
+	if !strings.Contains(listed, "worktree "+second.Path+"\n") {
+		t.Fatalf("second worktree is no longer registered:\n%s", listed)
+	}
+}
+
+func TestManagerRemoveDoesNotOverrideWorktreeLock(t *testing.T) {
+	t.Parallel()
+
+	fixture := newGitFixture(t)
+	manager := Manager{Root: fixture.worktreeRoot}
+	prepared, err := manager.Prepare(context.Background(), fixture.project, firstTaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	git(t, fixture.project.RepoPath, "worktree", "lock", prepared.Path)
+
+	err = manager.Remove(context.Background(), fixture.project.RepoPath, prepared.Path)
+	if err == nil || !strings.Contains(err.Error(), "remove worktree") {
+		t.Fatalf("Remove() error = %v, want preserved Git removal error", err)
+	}
+	if _, err := os.Stat(prepared.Path); err != nil {
+		t.Fatalf("locked worktree was removed: %v", err)
+	}
+	listed := git(t, fixture.project.RepoPath, "worktree", "list", "--porcelain")
+	if !strings.Contains(listed, "worktree "+prepared.Path+"\n") {
+		t.Fatalf("locked worktree is no longer registered:\n%s", listed)
 	}
 }
 
