@@ -226,6 +226,56 @@ func TestManagerPrepareRollsBackAfterCommonDirCancellation(t *testing.T) {
 	assertWorktree(t, fixture.worktreeRoot, prepared)
 }
 
+func TestManagerPrepareDeletesBranchWhenRollbackRemoveReportsFailureAfterSuccess(t *testing.T) {
+	fixture := newGitFixture(t)
+	helper := setupGitHelper(t, "common-dir-error-remove-success-then-error")
+	manager := Manager{Root: fixture.worktreeRoot}
+
+	_, err := manager.Prepare(context.Background(), fixture.project, firstTaskID)
+	if err == nil {
+		t.Fatal("Prepare() error = nil, want common-dir and rollback errors")
+	}
+	for _, want := range []string{"forced common-dir failure", "forced remove failure after success"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Prepare() error = %v, want containing %q", err, want)
+		}
+	}
+	assertTaskArtifactsAbsent(t, fixture, firstTaskID)
+
+	writeFile(t, helper.modePath, "pass")
+	prepared, err := manager.Prepare(context.Background(), fixture.project, firstTaskID)
+	if err != nil {
+		t.Fatalf("deterministic retry failed: %v", err)
+	}
+	assertWorktree(t, fixture.worktreeRoot, prepared)
+}
+
+func TestRollbackPreparedWorktreePreservesAttachedBranchAfterRemoveFailure(t *testing.T) {
+	fixture := newGitFixture(t)
+	manager := Manager{Root: fixture.worktreeRoot}
+	prepared, err := manager.Prepare(context.Background(), fixture.project, firstTaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	git(t, fixture.project.RepoPath, "worktree", "lock", prepared.Path)
+
+	err = rollbackPreparedWorktree(fixture.project.RepoPath, prepared.Path, prepared.Branch)
+	if err == nil {
+		t.Fatal("rollbackPreparedWorktree() error = nil, want removal and attached-branch errors")
+	}
+	for _, want := range []string{"roll back worktree", "while it is attached"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("rollbackPreparedWorktree() error = %v, want containing %q", err, want)
+		}
+	}
+	if _, err := os.Stat(prepared.Path); err != nil {
+		t.Fatalf("locked worktree was removed: %v", err)
+	}
+	if branch := git(t, fixture.project.RepoPath, "branch", "--list", prepared.Branch); branch == "" {
+		t.Fatal("attached task branch was deleted")
+	}
+}
+
 func TestManagerValidateCommit(t *testing.T) {
 	t.Parallel()
 
@@ -848,6 +898,18 @@ func runGitHelper() int {
 			if exitCode := runRealGit(realGit); exitCode != 0 {
 				return exitCode
 			}
+			return 42
+		}
+	case "common-dir-error-remove-success-then-error":
+		if hasArgSequence(os.Args[1:], "rev-parse", "--git-common-dir") {
+			_, _ = os.Stderr.WriteString("forced common-dir failure\n")
+			return 41
+		}
+		if command == "worktree" && hasArgSequence(os.Args[1:], "worktree", "remove") {
+			if exitCode := runRealGit(realGit); exitCode != 0 {
+				return exitCode
+			}
+			_, _ = os.Stderr.WriteString("forced remove failure after success\n")
 			return 42
 		}
 	}

@@ -96,10 +96,11 @@ func (m Manager) Prepare(ctx context.Context, project config.Project, taskID str
 func rollbackPreparedWorktree(repo, worktree, branch string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), prepareRollbackTimeout)
 	defer cancel()
+	var removeErr error
 	if _, err := runGit(ctx, repo, "worktree", "remove", "--force", worktree); err != nil {
-		return fmt.Errorf("roll back worktree: %w", err)
+		removeErr = fmt.Errorf("roll back worktree: %w", err)
 	}
-	return deleteTaskBranchIfUnattached(ctx, repo, branch)
+	return errors.Join(removeErr, deleteTaskBranchIfUnattached(ctx, repo, branch))
 }
 
 func rollbackFailedAdd(repo, worktree, branch string) error {
