@@ -1,0 +1,35 @@
+{
+  "onebot": {
+    "url": "ws://127.0.0.1:3001",
+    "access_token_env": "NAPCAT_ACCESS_TOKEN",
+    "self_id": "10001",
+    "message_runes": 1200
+  },
+  "database_path": "/var/lib/qqcodex/tasks.db",
+  "log_dir": "/var/log/qqcodex",
+  "worktree_root": "/srv/qqcodex/worktrees",
+  "message_workers": 4,
+  "allowed_group_ids": ["10002"],
+  "employee_ids": ["10001"],
+  "admin_ids": ["10001"],
+  "codex": {
+    "binary": "codex",
+    "environment_keep": ["PATH"]
+  },
+  "ops_command": ["./qqcodex-ops", "-config", "./configs/ops.json"],
+  "projects": [
+    {
+      "id": "order-api",
+      "aliases": ["orders", "订单"],
+      "repo_path": "/srv/repos/order-api",
+      "base_branch": "main",
+      "rc_branch": "rc",
+      "remote": "origin",
+      "checks": [["go", "test", "./..."]],
+      "deploy_action": "order-rc",
+      "max_concurrent": 2,
+      "codex_timeout_seconds": 1800,
+      "log_retention_days": 7
+    }
+  ]
+}
