@@ -938,7 +938,7 @@ Expected: FAIL because `Scheduler` is undefined.
 
 - [ ] **Step 3: Extend ports for execution dependencies**
 
-Add typed interfaces for `Runner`, `Worktrees`, and `Operator` matching the methods from Tasks 5-7, including `PushTaskBundle` with an `io.Reader` bundle input. Do not expose `exec.Cmd`, raw SQL, source repository paths, or unvalidated argv through these interfaces.
+Add typed interfaces for `Runner`, `Worktrees`, and `Operator` matching the methods from Tasks 5-7. The worker/task service `Operator` interface exposes `PushTask(ctx context.Context, projectID, taskID, branch, commit string) error`, implemented by `*ops.Client`. `tasksvc` never sees an `io.Reader`, bundle, or source repository path: `ops.Client` encapsulates source-ref verification, bundle creation, and helper stdin transfer. `PushTaskBundle(..., io.Reader)` remains an internal boundary between the ops helper CLI and `ops.Operator`. Do not expose `exec.Cmd`, raw SQL, source repository paths, or unvalidated argv through task-service interfaces.
 
 - [ ] **Step 4: Implement persistent polling and concurrency**
 
