@@ -250,6 +250,24 @@ func TestRunnerExecuteArguments(t *testing.T) {
 	assertNoFinalOutputFile(t, runner.LogDir)
 }
 
+func TestRunnerParsesStructuredBlockedEvent(t *testing.T) {
+	runner, req, _ := helperRunner(t)
+	req.GitCommonDir = t.TempDir()
+	setEnv(t, helperStdout, "{\"type\":\"thread.started\",\"thread_id\":\"thread-blocked\"}\n{\"type\":\"task.blocked\",\"reason\":\"need the deployment target\"}\n")
+	runner.KeepEnv = append(runner.KeepEnv, helperStdout)
+
+	result, err := runner.Execute(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Blocked || result.BlockedReason != "need the deployment target" {
+		t.Fatalf("blocked result = %#v, want bounded structured reason", result)
+	}
+	if result.SessionID != "thread-blocked" {
+		t.Fatalf("blocked session = %q, want thread-blocked", result.SessionID)
+	}
+}
+
 func TestRunnerResumeArgumentsAndWorkingDirectory(t *testing.T) {
 	runner, req, recordPath := helperRunner(t)
 	req.SessionID = "session-exact"

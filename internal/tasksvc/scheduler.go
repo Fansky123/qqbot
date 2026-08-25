@@ -377,6 +377,18 @@ func (s *Scheduler) runTask(ctx context.Context, taskID string, project config.P
 	}
 	task.SessionID = result.SessionID
 	task.Summary = bound(s.safeText(result.Final))
+	if result.Blocked {
+		reason := bound(s.safeText(result.BlockedReason))
+		if reason == "" {
+			reason = "Codex 请求补充任务信息"
+		}
+		task.Failure = reason
+		if !s.transition(ctx, task, model.StatusBlocked, false) {
+			return
+		}
+		s.notify(ctx, task.GroupID, "任务 #"+task.ID+" 暂停，需要补充信息："+reason+"。请回复：补充 #"+task.ID+" <补充内容>")
+		return
+	}
 	if !s.checkpoint(ctx, task, "stored Codex session and summary") {
 		return
 	}
@@ -637,7 +649,7 @@ func (s *Scheduler) stopped(ctx context.Context, taskID string) bool {
 func (s *Scheduler) completion(task *model.Task, project config.Project) string {
 	checks := make([]string, 0, len(project.Checks))
 	for _, check := range project.Checks {
-		checks = append(checks, strings.Join(check, " "))
+		checks = append(checks, strings.Join(check, " ")+" （通过）")
 	}
 	checksText := s.safeText(strings.Join(checks, "、"))
 	summary := s.safeText(task.Summary)

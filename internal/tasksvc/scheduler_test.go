@@ -646,6 +646,36 @@ func TestSchedulerFailuresNeverAdvanceToApproval(t *testing.T) {
 	}
 }
 
+func TestSchedulerPersistsBlockedResultForSupplement(t *testing.T) {
+	fixture := newSchedulerFixture(t, 1)
+	taskID := "T-000000000151"
+	fixture.createTask(t, taskID, "p1")
+	fixture.runner.resultByTask[taskID] = codex.Result{
+		SessionID:     "session-blocked",
+		Final:         "waiting for a missing detail",
+		Blocked:       true,
+		BlockedReason: "need the deployment target",
+	}
+	cancel, done := fixture.run(t)
+	waitTaskStatus(t, fixture.db, taskID, model.StatusBlocked)
+	cancel()
+	waitRun(t, done)
+
+	task := mustTask(t, fixture.db, taskID)
+	if task.SessionID != "session-blocked" || task.Failure != "need the deployment target" {
+		t.Fatalf("blocked task = %#v, want session and reason persisted", task)
+	}
+	if fixture.operator.pushes(taskID) != 0 {
+		t.Fatal("blocked task was pushed")
+	}
+	messages := strings.Join(fixture.notifier.all(), "\n")
+	for _, want := range []string{"需要补充信息", "need the deployment target", "补充 #" + taskID} {
+		if !strings.Contains(messages, want) {
+			t.Fatalf("blocked notification lacks %q: %q", want, messages)
+		}
+	}
+}
+
 func TestSchedulerCancellationDuringRunnerAndChecksPreservesCancelled(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -816,6 +846,23 @@ func TestSchedulerCompletionPreservesApprovalCommandAtRuneLimit(t *testing.T) {
 	} {
 		if !strings.Contains(message, want) {
 			t.Errorf("bounded completion lacks %q: %q", want, message)
+		}
+	}
+}
+
+func TestSchedulerCompletionListsEveryCheckAsPassed(t *testing.T) {
+	fixture := newSchedulerFixture(t, 1)
+	scheduler := fixture.scheduler(t)
+	project, ok := fixture.registry.ProjectByID("p1")
+	if !ok {
+		t.Fatal("project p1 missing")
+	}
+	project.Checks = [][]string{{"go", "test", "./..."}, {"go", "vet", "./..."}}
+	task := &model.Task{ID: "T-000000000371", Branch: "codex/T-000000000371", TaskCommit: schedulerTaskCommit}
+	message := scheduler.completion(task, project)
+	for _, want := range []string{"go test ./... （通过）", "go vet ./... （通过）"} {
+		if !strings.Contains(message, want) {
+			t.Errorf("completion lacks %q: %q", want, message)
 		}
 	}
 }
