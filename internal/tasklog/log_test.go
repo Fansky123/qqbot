@@ -236,6 +236,41 @@ func TestRedactTextIsIdempotentForSingleCharacterSecret(t *testing.T) {
 	}
 }
 
+func TestRedactTextMatchesSecretsContainingMarker(t *testing.T) {
+	secrets := []string{
+		"prefix[REDACTED]suffix",
+		"[REDACTED]suffix",
+		"quote\"[REDACTED]\\suffix",
+	}
+	logs, err := Open(t.TempDir(), secrets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range secrets {
+		encoded, err := json.Marshal(secret)
+		if err != nil {
+			t.Fatal(err)
+		}
+		escaped := string(encoded[1 : len(encoded)-1])
+		for _, value := range []string{secret, escaped} {
+			got := logs.RedactText("before " + value + " after")
+			if got != "before "+redactionMarker+" after" {
+				t.Errorf("RedactText(%q) = %q", value, got)
+			}
+		}
+	}
+	overlapLogs, err := Open(t.TempDir(), append(secrets, "Bearer", "CODEX"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := overlapLogs.RedactText(secrets[0] + " Bearer bearer-value CODEX_API_KEY=codex-secret")
+	for _, leaked := range []string{secrets[0], "bearer-value", "codex-secret"} {
+		if strings.Contains(got, leaked) {
+			t.Errorf("overlapping exact/generic redaction leaked %q: %q", leaked, got)
+		}
+	}
+}
+
 func TestSummaryIsUnicodeSafeBoundedAndReredacted(t *testing.T) {
 	t.Parallel()
 	store := openStore(t, []string{"summary-secret"})

@@ -220,10 +220,31 @@ func (s *Service) create(ctx context.Context, message Message, parsed command.Co
 		return err
 	}
 	plan = s.sanitizePlan(plan)
+	if err := validatePlan(plan); err != nil {
+		if transitionErr := s.transition(task, model.StatusFailed); transitionErr != nil {
+			return errors.Join(err, transitionErr)
+		}
+		task.Failure = "invalid planning result"
+		if recordErr := s.commitMutation(ctx, message, key, task, task.Version, "create", "invalid planning result"); recordErr != nil {
+			return errors.Join(err, recordErr)
+		}
+		return err
+	}
 
 	planJSON, err := json.Marshal(plan)
 	if err != nil {
 		return fmt.Errorf("encode task plan: %w", err)
+	}
+	if len(planJSON) > maxPlanBytes {
+		err := errors.New("sanitized planning result is too large")
+		if transitionErr := s.transition(task, model.StatusFailed); transitionErr != nil {
+			return errors.Join(err, transitionErr)
+		}
+		task.Failure = "invalid planning result"
+		if recordErr := s.commitMutation(ctx, message, key, task, task.Version, "create", "invalid planning result"); recordErr != nil {
+			return errors.Join(err, recordErr)
+		}
+		return err
 	}
 	task.Plan = string(planJSON)
 	task.Summary = bound(plan.Summary)

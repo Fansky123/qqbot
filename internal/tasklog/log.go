@@ -25,7 +25,6 @@ const (
 	maxRecordDataBytes  = 2 << 20
 	maxTaskLogBytes     = 64 << 20
 	redactionMarker     = "[REDACTED]"
-	redactionSentinel   = "\x00"
 )
 
 // ErrLimitExceeded reports that a record or task log reached its hard limit.
@@ -44,13 +43,12 @@ var (
 type Store struct {
 	Root string
 
-	secrets        []string
-	secretRedactor *strings.Replacer
-	rootDev        uint64
-	rootIno        uint64
-	locksMu        sync.Mutex
-	locks          map[string]*sync.Mutex
-	limited        map[string]bool
+	secrets []string
+	rootDev uint64
+	rootIno uint64
+	locksMu sync.Mutex
+	locks   map[string]*sync.Mutex
+	limited map[string]bool
 
 	maxTaskBytes int64
 }
@@ -92,15 +90,6 @@ func Open(root string, secretValues []string) (*Store, error) {
 		addSecret(string(encoded[1 : len(encoded)-1]))
 	}
 	sort.SliceStable(secrets, func(i, j int) bool { return len(secrets[i]) > len(secrets[j]) })
-	var secretRedactor *strings.Replacer
-	if len(secrets) > 0 {
-		replacements := make([]string, 0, len(secrets)*2)
-		for _, secret := range secrets {
-			replacements = append(replacements, secret, redactionSentinel)
-		}
-		secretRedactor = strings.NewReplacer(replacements...)
-	}
-
 	abs, err := filepath.Abs(root)
 	if err != nil {
 		return nil, fmt.Errorf("make task log root absolute: %w", err)
@@ -127,13 +116,12 @@ func Open(root string, secretValues []string) (*Store, error) {
 	}
 
 	return &Store{
-		Root:           canonical,
-		secrets:        secrets,
-		secretRedactor: secretRedactor,
-		rootDev:        uint64(stat.Dev),
-		rootIno:        stat.Ino,
-		locks:          make(map[string]*sync.Mutex),
-		limited:        make(map[string]bool),
+		Root:    canonical,
+		secrets: secrets,
+		rootDev: uint64(stat.Dev),
+		rootIno: stat.Ino,
+		locks:   make(map[string]*sync.Mutex),
+		limited: make(map[string]bool),
 
 		maxTaskBytes: maxTaskLogBytes,
 	}, nil
@@ -429,13 +417,39 @@ func (s *Store) Remove(taskID string) error {
 }
 
 func (s *Store) redact(value string) string {
-	value = strings.ReplaceAll(value, redactionMarker, redactionSentinel)
-	value = bearerPattern.ReplaceAllString(value, `${1}`+redactionSentinel)
-	value = keyPattern.ReplaceAllString(value, `${1}=`+redactionSentinel)
-	if s.secretRedactor != nil {
-		value = s.secretRedactor.Replace(value)
+	value = bearerPattern.ReplaceAllString(value, `${1}`+redactionMarker)
+	value = keyPattern.ReplaceAllString(value, `${1}=`+redactionMarker)
+	return s.redactExact(value)
+}
+
+func (s *Store) redactExact(value string) string {
+	if len(s.secrets) == 0 {
+		return value
 	}
-	return strings.ReplaceAll(value, redactionSentinel, redactionMarker)
+	var redacted strings.Builder
+	redacted.Grow(len(value))
+	for offset := 0; offset < len(value); {
+		matched := false
+		for _, secret := range s.secrets {
+			if strings.HasPrefix(value[offset:], secret) {
+				redacted.WriteString(redactionMarker)
+				offset += len(secret)
+				matched = true
+				break
+			}
+		}
+		if matched {
+			continue
+		}
+		if strings.HasPrefix(value[offset:], redactionMarker) {
+			redacted.WriteString(redactionMarker)
+			offset += len(redactionMarker)
+			continue
+		}
+		redacted.WriteByte(value[offset])
+		offset++
+	}
+	return redacted.String()
 }
 
 // RedactText removes configured exact secrets and recognized credentials from text.

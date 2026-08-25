@@ -594,6 +594,85 @@ func TestServiceRedactsExactSecretsFromEveryNotificationPath(t *testing.T) {
 	}
 }
 
+func TestServiceRedactsMarkerContainingSecretAcrossReplayAndStatus(t *testing.T) {
+	secret := "quote\"[REDACTED]\\suffix"
+	encodedSecret, err := json.Marshal(secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	escapedSecret := string(encodedSecret[1 : len(encodedSecret)-1])
+	logs, err := tasklog.Open(t.TempDir(), []string{secret})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := codex.Plan{Summary: secret, Scope: []string{escapedSecret}, Checks: []string{}, Risks: []string{}}
+	encodedPlan, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planner := &fakePlanner{result: codex.Result{Final: string(encodedPlan)}}
+	svc, db, _, notifier := testServiceWithLogs(t, planner, logs)
+	ctx := context.Background()
+	create := msg("marker-secret", "u1", "[orders] task")
+	notifier.FailNext()
+	if err := svc.Handle(ctx, create); err == nil {
+		t.Fatal("initial notification failure was not returned")
+	}
+	if err := svc.Handle(ctx, create); err != nil {
+		t.Fatal(err)
+	}
+	id := TaskID("g1", "marker-secret")
+	if err := svc.Handle(ctx, msg("marker-status", "u1", "状态 #"+id)); err != nil {
+		t.Fatal(err)
+	}
+	task, err := db.GetTask(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stored := range []string{task.Plan, task.Summary} {
+		if strings.Contains(stored, secret) || strings.Contains(stored, escapedSecret) {
+			t.Fatalf("stored task leaked marker-containing secret: %q", stored)
+		}
+	}
+	for i, notification := range notifier.Messages() {
+		if strings.Contains(notification, secret) || strings.Contains(notification, escapedSecret) {
+			t.Fatalf("notification %d leaked marker-containing secret: %q", i, notification)
+		}
+	}
+}
+
+func TestServiceRejectsPlanExpandedByRedaction(t *testing.T) {
+	logs, err := tasklog.Open(t.TempDir(), []string{"A"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := codex.Plan{Summary: strings.Repeat("A", 4000), Scope: []string{strings.Repeat("A", 4000)}, Checks: []string{}, Risks: []string{}}
+	encodedPlan, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(encodedPlan) >= maxPlanBytes {
+		t.Fatalf("raw test plan unexpectedly exceeds limit: %d", len(encodedPlan))
+	}
+	planner := &fakePlanner{result: codex.Result{Final: string(encodedPlan)}}
+	svc, db, _, _ := testServiceWithLogs(t, planner, logs)
+	ctx := context.Background()
+	create := msg("expanded-plan", "u1", "[orders] task")
+	if err := svc.Handle(ctx, create); err == nil {
+		t.Fatal("redaction-expanded plan succeeded")
+	}
+	task, err := db.GetTask(ctx, TaskID("g1", "expanded-plan"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Status != model.StatusFailed || task.Plan != "" || task.Summary != "" {
+		t.Fatalf("redaction-expanded task = %#v", task)
+	}
+	if processed, err := db.MessageProcessed(ctx, "g1\x00expanded-plan"); err != nil || !processed {
+		t.Fatalf("expanded plan processed=%v err=%v", processed, err)
+	}
+}
+
 type unredactedLogs struct{}
 
 func (unredactedLogs) Summary(string, int) (string, error) { return "", nil }
