@@ -489,6 +489,15 @@ func TestAppendRejectsOversizedRecordWithoutLimitingTask(t *testing.T) {
 	}
 }
 
+func TestAppendAcceptsBoundedCallerPayloadWithFramingMarker(t *testing.T) {
+	t.Parallel()
+	store := openStore(t, nil)
+	data := bytes.Repeat([]byte{'x'}, maxRecordDataBytes-256)
+	if err := store.Append(testTaskID, "codex.stderr", data); err != nil {
+		t.Fatalf("Append() error = %v, want bounded caller payload accepted", err)
+	}
+}
+
 func TestAppendEnforcesTaskLimitAndWritesOneMarker(t *testing.T) {
 	t.Parallel()
 	store := openStore(t, nil)

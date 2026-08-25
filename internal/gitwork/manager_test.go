@@ -701,6 +701,32 @@ func TestManagerRunChecksBoundsFailureOutput(t *testing.T) {
 	}
 }
 
+func TestManagerRunChecksWritesBoundedOutputToRealTaskLogStore(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	worktree := filepath.Join(root, "worktree")
+	if err := os.Mkdir(worktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store, err := tasklog.Open(filepath.Join(root, "logs"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	project := config.Project{Checks: [][]string{checkHelperCommand("large-output")}}
+
+	err = (Manager{Root: root}).RunChecks(context.Background(), project, worktree, store.Writer(firstTaskID, "checks"))
+	if err == nil {
+		t.Fatal("RunChecks() error = nil, want failed check error")
+	}
+	summary, err := store.Summary(firstTaskID, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(summary, "check output truncated") {
+		t.Fatalf("task log omitted check truncation marker: %q", summary)
+	}
+}
+
 func TestGitworkCheckHelperProcess(t *testing.T) {
 	args := checkHelperArgs()
 	if len(args) == 0 {

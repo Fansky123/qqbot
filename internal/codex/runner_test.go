@@ -17,26 +17,29 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"qqcodex/internal/model"
 	"qqcodex/internal/tasklog"
 )
 
 const (
-	helperEnabled   = "GO_WANT_CODEX_HELPER"
-	helperRecord    = "QQ_CODEX_HELPER_RECORD"
-	helperFinal     = "QQ_CODEX_HELPER_FINAL"
-	helperFinalSize = "QQ_CODEX_HELPER_FINAL_SIZE"
-	helperStderr    = "QQ_CODEX_HELPER_STDERR"
-	helperExit      = "QQ_CODEX_HELPER_EXIT"
-	helperSleep     = "QQ_CODEX_HELPER_SLEEP"
-	helperLarge     = "QQ_CODEX_HELPER_LARGE"
-	helperSpawn     = "QQ_CODEX_HELPER_SPAWN"
-	helperPID       = "QQ_CODEX_HELPER_PID"
-	helperChild     = "QQ_CODEX_HELPER_CHILD"
-	helperStdout    = "QQ_CODEX_HELPER_STDOUT"
-	helperDirty     = "QQ_CODEX_HELPER_DIRTY_TEMP"
-	helperMany      = "QQ_CODEX_HELPER_MANY_EVENTS"
+	helperEnabled     = "GO_WANT_CODEX_HELPER"
+	helperRecord      = "QQ_CODEX_HELPER_RECORD"
+	helperFinal       = "QQ_CODEX_HELPER_FINAL"
+	helperFinalSize   = "QQ_CODEX_HELPER_FINAL_SIZE"
+	helperFinalSecret = "QQ_CODEX_HELPER_FINAL_SECRET"
+	helperStderr      = "QQ_CODEX_HELPER_STDERR"
+	helperStderrSize  = "QQ_CODEX_HELPER_STDERR_SIZE"
+	helperExit        = "QQ_CODEX_HELPER_EXIT"
+	helperSleep       = "QQ_CODEX_HELPER_SLEEP"
+	helperLarge       = "QQ_CODEX_HELPER_LARGE"
+	helperSpawn       = "QQ_CODEX_HELPER_SPAWN"
+	helperPID         = "QQ_CODEX_HELPER_PID"
+	helperChild       = "QQ_CODEX_HELPER_CHILD"
+	helperStdout      = "QQ_CODEX_HELPER_STDOUT"
+	helperDirty       = "QQ_CODEX_HELPER_DIRTY_TEMP"
+	helperMany        = "QQ_CODEX_HELPER_MANY_EVENTS"
 )
 
 type helperRecordData struct {
@@ -92,6 +95,9 @@ func runCodexHelper() {
 		if size, _ := strconv.Atoi(os.Getenv(helperFinalSize)); size > 0 {
 			final = strings.Repeat("h", size/2) + strings.Repeat("t", size-size/2)
 		}
+		if secret := os.Getenv(helperFinalSecret); secret != "" {
+			final = strings.Repeat("p", maxFinalBytes/2-len(secret)/2) + secret + strings.Repeat("q", maxFinalBytes)
+		}
 		_ = os.WriteFile(record.LastPath, []byte(final), 0o600)
 	}
 	data, err := json.Marshal(record)
@@ -136,7 +142,11 @@ func runCodexHelper() {
 		}
 		helperPrintln(`{"type":"item.completed","item":{"type":"agent_message","text":"done"}}`)
 	}
-	_, _ = fmt.Fprint(os.Stderr, os.Getenv(helperStderr))
+	stderr := os.Getenv(helperStderr)
+	if size, _ := strconv.Atoi(os.Getenv(helperStderrSize)); size > 0 {
+		stderr = strings.Repeat("s", size)
+	}
+	_, _ = fmt.Fprint(os.Stderr, stderr)
 	if delay, _ := time.ParseDuration(os.Getenv(helperSleep)); delay > 0 {
 		time.Sleep(delay)
 	}
@@ -194,8 +204,11 @@ func TestRunnerPlanArgumentsAndTemporaryFiles(t *testing.T) {
 	if record.SchemaPath == record.LastPath || record.SchemaPath == "" || record.LastPath == "" {
 		t.Fatalf("temporary paths are not distinct: schema=%q last=%q", record.SchemaPath, record.LastPath)
 	}
-	if record.SchemaMode != 0o600 || record.LastMode != 0o600 {
-		t.Fatalf("temporary modes = %o and %o, want 600", record.SchemaMode, record.LastMode)
+	if record.SchemaMode != 0o600 {
+		t.Fatalf("schema mode = %o, want 600", record.SchemaMode)
+	}
+	if record.LastPath != "/proc/self/fd/3" {
+		t.Fatalf("final output path = %q, want inherited pipe", record.LastPath)
 	}
 	wantSchema, err := os.ReadFile("schema.json")
 	if err != nil {
@@ -205,7 +218,7 @@ func TestRunnerPlanArgumentsAndTemporaryFiles(t *testing.T) {
 		t.Fatalf("schema content differs from embedded schema")
 	}
 	assertRemoved(t, record.SchemaPath)
-	assertRemoved(t, record.LastPath)
+	assertNoFinalOutputFile(t, runner.LogDir)
 	if result.SessionID != "thread-123" || result.Final != "final answer" {
 		t.Fatalf("unexpected result: %#v", result)
 	}
@@ -234,7 +247,7 @@ func TestRunnerExecuteArguments(t *testing.T) {
 		t.Fatalf("--add-dir count = %d, want 1", got)
 	}
 	assertPrivateGitTemp(t, record, req.GitCommonDir)
-	assertRemoved(t, record.LastPath)
+	assertNoFinalOutputFile(t, runner.LogDir)
 }
 
 func TestRunnerResumeArgumentsAndWorkingDirectory(t *testing.T) {
@@ -520,6 +533,29 @@ func TestRunnerReturnsPartialResultWithoutStderrOnFailure(t *testing.T) {
 	}
 }
 
+func TestRunnerLogsTruncatedStderrWithRealTaskLogStore(t *testing.T) {
+	runner, req, _ := helperRunner(t)
+	req.TaskID = "T-ABCDEF012345"
+	setEnv(t, helperStderrSize, strconv.Itoa(maxStderrBytes+1024))
+	runner.KeepEnv = append(runner.KeepEnv, helperStderrSize)
+	store, err := tasklog.Open(filepath.Join(t.TempDir(), "task-logs"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner.Log = store
+
+	if _, err := runner.Plan(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	summary, err := store.Summary(req.TaskID, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(summary, "codex stderr truncated") {
+		t.Fatalf("task log omitted stderr truncation marker: %q", summary)
+	}
+}
+
 func TestRunnerRoutesEventsStderrAndFinalToLogSink(t *testing.T) {
 	runner, req, _ := helperRunner(t)
 	req.TaskID = "T-ABCDEF012345"
@@ -661,7 +697,7 @@ func TestRunnerTaskLogRedactsJSONEscapedSecretForms(t *testing.T) {
 func TestRunnerOversizedEventFailsThroughTaskLogSink(t *testing.T) {
 	runner, req, _ := helperRunner(t)
 	req.TaskID = "T-ABCDEF012345"
-	setEnv(t, helperLarge, strconv.Itoa((1<<20)+1024))
+	setEnv(t, helperLarge, strconv.Itoa((2<<20)+1024))
 	runner.KeepEnv = append(runner.KeepEnv, helperLarge)
 	store, err := tasklog.Open(filepath.Join(t.TempDir(), "task-logs"), nil)
 	if err != nil {
@@ -675,7 +711,7 @@ func TestRunnerOversizedEventFailsThroughTaskLogSink(t *testing.T) {
 	}
 }
 
-func TestRunnerBoundsOversizedFinalAndReturnsHeadAndTail(t *testing.T) {
+func TestRunnerBoundsOversizedFinalAndReturnsMarkerOnly(t *testing.T) {
 	runner, req, _ := helperRunner(t)
 	setEnv(t, helperFinalSize, strconv.Itoa(maxFinalBytes+4096))
 	runner.KeepEnv = append(runner.KeepEnv, helperFinalSize)
@@ -686,14 +722,73 @@ func TestRunnerBoundsOversizedFinalAndReturnsHeadAndTail(t *testing.T) {
 	if !errors.Is(err, ErrFinalTooLarge) {
 		t.Fatalf("Plan() error = %v, want final output limit", err)
 	}
-	if len(result.Final) != maxFinalBytes || !strings.Contains(result.Final, finalTruncationMarker) {
-		t.Fatalf("bounded final length = %d, marker present = %t", len(result.Final), strings.Contains(result.Final, finalTruncationMarker))
-	}
-	if !strings.HasPrefix(result.Final, strings.Repeat("h", 32)) || !strings.HasSuffix(result.Final, strings.Repeat("t", 32)) {
-		t.Fatal("bounded final did not preserve head and tail")
+	if result.Final != finalTruncationMarker || !utf8.ValidString(result.Final) {
+		t.Fatalf("bounded final = %q, want valid marker only", result.Final)
 	}
 	if got := sink.joined("codex.final"); got != result.Final {
 		t.Fatalf("logged final differs from bounded Result: length=%d", len(got))
+	}
+}
+
+func TestRunnerStreamsOversizedFinalThroughPipeWithoutLeavingFile(t *testing.T) {
+	runner, req, _ := helperRunner(t)
+	req.TaskID = "T-ABCDEF012345"
+	setEnv(t, helperFinalSize, strconv.Itoa(32<<20))
+	runner.KeepEnv = append(runner.KeepEnv, helperFinalSize)
+	store, err := tasklog.Open(filepath.Join(t.TempDir(), "task-logs"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner.Log = store
+
+	result, err := runner.Plan(context.Background(), req)
+	if !errors.Is(err, ErrFinalTooLarge) {
+		t.Fatalf("Plan() error = %v, want final output limit", err)
+	}
+	if result.Final != finalTruncationMarker {
+		t.Fatalf("final = %q, want marker only", result.Final)
+	}
+	assertNoFinalOutputFile(t, runner.LogDir)
+	summary, err := store.Summary(req.TaskID, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(summary, "codex final output truncated") || strings.Contains(summary, strings.Repeat("h", 64)) {
+		t.Fatalf("task log summary retained oversized final data: %q", summary)
+	}
+}
+
+func TestRunnerDropsOversizedFinalBeforeTaskLogRedaction(t *testing.T) {
+	runner, req, _ := helperRunner(t)
+	req.TaskID = "T-ABCDEF012345"
+	secret := strings.Repeat("密", 100) + `quote"\\` + "\tcontrol"
+	setEnv(t, helperFinalSecret, secret)
+	runner.KeepEnv = append(runner.KeepEnv, helperFinalSecret)
+	store, err := tasklog.Open(filepath.Join(t.TempDir(), "task-logs"), []string{secret})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner.Log = store
+
+	result, err := runner.Plan(context.Background(), req)
+	if !errors.Is(err, ErrFinalTooLarge) || result.Final != finalTruncationMarker {
+		t.Fatalf("final result = %q, error = %v; want marker and ErrFinalTooLarge", result.Final, err)
+	}
+	raw, err := os.ReadFile(filepath.Join(store.Root, req.TaskID+".log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	summary, err := store.Summary(req.TaskID, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range []string{string(raw), summary, result.Final} {
+		if strings.Contains(value, secret) || strings.Contains(value, "quote") || strings.Contains(value, "control") {
+			t.Fatalf("oversized final secret leaked: %q", value)
+		}
+	}
+	if !utf8.ValidString(result.Final) {
+		t.Fatal("final marker is not valid UTF-8")
 	}
 }
 
@@ -713,7 +808,7 @@ func TestRunnerAcceptsLargeJSONLLine(t *testing.T) {
 
 func TestRunnerReturnsScannerErrorWithPartialResult(t *testing.T) {
 	runner, req, _ := helperRunner(t)
-	setEnv(t, helperLarge, strconv.Itoa(2<<20))
+	setEnv(t, helperLarge, strconv.Itoa((3<<20)+1024))
 	runner.KeepEnv = append(runner.KeepEnv, helperLarge)
 
 	result, err := runner.Plan(context.Background(), req)
@@ -901,7 +996,7 @@ func TestRunnerRemovesTemporaryFilesAfterFailure(t *testing.T) {
 	}
 	record := readHelperRecord(t, recordPath)
 	assertRemoved(t, record.SchemaPath)
-	assertRemoved(t, record.LastPath)
+	assertNoFinalOutputFile(t, runner.LogDir)
 }
 
 func TestRunnerRemovesTemporaryFilesWhenStartFails(t *testing.T) {
@@ -1154,7 +1249,7 @@ func helperRunner(t *testing.T) (Runner, Request, string) {
 	setEnv(t, helperEnabled, "1")
 	setEnv(t, helperRecord, recordPath)
 	for _, name := range []string{
-		helperFinal, helperFinalSize, helperStderr, helperExit, helperSleep, helperLarge, helperSpawn,
+		helperFinal, helperFinalSize, helperFinalSecret, helperStderr, helperStderrSize, helperExit, helperSleep, helperLarge, helperSpawn,
 		helperPID, helperChild, helperStdout, helperDirty, helperMany,
 	} {
 		unsetEnv(t, name)
@@ -1356,6 +1451,19 @@ func assertRemoved(t *testing.T, path string) {
 	t.Helper()
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("temporary file %q still exists or stat failed: %v", path, err)
+	}
+}
+
+func assertNoFinalOutputFile(t *testing.T, dir string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.Contains(entry.Name(), "-last-") {
+			t.Fatalf("final output file leaked: %q", entry.Name())
+		}
 	}
 }
 

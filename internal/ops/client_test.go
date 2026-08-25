@@ -1,6 +1,7 @@
 package ops
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -14,6 +15,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"qqcodex/internal/tasklog"
 )
 
 func TestClientBuildsTypedArgvAndParsesResponse(t *testing.T) {
@@ -196,6 +199,26 @@ func TestClientLogsTaskHelperStderrWithoutExposingIt(t *testing.T) {
 	}
 }
 
+func TestClientLogsTruncatedHelperStderrWithRealTaskLogStore(t *testing.T) {
+	root := t.TempDir()
+	store, err := tasklog.Open(filepath.Join(root, "task-logs"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := mustNewClientWithLog(t, helperCommand(t, filepath.Join(root, "argv.json"), "large-stderr"), nil, store)
+	_, err = client.MergeRC(context.Background(), "order-api", testTaskID, strings.Repeat("a", 40))
+	if err == nil || err.Error() != "public failure" {
+		t.Fatalf("MergeRC() error = %v, want public failure", err)
+	}
+	summary, err := store.Summary(testTaskID, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(summary, "ops stderr truncated") {
+		t.Fatalf("task log omitted ops stderr truncation marker: %q", summary)
+	}
+}
+
 func TestClientDoesNotFailCompletedActionWhenTaskLogFails(t *testing.T) {
 	wantErr := errors.New("task log unavailable")
 	record := filepath.Join(t.TempDir(), "argv.json")
@@ -297,6 +320,10 @@ func TestOpsClientHelper(t *testing.T) {
 		} else {
 			_, _ = os.Stdout.WriteString(`{"ok":true}`)
 		}
+	case "large-stderr":
+		_, _ = os.Stderr.Write(bytes.Repeat([]byte{'s'}, (1<<20)+1024))
+		_, _ = os.Stdout.WriteString(`{"ok":false,"error":"public failure"}`)
+		os.Exit(1)
 	default:
 		os.Exit(121)
 	}

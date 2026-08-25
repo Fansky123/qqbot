@@ -22,7 +22,7 @@ const (
 	maxSummaryReadBytes = 1 << 20
 	// This is also the maximum configured secret length, measured in bytes.
 	maxRedactionOverlap = 64 << 10
-	maxRecordDataBytes  = 1 << 20
+	maxRecordDataBytes  = 2 << 20
 	maxTaskLogBytes     = 64 << 20
 	redactionMarker     = "[REDACTED]"
 	redactionSentinel   = "\x00"

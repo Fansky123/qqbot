@@ -23,14 +23,16 @@ import (
 )
 
 const (
-	maxEventBytes         = 2 << 20
+	maxEventBytes         = 3 << 20
 	maxEventsResultBytes  = 1 << 20
 	maxStderrBytes        = 1 << 20
 	maxFinalBytes         = 1 << 20
 	finalTruncationMarker = "\n[codex final output truncated]\n"
+	finalOutputPath       = "/proc/self/fd/3"
+	finalDrainTimeout     = time.Second
 )
 
-// ErrFinalTooLarge reports that Result.Final contains a bounded head/tail view.
+// ErrFinalTooLarge reports that Result.Final was replaced with a fixed marker.
 var ErrFinalTooLarge = errors.New("codex final output exceeded limit")
 
 var (
@@ -118,11 +120,16 @@ func (r Runner) run(parent context.Context, req Request, kind invocation) (resul
 		return Result{}, err
 	}
 
-	lastPath, err := privateTemp(r.LogDir, req.TaskID+"-last-*.tmp", nil)
+	finalReader, finalWriter, err := os.Pipe()
 	if err != nil {
-		return Result{}, err
+		return Result{}, fmt.Errorf("create Codex final output pipe: %w", err)
 	}
-	temporaryPaths = append(temporaryPaths, lastPath)
+	defer func() {
+		_ = finalReader.Close()
+		_ = finalWriter.Close()
+	}()
+	finalDone := make(chan finalCapture, 1)
+	go drainFinalOutput(finalReader, finalDone)
 
 	var schemaPath string
 	if kind == invocationPlan {
@@ -133,12 +140,13 @@ func (r Runner) run(parent context.Context, req Request, kind invocation) (resul
 		temporaryPaths = append(temporaryPaths, schemaPath)
 	}
 
-	args := invocationArgs(kind, req, schemaPath, lastPath, toolEnv)
+	args := invocationArgs(kind, req, schemaPath, finalOutputPath, toolEnv)
 	ctx, cancel := context.WithTimeout(parent, req.Timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, binary, args...)
 	cmd.Dir = req.WorkingDir
 	cmd.Env = env
+	cmd.ExtraFiles = []*os.File{finalWriter}
 	var stderr boundedCapture
 	cmd.Stderr = &stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -154,17 +162,16 @@ func (r Runner) run(parent context.Context, req Request, kind invocation) (resul
 	cmd.Cancel = func() error {
 		cancelOnce.Do(func() {
 			canceled.Store(true)
-			cancelErr = errors.Join(killProcessGroup(cmd.Process), closePipe(stdout))
+			cancelErr = errors.Join(killProcessGroup(cmd.Process), closePipe(stdout), closePipe(finalReader))
 		})
 		return cancelErr
 	}
 	if err := cmd.Start(); err != nil {
-		result, finalErr := readFinal(lastPath, Result{})
-		if finalErr != nil {
-			return result, finalErr
-		}
+		_ = finalReader.Close()
+		_ = finalWriter.Close()
 		return result, fmt.Errorf("start codex %s: %w", kind, err)
 	}
+	_ = finalWriter.Close()
 
 	type scanOutcome struct {
 		result Result
@@ -187,8 +194,13 @@ func (r Runner) run(parent context.Context, req Request, kind invocation) (resul
 		_ = killProcessGroup(cmd.Process)
 	}
 	waitErr := cmd.Wait()
+	final := finishFinalOutput(finalReader, finalDone)
+	result = outcome.result
+	result.Final = final.String()
 	var finalErr error
-	result, finalErr = readFinal(lastPath, outcome.result)
+	if final.truncated {
+		finalErr = ErrFinalTooLarge
+	}
 	logErr := errors.Join(
 		appendLog(r.Log, req.TaskID, "codex.stderr", stderr.Bytes()),
 		appendLog(r.Log, req.TaskID, "codex.final", []byte(result.Final)),
@@ -580,69 +592,46 @@ func scanEvents(reader io.Reader, log LogSink, taskID string) (Result, error) {
 	return result, scanner.Err()
 }
 
-func readFinal(path string, result Result) (Result, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return result, fmt.Errorf("open codex final message: %w", err)
-	}
-	info, statErr := file.Stat()
-	if statErr != nil {
-		return result, errors.Join(fmt.Errorf("stat codex final message: %w", statErr), file.Close())
-	}
-	if !info.Mode().IsRegular() {
-		return result, errors.Join(errors.New("codex final message is not a regular file"), file.Close())
-	}
-	if info.Size() <= maxFinalBytes {
-		data := make([]byte, int(info.Size()))
-		readErr := readFinalAt(file, data, 0)
-		closeErr := file.Close()
-		result.Final = string(data)
-		if err := errors.Join(readErr, closeErr); err != nil {
-			return result, fmt.Errorf("read codex final message: %w", err)
+type finalCapture struct {
+	data      []byte
+	truncated bool
+}
+
+func (c *finalCapture) Write(p []byte) (int, error) {
+	want := len(p)
+	if !c.truncated {
+		remaining := maxFinalBytes - len(c.data)
+		if remaining >= len(p) {
+			c.data = append(c.data, p...)
+		} else {
+			c.truncated = true
 		}
-		return result, nil
 	}
-
-	payloadBytes := maxFinalBytes - len(finalTruncationMarker)
-	headBytes := payloadBytes / 2
-	tailBytes := payloadBytes - headBytes
-	head := make([]byte, headBytes)
-	tail := make([]byte, tailBytes)
-	headErr := readFinalAt(file, head, 0)
-	tailErr := readFinalAt(file, tail, info.Size()-int64(tailBytes))
-	closeErr := file.Close()
-	data := make([]byte, 0, maxFinalBytes)
-	data = append(data, head...)
-	data = append(data, finalTruncationMarker...)
-	data = append(data, tail...)
-	result.Final = string(data)
-	return result, errors.Join(
-		ErrFinalTooLarge,
-		wrapReadFinalError(headErr),
-		wrapReadFinalError(tailErr),
-		closeErr,
-	)
+	return want, nil
 }
 
-func readFinalAt(file *os.File, data []byte, offset int64) error {
-	if len(data) == 0 {
-		return nil
+func (c finalCapture) String() string {
+	if c.truncated {
+		return finalTruncationMarker
 	}
-	read, err := file.ReadAt(data, offset)
-	if err != nil {
-		return err
-	}
-	if read != len(data) {
-		return io.ErrUnexpectedEOF
-	}
-	return nil
+	return string(c.data)
 }
 
-func wrapReadFinalError(err error) error {
-	if err == nil {
-		return nil
+func drainFinalOutput(reader *os.File, done chan<- finalCapture) {
+	var capture finalCapture
+	_, _ = io.Copy(&capture, reader)
+	_ = reader.Close()
+	done <- capture
+}
+
+func finishFinalOutput(reader *os.File, done <-chan finalCapture) finalCapture {
+	select {
+	case capture := <-done:
+		return capture
+	case <-time.After(finalDrainTimeout):
+		_ = reader.Close()
+		return <-done
 	}
-	return fmt.Errorf("read codex final message: %w", err)
 }
 
 func appendLog(log LogSink, taskID, stream string, data []byte) error {
