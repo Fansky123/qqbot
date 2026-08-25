@@ -1,10 +1,14 @@
 {
+  "git_binary": "/usr/bin/git",
   "projects": {
     "order-api": {
       "repo_path": "/srv/repos/order-api",
       "remote": "origin",
+      "remote_url": "https://git.example.com/company/order-api.git",
+      "allow_local_remote": false,
       "base_branch": "main",
       "rc_branch": "rc",
+      "check_runner": ["/usr/local/libexec/qqcodex-check"],
       "checks": [["go", "test", "./..."]],
       "deploy_action": ["/usr/local/libexec/deploy-order-rc"]
     }

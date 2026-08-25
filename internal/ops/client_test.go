@@ -96,9 +96,21 @@ func TestClientRejectsInvalidOrMultipleJSONResponses(t *testing.T) {
 
 func TestClientDoesNotPassCodexCredential(t *testing.T) {
 	t.Setenv("CODEX_API_KEY", "must-not-cross-boundary")
+	t.Setenv("OPENAI_API_KEY", "must-not-cross-boundary")
+	t.Setenv("NAPCAT_ACCESS_TOKEN", "must-not-cross-boundary")
+	t.Setenv("CUSTOM_TOKEN", "must-not-cross-boundary")
+	t.Setenv("HOME", "/attacker/home")
+	t.Setenv("PATH", "/attacker/bin")
 	client := Client{Command: helperCommand(t, filepath.Join(t.TempDir(), "argv.json"), "check-env")}
 	if err := client.Sync(context.Background(), "order-api"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestClientRejectsUntrustedExecutable(t *testing.T) {
+	client := Client{Command: []string{"qqcodex-ops"}}
+	if err := client.Sync(context.Background(), "order-api"); err == nil {
+		t.Fatal("Sync() error = nil, want untrusted executable rejection")
 	}
 }
 
@@ -111,15 +123,15 @@ func TestClientDoesNotExposeHelperStderr(t *testing.T) {
 }
 
 func TestOpsClientHelper(t *testing.T) {
-	if os.Getenv("GO_WANT_OPS_CLIENT_HELPER") != "1" {
-		return
-	}
 	separator := -1
 	for i, arg := range os.Args {
-		if arg == "--" {
+		if arg == "qqcodex-client-helper" {
 			separator = i
 			break
 		}
+	}
+	if separator < 0 {
+		return
 	}
 	if separator < 0 || len(os.Args) < separator+4 {
 		os.Exit(120)
@@ -151,7 +163,9 @@ func TestOpsClientHelper(t *testing.T) {
 		_, _ = os.Stdout.WriteString(`{"ok":null,"error":"public failure"}`)
 		os.Exit(1)
 	case "check-env":
-		if os.Getenv("CODEX_API_KEY") != "" {
+		if os.Getenv("PATH") != "/usr/bin:/bin" || os.Getenv("HOME") != "/nonexistent" ||
+			os.Getenv("CODEX_API_KEY") != "" || os.Getenv("OPENAI_API_KEY") != "" ||
+			os.Getenv("NAPCAT_ACCESS_TOKEN") != "" || os.Getenv("CUSTOM_TOKEN") != "" {
 			_, _ = os.Stdout.WriteString(`{"ok":false,"error":"credential leaked"}`)
 			os.Exit(1)
 		}
@@ -172,6 +186,16 @@ func helperCommand(t *testing.T, record, mode string) []string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("GO_WANT_OPS_CLIENT_HELPER", "1")
-	return []string{executable, "-test.run=^TestOpsClientHelper$", "--", record, mode}
+	trusted := filepath.Join(privateTempDir(t), "qqcodex-ops-test")
+	data, err := os.ReadFile(executable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(trusted, data, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := trustedExecutable(trusted, nil); err != nil {
+		t.Fatalf("test helper is not trusted: %v", err)
+	}
+	return []string{trusted, "-test.run=^TestOpsClientHelper$", "--", "qqcodex-client-helper", record, mode}
 }

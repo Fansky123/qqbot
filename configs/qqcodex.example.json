@@ -16,7 +16,7 @@
     "binary": "codex",
     "environment_keep": ["PATH"]
   },
-  "ops_command": ["./qqcodex-ops", "-config", "./configs/ops.json"],
+  "ops_command": ["/usr/local/libexec/qqcodex-ops", "-config", "/etc/qqcodex/ops.json"],
   "projects": [
     {
       "id": "order-api",

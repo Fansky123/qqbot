@@ -34,7 +34,10 @@ func run(ctx context.Context, args []string) (response, int) {
 	if err != nil {
 		return failed(errors.New("load ops config failed")), 1
 	}
-	operator := ops.NewOperator(cfg)
+	operator, err := ops.NewOperator(cfg)
+	if err != nil {
+		return failed(errors.New("invalid ops config")), 1
+	}
 
 	switch action {
 	case "sync":

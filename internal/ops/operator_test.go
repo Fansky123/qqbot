@@ -19,23 +19,35 @@ const testTaskID = "T-012345ABCDEF"
 func TestLoadConfigValidatesAndCanonicalizesProjects(t *testing.T) {
 	t.Parallel()
 
-	root := t.TempDir()
+	root := privateTempDir(t)
 	repo := filepath.Join(root, "repo")
 	mustMkdir(t, repo)
+	remote := filepath.Join(root, "remote.git")
+	mustMkdir(t, remote)
+	runner := writeExecutable(t, filepath.Join(root, "check-runner"), "#!/bin/sh\nexit 0\n")
+	runnerLink := filepath.Join(root, "check-runner-link")
+	if err := os.Symlink(runner, runnerLink); err != nil {
+		t.Skipf("cannot create executable symlink: %v", err)
+	}
+	deploy := writeExecutable(t, filepath.Join(root, "deploy"), "#!/bin/sh\nexit 0\n")
 	repoLink := filepath.Join(root, "repo-link")
 	if err := os.Symlink(repo, repoLink); err != nil {
 		t.Skipf("cannot create symlink: %v", err)
 	}
 	configPath := filepath.Join(root, "ops.json")
 	writeJSON(t, configPath, map[string]any{
+		"git_binary": realGit(t),
 		"projects": map[string]any{
 			"order-api": map[string]any{
-				"repo_path":     repoLink,
-				"remote":        "origin",
-				"base_branch":   "main",
-				"rc_branch":     "rc",
-				"checks":        [][]string{{"go", "test", "./..."}},
-				"deploy_action": []string{"/usr/local/libexec/deploy-order-rc"},
+				"repo_path":          repoLink,
+				"remote":             "origin",
+				"remote_url":         remote,
+				"allow_local_remote": true,
+				"base_branch":        "main",
+				"rc_branch":          "rc",
+				"check_runner":       []string{runnerLink, "fixed-runner-arg"},
+				"checks":             [][]string{{"go", "test", "./..."}},
+				"deploy_action":      []string{deploy},
 			},
 		},
 	})
@@ -47,50 +59,110 @@ func TestLoadConfigValidatesAndCanonicalizesProjects(t *testing.T) {
 	if got := cfg.Projects["order-api"].RepoPath; got != repo {
 		t.Fatalf("canonical repo path = %q, want %q", got, repo)
 	}
+	if got := cfg.Projects["order-api"].CheckRunner[0]; got != runner {
+		t.Fatalf("canonical check runner = %q, want %q", got, runner)
+	}
 }
 
 func TestLoadConfigRejectsUnsafeConfiguration(t *testing.T) {
 	t.Parallel()
 
-	repo := t.TempDir()
+	root := privateTempDir(t)
+	repo := filepath.Join(root, "repo")
+	remote := filepath.Join(root, "remote.git")
+	mustMkdir(t, repo)
+	mustMkdir(t, remote)
+	runner := writeExecutable(t, filepath.Join(root, "check-runner"), "#!/bin/sh\nexit 0\n")
+	deploy := writeExecutable(t, filepath.Join(root, "deploy"), "#!/bin/sh\nexit 0\n")
 	tests := []struct {
 		name   string
-		mutate func(map[string]any)
+		mutate func(*testing.T, map[string]any, map[string]any)
 	}{
 		{
 			name: "relative repository",
-			mutate: func(project map[string]any) {
+			mutate: func(_ *testing.T, _ map[string]any, project map[string]any) {
 				project["repo_path"] = "relative/repo"
 			},
 		},
 		{
 			name: "revision syntax in branch",
-			mutate: func(project map[string]any) {
+			mutate: func(_ *testing.T, _ map[string]any, project map[string]any) {
 				project["base_branch"] = "main^{commit}"
 			},
 		},
 		{
 			name: "option-like remote",
-			mutate: func(project map[string]any) {
+			mutate: func(_ *testing.T, _ map[string]any, project map[string]any) {
 				project["remote"] = "--upload-pack=bad"
 			},
 		},
 		{
 			name: "empty check argument",
-			mutate: func(project map[string]any) {
+			mutate: func(_ *testing.T, _ map[string]any, project map[string]any) {
 				project["checks"] = [][]string{{"go", ""}}
 			},
 		},
 		{
 			name: "missing deploy action",
-			mutate: func(project map[string]any) {
+			mutate: func(_ *testing.T, _ map[string]any, project map[string]any) {
 				project["deploy_action"] = []string{}
 			},
 		},
 		{
 			name: "secret field",
-			mutate: func(project map[string]any) {
+			mutate: func(_ *testing.T, _ map[string]any, project map[string]any) {
 				project["credential"] = "secret"
+			},
+		},
+		{
+			name: "relative Git binary",
+			mutate: func(_ *testing.T, config map[string]any, _ map[string]any) {
+				config["git_binary"] = "git"
+			},
+		},
+		{
+			name: "local remote without fake mode",
+			mutate: func(_ *testing.T, _ map[string]any, project map[string]any) {
+				project["allow_local_remote"] = false
+			},
+		},
+		{
+			name: "scp-like remote",
+			mutate: func(_ *testing.T, _ map[string]any, project map[string]any) {
+				project["allow_local_remote"] = false
+				project["remote_url"] = "git@example.com:company/order-api.git"
+			},
+		},
+		{
+			name: "Git protocol remote",
+			mutate: func(_ *testing.T, _ map[string]any, project map[string]any) {
+				project["allow_local_remote"] = false
+				project["remote_url"] = "git://example.com/company/order-api.git"
+			},
+		},
+		{
+			name: "credential in HTTPS remote",
+			mutate: func(_ *testing.T, _ map[string]any, project map[string]any) {
+				project["allow_local_remote"] = false
+				project["remote_url"] = "https://user:secret@example.com/company/order-api.git"
+			},
+		},
+		{
+			name: "check runner inside repository",
+			mutate: func(t *testing.T, _ map[string]any, project map[string]any) {
+				inside := writeExecutable(t, filepath.Join(repo, "runner"), "#!/bin/sh\nexit 0\n")
+				project["check_runner"] = []string{inside}
+			},
+		},
+		{
+			name: "replaceable deploy parent",
+			mutate: func(t *testing.T, _ map[string]any, project map[string]any) {
+				parent := filepath.Join(root, "replaceable")
+				mustMkdir(t, parent)
+				if err := os.Chmod(parent, 0o777); err != nil {
+					t.Fatal(err)
+				}
+				project["deploy_action"] = []string{writeExecutable(t, filepath.Join(parent, "deploy"), "#!/bin/sh\nexit 0\n")}
 			},
 		},
 	}
@@ -100,20 +172,36 @@ func TestLoadConfigRejectsUnsafeConfiguration(t *testing.T) {
 			t.Parallel()
 
 			project := map[string]any{
-				"repo_path":     repo,
-				"remote":        "origin",
-				"base_branch":   "main",
-				"rc_branch":     "rc",
-				"checks":        [][]string{{"go", "test", "./..."}},
-				"deploy_action": []string{"deploy-rc"},
+				"repo_path":          repo,
+				"remote":             "origin",
+				"remote_url":         remote,
+				"allow_local_remote": true,
+				"base_branch":        "main",
+				"rc_branch":          "rc",
+				"check_runner":       []string{runner},
+				"checks":             [][]string{{"go", "test", "./..."}},
+				"deploy_action":      []string{deploy},
 			}
-			tt.mutate(project)
+			config := map[string]any{"git_binary": realGit(t), "projects": map[string]any{"order-api": project}}
+			tt.mutate(t, config, project)
 			path := filepath.Join(t.TempDir(), "ops.json")
-			writeJSON(t, path, map[string]any{"projects": map[string]any{"order-api": project}})
+			writeJSON(t, path, config)
 			if _, err := LoadConfig(path); err == nil {
 				t.Fatal("LoadConfig() error = nil, want validation error")
 			}
 		})
+	}
+}
+
+func TestNewOperatorRevalidatesConfiguration(t *testing.T) {
+	t.Parallel()
+
+	fixture := newOpsFixture(t)
+	project := fixture.config.Projects[fixture.projectID]
+	project.DeployAction[0] = "relative-deploy"
+	fixture.config.Projects[fixture.projectID] = project
+	if _, err := NewOperator(fixture.config); err == nil {
+		t.Fatal("NewOperator() error = nil, want executable validation error")
 	}
 }
 
@@ -200,22 +288,22 @@ func TestOperatorPushTaskAllowsOnlyExactFastForwardTaskRef(t *testing.T) {
 }
 
 func TestOperatorMergeRCVerifiesCommitRunsChecksAndSkipsHooks(t *testing.T) {
-	t.Parallel()
-
 	fixture := newOpsFixture(t)
 	branch, taskCommit := fixture.createTaskCommit(t, testTaskID, "feature.txt", "feature\n")
 	if err := fixture.operator.PushTask(context.Background(), fixture.projectID, testTaskID, branch, taskCommit); err != nil {
 		t.Fatal(err)
 	}
 	checkMarker := filepath.Join(t.TempDir(), "check-ran")
-	check := writeExecutable(t, filepath.Join(t.TempDir(), "check"), "#!/bin/sh\nprintf '%s' \"$PWD\" > \"$1\"\n")
+	check := writeExecutable(t, filepath.Join(t.TempDir(), "check"), "#!/bin/sh\n[ \"$PATH\" = /usr/bin:/bin ] || exit 65\n[ -z \"${CUSTOM_TOKEN-}\" ] || exit 66\n[ \"$HOME\" != /attacker/home ] || exit 67\nprintf '%s' \"$PWD\" > \"$1\"\n")
 	hookMarker := filepath.Join(t.TempDir(), "hook-ran")
 	hooks := filepath.Join(fixture.repo, ".git", "hooks")
 	writeExecutable(t, filepath.Join(hooks, "post-merge"), "#!/bin/sh\ntouch \""+hookMarker+"\"\n")
 	project := fixture.config.Projects[fixture.projectID]
 	project.Checks = [][]string{{check, checkMarker}}
 	fixture.config.Projects[fixture.projectID] = project
-	fixture.operator = NewOperator(fixture.config)
+	fixture.operator = mustNewOperator(t, fixture.config)
+	t.Setenv("CUSTOM_TOKEN", "must-not-cross-check-boundary")
+	t.Setenv("HOME", "/attacker/home")
 	oldRC := fixture.remoteRef(t, "rc")
 
 	merged, err := fixture.operator.MergeRC(context.Background(), fixture.projectID, testTaskID, taskCommit)
@@ -271,7 +359,7 @@ func TestOperatorMergeRCFailureLeavesRemoteUnchanged(t *testing.T) {
 				project := fixture.config.Projects[fixture.projectID]
 				project.Checks = [][]string{{writeExecutable(t, filepath.Join(t.TempDir(), "fail"), "#!/bin/sh\nexit 17\n")}}
 				fixture.config.Projects[fixture.projectID] = project
-				fixture.operator = NewOperator(fixture.config)
+				fixture.operator = mustNewOperator(t, fixture.config)
 				return commit
 			},
 		},
@@ -318,6 +406,60 @@ func TestOperatorMergeRCFailureLeavesRemoteUnchanged(t *testing.T) {
 	}
 }
 
+func TestOperatorMergeRCRejectsCheckRepositoryChanges(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		check func(*testing.T, opsFixture) []string
+	}{
+		{
+			name: "dirty worktree",
+			check: func(t *testing.T, _ opsFixture) []string {
+				return []string{writeExecutable(t, filepath.Join(privateTempDir(t), "dirty"), "#!/bin/sh\nprintf dirty > check-dirty.txt\n")}
+			},
+		},
+		{
+			name: "new commit",
+			check: func(t *testing.T, _ opsFixture) []string {
+				return []string{writeExecutable(t, filepath.Join(privateTempDir(t), "commit"), "#!/bin/sh\nprintf checked > check-commit.txt\n\""+realGit(t)+"\" add check-commit.txt\n\""+realGit(t)+"\" commit -m check-commit\n")}
+			},
+		},
+		{
+			name: "local Git configuration",
+			check: func(t *testing.T, _ opsFixture) []string {
+				alternate := filepath.Join(privateTempDir(t), "alternate.git")
+				git(t, filepath.Dir(alternate), "init", "--bare", alternate)
+				return []string{writeExecutable(t, filepath.Join(privateTempDir(t), "config"), "#!/bin/sh\n\""+realGit(t)+"\" config remote.origin.pushurl \""+alternate+"\"\n")}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			fixture := newOpsFixture(t)
+			branch, taskCommit := fixture.createTaskCommit(t, testTaskID, "feature.txt", "feature\n")
+			if err := fixture.operator.PushTask(context.Background(), fixture.projectID, testTaskID, branch, taskCommit); err != nil {
+				t.Fatal(err)
+			}
+			project := fixture.config.Projects[fixture.projectID]
+			project.Checks = [][]string{tt.check(t, fixture)}
+			fixture.config.Projects[fixture.projectID] = project
+			fixture.operator = mustNewOperator(t, fixture.config)
+			oldRC := fixture.remoteRef(t, "rc")
+
+			if _, err := fixture.operator.MergeRC(context.Background(), fixture.projectID, testTaskID, taskCommit); err == nil {
+				t.Fatal("MergeRC() error = nil, want check repository change rejection")
+			}
+			if got := fixture.remoteRef(t, "rc"); got != oldRC {
+				t.Fatalf("failed merge changed remote RC to %q, want %q", got, oldRC)
+			}
+		})
+	}
+}
+
 func TestOperatorRejectsUnsafeLocalGitCommands(t *testing.T) {
 	t.Parallel()
 
@@ -337,6 +479,123 @@ func TestOperatorRejectsUnsafeLocalGitCommands(t *testing.T) {
 				t.Fatalf("Sync() accepted unsafe local Git config %q", tt.key)
 			}
 		})
+	}
+}
+
+func TestOperatorRejectsWorktreePushURLAndPinnedRemoteMismatch(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, opsFixture, string)
+	}{
+		{
+			name: "worktree push URL",
+			mutate: func(t *testing.T, fixture opsFixture, alternate string) {
+				git(t, fixture.repo, "config", "extensions.worktreeConfig", "true")
+				git(t, fixture.repo, "config", "--worktree", "remote.origin.pushurl", alternate)
+			},
+		},
+		{
+			name: "local remote URL changed",
+			mutate: func(t *testing.T, fixture opsFixture, alternate string) {
+				git(t, fixture.repo, "config", "remote.origin.url", alternate)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			fixture := newOpsFixture(t)
+			alternate := filepath.Join(privateTempDir(t), "alternate.git")
+			git(t, filepath.Dir(alternate), "init", "--bare", alternate)
+			branch, commit := fixture.createTaskCommit(t, testTaskID, "redirect.txt", "redirect\n")
+			tt.mutate(t, fixture, alternate)
+
+			if err := fixture.operator.PushTask(context.Background(), fixture.projectID, testTaskID, branch, commit); err == nil {
+				t.Fatal("PushTask() accepted redirected repository configuration")
+			}
+			if got := remoteRefOrEmpty(t, alternate, branch); got != "" {
+				t.Fatalf("alternate remote received task commit %q", got)
+			}
+		})
+	}
+}
+
+func TestOperatorRejectsPushConfigAndNeverLeaksTags(t *testing.T) {
+	t.Parallel()
+
+	fixture := newOpsFixture(t)
+	branch, commit := fixture.createTaskCommit(t, testTaskID, "tagged.txt", "tagged\n")
+	git(t, fixture.repo, "tag", "release-leak", commit)
+	git(t, fixture.repo, "config", "push.followTags", "true")
+	git(t, fixture.repo, "config", "push.pushOption", "leak")
+
+	if err := fixture.operator.PushTask(context.Background(), fixture.projectID, testTaskID, branch, commit); err == nil || !strings.Contains(err.Error(), "unsafe local") {
+		t.Fatalf("PushTask() error = %v, want unsafe local configuration rejection", err)
+	}
+	if got := remoteRefOrEmpty(t, fixture.remote, "release-leak"); got != "" {
+		t.Fatalf("remote received tag %q", got)
+	}
+	if got := remoteRefOrEmpty(t, fixture.remote, branch); got != "" {
+		t.Fatalf("remote received task branch %q", got)
+	}
+}
+
+func TestOperatorSyncFetchesOnlyPinnedBranchesWithoutTags(t *testing.T) {
+	t.Parallel()
+
+	fixture := newOpsFixture(t)
+	producer := fixture.clone(t)
+	writeFile(t, filepath.Join(producer, "tag-source.txt"), "tag source\n")
+	git(t, producer, "add", "tag-source.txt")
+	git(t, producer, "commit", "-m", "tag source")
+	wantMain := git(t, producer, "rev-parse", "HEAD")
+	git(t, producer, "tag", "sync-leak", wantMain)
+	git(t, producer, "push", "origin", "HEAD:main", "refs/tags/sync-leak")
+
+	if err := fixture.operator.Sync(context.Background(), fixture.projectID); err != nil {
+		t.Fatal(err)
+	}
+	if tags := git(t, fixture.repo, "tag", "--list", "sync-leak"); tags != "" {
+		t.Fatalf("Sync() fetched tag %q", tags)
+	}
+	if got := git(t, fixture.repo, "rev-parse", "refs/remotes/origin/main"); got != wantMain {
+		t.Fatalf("Sync() main = %q, want %q", got, wantMain)
+	}
+}
+
+func TestOperatorUsesConfiguredGitWithSanitizedEnvironment(t *testing.T) {
+	fixture := newOpsFixture(t)
+	record := filepath.Join(privateTempDir(t), "git-env")
+	real := realGit(t)
+	wrapper := writeExecutable(t, filepath.Join(privateTempDir(t), "trusted-git"), `#!/bin/sh
+printf '%s|%s|%s|%s|%s\n' "$PATH" "$HOME" "${CUSTOM_TOKEN-unset}" "${GIT_ASKPASS-unset}" "${HTTP_PROXY-unset}" >> "`+record+`"
+exec "`+real+`" "$@"
+`)
+	fixture.config.GitBinary = wrapper
+	t.Setenv("PATH", "/attacker/bin")
+	t.Setenv("HOME", "relative-home")
+	t.Setenv("CUSTOM_TOKEN", "secret")
+	t.Setenv("GIT_ASKPASS", "/attacker/askpass")
+	t.Setenv("HTTP_PROXY", "http://attacker.invalid")
+	fixture.operator = mustNewOperator(t, fixture.config)
+	if err := os.WriteFile(record, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := fixture.operator.Sync(context.Background(), fixture.projectID); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if line != "/usr/bin:/bin|/nonexistent|unset|unset|unset" {
+			t.Fatalf("Git environment = %q, want fixed sanitized values", line)
+		}
 	}
 }
 
@@ -386,17 +645,18 @@ func TestRunProcessCancellationKillsProcessGroup(t *testing.T) {
 func TestOperatorDeployRCUsesOnlyConfiguredAction(t *testing.T) {
 	fixture := newOpsFixture(t)
 	record := filepath.Join(t.TempDir(), "deploy.json")
-	helper := writeExecutable(t, filepath.Join(t.TempDir(), "deploy"), `#!/bin/sh
-printf '{"project":"%s","task":"%s","commit":"%s","arg":"%s"}' \
-  "$QQCODEX_PROJECT_ID" "$QQCODEX_TASK_ID" "$QQCODEX_RC_COMMIT" "$1" > "$2"
+	helper := writeExecutable(t, filepath.Join(privateTempDir(t), "deploy"), `#!/bin/sh
+printf '{"project":"%s","task":"%s","commit":"%s","key":"%s","dir":"%s","arg":"%s"}' \
+  "$QQCODEX_PROJECT_ID" "$QQCODEX_TASK_ID" "$QQCODEX_RC_COMMIT" "$QQCODEX_DEPLOY_KEY" "$PWD" "$1" > "$2"
 `)
 	project := fixture.config.Projects[fixture.projectID]
 	project.DeployAction = []string{helper, "fixed", record}
 	fixture.config.Projects[fixture.projectID] = project
-	fixture.operator = NewOperator(fixture.config)
+	fixture.operator = mustNewOperator(t, fixture.config)
 	t.Setenv("QQCODEX_PROJECT_ID", "attacker-project")
 	t.Setenv("QQCODEX_TASK_ID", "attacker-task")
 	t.Setenv("QQCODEX_RC_COMMIT", "attacker-commit")
+	t.Setenv("QQCODEX_DEPLOY_KEY", "attacker-key")
 
 	if err := fixture.operator.DeployRC(context.Background(), fixture.projectID, testTaskID, fixture.rcCommit); err != nil {
 		t.Fatal(err)
@@ -413,6 +673,8 @@ printf '{"project":"%s","task":"%s","commit":"%s","arg":"%s"}' \
 		"project": fixture.projectID,
 		"task":    testTaskID,
 		"commit":  fixture.rcCommit,
+		"key":     deployKey(fixture.projectID, testTaskID, fixture.rcCommit),
+		"dir":     "/",
 		"arg":     "fixed",
 	}
 	for key, value := range want {
@@ -420,9 +682,48 @@ printf '{"project":"%s","task":"%s","commit":"%s","arg":"%s"}' \
 			t.Errorf("deploy %s = %q, want %q", key, got[key], value)
 		}
 	}
+	firstKey := got["key"]
+	if err := fixture.operator.DeployRC(context.Background(), fixture.projectID, testTaskID, fixture.rcCommit); err != nil {
+		t.Fatal(err)
+	}
+	data, err = os.ReadFile(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["key"] != firstKey {
+		t.Fatalf("deploy key changed from %q to %q", firstKey, got["key"])
+	}
 
 	if err := fixture.operator.DeployRC(context.Background(), fixture.projectID, testTaskID+";touch /tmp/bad", fixture.rcCommit); err == nil {
 		t.Fatal("DeployRC() accepted an invalid task ID")
+	}
+}
+
+func TestOperatorDeployRCCleanupFailurePreventsAction(t *testing.T) {
+	fixture := newOpsFixture(t)
+	marker := filepath.Join(t.TempDir(), "deploy-ran")
+	deploy := writeExecutable(t, filepath.Join(privateTempDir(t), "deploy"), "#!/bin/sh\ntouch \""+marker+"\"\n")
+	real := realGit(t)
+	wrapper := writeExecutable(t, filepath.Join(privateTempDir(t), "cleanup-failing-git"), `#!/bin/sh
+case " $* " in
+  *" update-ref -d refs/qqcodex/"*) exit 88 ;;
+esac
+exec "`+real+`" "$@"
+`)
+	project := fixture.config.Projects[fixture.projectID]
+	project.DeployAction = []string{deploy}
+	fixture.config.GitBinary = wrapper
+	fixture.config.Projects[fixture.projectID] = project
+	fixture.operator = mustNewOperator(t, fixture.config)
+
+	if err := fixture.operator.DeployRC(context.Background(), fixture.projectID, testTaskID, fixture.rcCommit); err == nil {
+		t.Fatal("DeployRC() error = nil, want temporary ref cleanup failure")
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("deploy action ran after cleanup failure, stat error = %v", err)
 	}
 }
 
@@ -439,7 +740,7 @@ type opsFixture struct {
 func newOpsFixture(t *testing.T) opsFixture {
 	t.Helper()
 
-	root := t.TempDir()
+	root := privateTempDir(t)
 	remote := filepath.Join(root, "remote.git")
 	seed := filepath.Join(root, "seed")
 	repo := filepath.Join(root, "operator-repo")
@@ -465,14 +766,24 @@ func newOpsFixture(t *testing.T) opsFixture {
 	git(t, repo, "switch", "-c", "main", "origin/main")
 
 	projectID := "order-api"
-	cfg := Config{Projects: map[string]Project{
+	runner := writeExecutable(t, filepath.Join(root, "check-runner"), `#!/bin/sh
+if [ "$1" != "--" ]; then
+  exit 64
+fi
+shift
+exec "$@"
+`)
+	cfg := Config{GitBinary: realGit(t), Projects: map[string]Project{
 		projectID: {
-			RepoPath:     repo,
-			Remote:       "origin",
-			BaseBranch:   "main",
-			RCBranch:     "rc",
-			Checks:       [][]string{{"git", "diff", "--check", "HEAD^", "HEAD"}},
-			DeployAction: []string{"true"},
+			RepoPath:         repo,
+			Remote:           "origin",
+			RemoteURL:        remote,
+			AllowLocalRemote: true,
+			BaseBranch:       "main",
+			RCBranch:         "rc",
+			CheckRunner:      []string{runner},
+			Checks:           [][]string{{realGit(t), "diff", "--check", "HEAD^", "HEAD"}},
+			DeployAction:     []string{realExecutable(t, "true")},
 		},
 	}}
 	return opsFixture{
@@ -482,7 +793,7 @@ func newOpsFixture(t *testing.T) opsFixture {
 		mainCommit: mainCommit,
 		rcCommit:   rcCommit,
 		config:     cfg,
-		operator:   NewOperator(cfg),
+		operator:   mustNewOperator(t, cfg),
 	}
 }
 
@@ -516,10 +827,54 @@ func (f opsFixture) remoteRef(t *testing.T, branch string) string {
 	return fields[0]
 }
 
+func remoteRefOrEmpty(t *testing.T, remote, branch string) string {
+	t.Helper()
+	output := git(t, filepath.Dir(remote), "ls-remote", "--refs", remote, "refs/heads/"+branch, "refs/tags/"+branch)
+	fields := strings.Fields(output)
+	if len(fields) == 0 {
+		return ""
+	}
+	if len(fields) != 2 {
+		t.Fatalf("remote ref %q output = %q", branch, output)
+	}
+	return fields[0]
+}
+
 func configureGitUser(t *testing.T, repo string) {
 	t.Helper()
 	git(t, repo, "config", "user.name", "QQ Codex Test")
 	git(t, repo, "config", "user.email", "qqcodex@example.invalid")
+}
+
+func mustNewOperator(t *testing.T, cfg Config) *Operator {
+	t.Helper()
+	operator, err := NewOperator(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return operator
+}
+
+func realGit(t *testing.T) string {
+	t.Helper()
+	return realExecutable(t, "git")
+}
+
+func realExecutable(t *testing.T, name string) string {
+	t.Helper()
+	path, err := exec.LookPath(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err = filepath.Abs(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err = filepath.EvalSymlinks(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 func assertNoTemporaryRefs(t *testing.T, repo string) {
@@ -576,6 +931,15 @@ func writeExecutable(t *testing.T, path, content string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func privateTempDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return dir
 }
 
 func writeJSON(t *testing.T, path string, value any) {

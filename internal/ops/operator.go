@@ -4,10 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,10 +19,8 @@ import (
 )
 
 var (
-	taskIDPattern  = regexp.MustCompile(`^T-[A-F0-9]{12}$`)
-	commitPattern  = regexp.MustCompile(`^(?:[0-9a-f]{40}|[0-9a-f]{64})$`)
-	scpURLPattern  = regexp.MustCompile(`^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9.-]+:[A-Za-z0-9._~/-]+$`)
-	sshPathPattern = regexp.MustCompile(`^/[A-Za-z0-9._~/-]+$`)
+	taskIDPattern = regexp.MustCompile(`^T-[A-F0-9]{12}$`)
+	commitPattern = regexp.MustCompile(`^(?:[0-9a-f]{40}|[0-9a-f]{64})$`)
 )
 
 const (
@@ -32,11 +30,21 @@ const (
 )
 
 type Operator struct {
-	config Config
+	config    Config
+	gitBinary string
+	gitEnv    []string
 }
 
-func NewOperator(cfg Config) *Operator {
-	return &Operator{config: cloneConfig(cfg)}
+func NewOperator(cfg Config) (*Operator, error) {
+	normalized, err := normalizeConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &Operator{
+		config:    normalized,
+		gitBinary: normalized.GitBinary,
+		gitEnv:    gitEnvironment(),
+	}, nil
 }
 
 func (o *Operator) Sync(ctx context.Context, projectID string) error {
@@ -44,10 +52,16 @@ func (o *Operator) Sync(ctx context.Context, projectID string) error {
 	if err != nil {
 		return err
 	}
-	if err := guardRepository(ctx, project); err != nil {
+	if err := o.guardRepository(ctx, project); err != nil {
 		return err
 	}
-	if _, err := runGit(ctx, project.RepoPath, "fetch", "--prune", project.Remote, project.BaseBranch, project.RCBranch); err != nil {
+	refspecs := []string{
+		"refs/heads/" + project.BaseBranch + ":refs/remotes/" + project.Remote + "/" + project.BaseBranch,
+		"refs/heads/" + project.RCBranch + ":refs/remotes/" + project.Remote + "/" + project.RCBranch,
+	}
+	args := []string{"fetch", "--prune", "--no-tags", "--no-prune-tags", "--recurse-submodules=no", "--no-auto-maintenance", project.RemoteURL}
+	args = append(args, refspecs...)
+	if _, err := o.runGit(ctx, project.RepoPath, args...); err != nil {
 		return errors.New("sync fetch failed")
 	}
 	return nil
@@ -61,10 +75,10 @@ func (o *Operator) PushTask(ctx context.Context, projectID, taskID, branch, comm
 	if err := validateTask(taskID, branch, commit); err != nil {
 		return err
 	}
-	if err := guardRepository(ctx, project); err != nil {
+	if err := o.guardRepository(ctx, project); err != nil {
 		return err
 	}
-	local, err := resolveCommit(ctx, project.RepoPath, "refs/heads/"+branch)
+	local, err := o.resolveCommit(ctx, project.RepoPath, "refs/heads/"+branch)
 	if err != nil {
 		return errors.New("local task branch does not exist")
 	}
@@ -72,7 +86,7 @@ func (o *Operator) PushTask(ctx context.Context, projectID, taskID, branch, comm
 		return errors.New("local task branch does not match approved commit")
 	}
 
-	remoteCommit, cleanup, err := fetchRemoteBranch(ctx, project, branch)
+	remoteCommit, cleanup, err := o.fetchRemoteBranch(ctx, project, branch)
 	if cleanup != nil {
 		defer func() {
 			runErr = errors.Join(runErr, cleanup())
@@ -82,7 +96,7 @@ func (o *Operator) PushTask(ctx context.Context, projectID, taskID, branch, comm
 		return err
 	}
 	if remoteCommit != "" {
-		ancestor, err := isAncestor(ctx, project.RepoPath, remoteCommit, commit)
+		ancestor, err := o.isAncestor(ctx, project.RepoPath, remoteCommit, commit)
 		if err != nil {
 			return err
 		}
@@ -90,8 +104,11 @@ func (o *Operator) PushTask(ctx context.Context, projectID, taskID, branch, comm
 			return errors.New("remote task branch is not an ancestor of approved commit")
 		}
 	}
+	if err := o.guardRepository(ctx, project); err != nil {
+		return err
+	}
 	refspec := commit + ":refs/heads/" + branch
-	if _, err := runGit(ctx, project.RepoPath, "push", project.Remote, refspec); err != nil {
+	if _, err := o.runGit(ctx, project.RepoPath, pushArgs(project.RemoteURL, refspec)...); err != nil {
 		return errors.New("task push failed")
 	}
 	return nil
@@ -106,11 +123,11 @@ func (o *Operator) MergeRC(ctx context.Context, projectID, taskID, taskCommit st
 	if err := validateTask(taskID, branch, taskCommit); err != nil {
 		return "", err
 	}
-	if err := guardRepository(ctx, project); err != nil {
+	if err := o.guardRepository(ctx, project); err != nil {
 		return "", err
 	}
 
-	remoteTask, remoteRC, cleanupRefs, err := fetchMergeBranches(ctx, project, branch)
+	remoteTask, remoteRC, cleanupRefs, err := o.fetchMergeBranches(ctx, project, branch)
 	if cleanupRefs != nil {
 		defer func() {
 			runErr = errors.Join(runErr, cleanupRefs())
@@ -129,32 +146,43 @@ func (o *Operator) MergeRC(ctx context.Context, projectID, taskID, taskCommit st
 	}
 	added := false
 	defer func() {
-		cleanupErr := cleanupWorktree(project.RepoPath, worktree, added)
-		runErr = errors.Join(runErr, cleanupErr)
+		runErr = errors.Join(runErr, o.cleanupWorktree(project.RepoPath, worktree, added))
 	}()
-	if _, err := runGit(ctx, project.RepoPath, "worktree", "add", "--detach", worktree, remoteRC); err != nil {
+	if _, err := o.runGit(ctx, project.RepoPath, "worktree", "add", "--detach", worktree, remoteRC); err != nil {
 		return "", errors.New("create RC worktree failed")
 	}
 	added = true
-	if _, err := runGit(ctx, worktree, "merge", "--no-ff", "--no-edit", taskCommit); err != nil {
+	if _, err := o.runGit(ctx, worktree, "merge", "--no-ff", "--no-edit", taskCommit); err != nil {
 		return "", errors.New("RC merge failed")
 	}
-	for i, check := range project.Checks {
-		if _, err := runProcess(ctx, worktree, check, checkEnvironment()); err != nil {
-			return "", fmt.Errorf("RC check %d failed", i+1)
-		}
-	}
-	merged, err := resolveCommit(ctx, worktree, "HEAD")
+	merged, err := o.resolveCommit(ctx, worktree, "HEAD")
 	if err != nil {
 		return "", errors.New("resolve merged RC commit failed")
 	}
-	if _, err := runGit(ctx, worktree, "push", project.Remote, "HEAD:refs/heads/"+project.RCBranch); err != nil {
+	if err := runChecks(ctx, project, worktree); err != nil {
+		return "", err
+	}
+	status, err := o.runGit(ctx, worktree, "status", "--porcelain", "--untracked-files=all")
+	if err != nil {
+		return "", errors.New("inspect checked RC worktree failed")
+	}
+	if status != "" {
+		return "", errors.New("RC checks left the worktree dirty")
+	}
+	checkedHead, err := o.resolveCommit(ctx, worktree, "HEAD")
+	if err != nil || checkedHead != merged {
+		return "", errors.New("RC checks changed the merge commit")
+	}
+	if err := o.guardRepository(ctx, project); err != nil {
+		return "", err
+	}
+	if _, err := o.runGit(ctx, worktree, pushArgs(project.RemoteURL, "HEAD:refs/heads/"+project.RCBranch)...); err != nil {
 		return "", errors.New("RC push failed")
 	}
 	return merged, nil
 }
 
-func (o *Operator) DeployRC(ctx context.Context, projectID, taskID, rcCommit string) (runErr error) {
+func (o *Operator) DeployRC(ctx context.Context, projectID, taskID, rcCommit string) error {
 	project, err := o.project(projectID)
 	if err != nil {
 		return err
@@ -165,27 +193,32 @@ func (o *Operator) DeployRC(ctx context.Context, projectID, taskID, rcCommit str
 	if !commitPattern.MatchString(rcCommit) {
 		return errors.New("invalid RC commit")
 	}
-	if err := guardRepository(ctx, project); err != nil {
+	if err := o.guardRepository(ctx, project); err != nil {
 		return err
 	}
-	remoteRC, cleanup, err := fetchRemoteBranch(ctx, project, project.RCBranch)
-	if cleanup != nil {
-		defer func() {
-			runErr = errors.Join(runErr, cleanup())
-		}()
-	}
+	remoteRC, cleanup, err := o.fetchRemoteBranch(ctx, project, project.RCBranch)
 	if err != nil {
 		return err
 	}
 	if remoteRC != rcCommit {
-		return errors.New("remote RC changed")
+		if cleanup != nil {
+			err = cleanup()
+		}
+		return errors.Join(errors.New("remote RC changed"), err)
+	}
+	if cleanup == nil {
+		return errors.New("remote RC is unavailable")
+	}
+	if err := cleanup(); err != nil {
+		return err
 	}
 	env := replaceEnvironment(os.Environ(), map[string]string{
 		"QQCODEX_PROJECT_ID": projectID,
 		"QQCODEX_TASK_ID":    taskID,
 		"QQCODEX_RC_COMMIT":  rcCommit,
+		"QQCODEX_DEPLOY_KEY": deployKey(projectID, taskID, rcCommit),
 	})
-	if _, err := runProcess(ctx, project.RepoPath, project.DeployAction, env); err != nil {
+	if _, err := runProcess(ctx, "/", project.DeployAction, env); err != nil {
 		return errors.New("RC deploy failed")
 	}
 	return nil
@@ -215,85 +248,117 @@ func validateTask(taskID, branch, commit string) error {
 	return nil
 }
 
-func guardRepository(ctx context.Context, project Project) error {
-	if _, err := canonicalDirectory(project.RepoPath); err != nil {
+func fetchArgs(remoteURL string, refspecs ...string) []string {
+	args := []string{"fetch", "--no-tags", "--no-prune-tags", "--recurse-submodules=no", "--no-auto-maintenance", remoteURL}
+	return append(args, refspecs...)
+}
+
+func pushArgs(remoteURL, refspec string) []string {
+	return []string{
+		"push", "--no-follow-tags", "--recurse-submodules=no", "--no-push-option", "--signed=no", "--no-verify",
+		remoteURL, refspec,
+	}
+}
+
+type localConfigEntry struct {
+	origin, key, value string
+}
+
+func (o *Operator) guardRepository(ctx context.Context, project Project) error {
+	repository, err := canonicalDirectory(project.RepoPath)
+	if err != nil || repository != project.RepoPath {
 		return errors.New("repository is unavailable")
 	}
-	keys, err := runGit(ctx, project.RepoPath, "config", "--local", "--name-only", "--null", "--list")
+	configPath, err := o.runGit(ctx, project.RepoPath, "rev-parse", "--path-format=absolute", "--git-path", "config")
 	if err != nil {
 		return errors.New("inspect repository configuration failed")
 	}
-	for _, key := range strings.Split(strings.ToLower(keys), "\x00") {
-		if unsafeLocalConfigKey(key, strings.ToLower(project.Remote)) {
+	configPath, err = filepath.EvalSymlinks(configPath)
+	if err != nil {
+		return errors.New("inspect repository configuration failed")
+	}
+	output, err := o.runGit(ctx, project.RepoPath, "config", "--local", "--includes", "--show-origin", "--null", "--list")
+	if err != nil {
+		return errors.New("inspect repository configuration failed")
+	}
+	entries, err := parseLocalConfig(output)
+	if err != nil {
+		return errors.New("repository contains unsafe local configuration")
+	}
+	seenURL, seenFetch := 0, 0
+	for _, entry := range entries {
+		origin := strings.TrimPrefix(entry.origin, "file:")
+		if !filepath.IsAbs(origin) {
+			origin = filepath.Join(project.RepoPath, origin)
+		}
+		origin, originErr := filepath.EvalSymlinks(origin)
+		if originErr != nil || origin != configPath || !allowedLocalConfig(project, entry, &seenURL, &seenFetch) {
 			return errors.New("repository contains unsafe local configuration")
 		}
 	}
-	remoteURL, err := runGit(ctx, project.RepoPath, "config", "--local", "--get", "remote."+project.Remote+".url")
-	if err != nil || !safeRemoteURL(remoteURL) {
-		return errors.New("repository remote is unsafe")
+	if seenURL != 1 || seenFetch != 1 {
+		return errors.New("repository contains unsafe local configuration")
 	}
 	return nil
 }
 
-func unsafeLocalConfigKey(key, remote string) bool {
-	if key == "" {
-		return false
+func parseLocalConfig(output string) ([]localConfigEntry, error) {
+	fields := strings.Split(output, "\x00")
+	if len(fields) > 0 && fields[len(fields)-1] == "" {
+		fields = fields[:len(fields)-1]
 	}
-	for _, prefix := range []string{"include.", "includeif.", "filter.", "credential.", "url."} {
-		if strings.HasPrefix(key, prefix) {
-			return true
+	if len(fields)%2 != 0 {
+		return nil, errors.New("invalid local config output")
+	}
+	entries := make([]localConfigEntry, 0, len(fields)/2)
+	for i := 0; i < len(fields); i += 2 {
+		key, value, ok := strings.Cut(fields[i+1], "\n")
+		if !ok || key == "" {
+			return nil, errors.New("invalid local config entry")
 		}
+		entries = append(entries, localConfigEntry{origin: fields[i], key: strings.ToLower(key), value: value})
 	}
-	for _, exact := range []string{
-		"core.alternaterefscommand", "core.askpass", "core.fsmonitor", "core.gitproxy", "core.hookspath", "core.sshcommand", "core.worktree",
-		"commit.gpgsign", "merge.gpgsign", "gpg.program", "gpg.ssh.program",
-		"remote." + remote + ".mirror", "remote." + remote + ".proxy", "remote." + remote + ".pushurl",
-		"remote." + remote + ".receivepack", "remote." + remote + ".uploadpack", "remote." + remote + ".vcs",
-	} {
-		if key == exact {
-			return true
-		}
-	}
-	return strings.HasPrefix(key, "protocol.") && strings.HasSuffix(key, ".allow") ||
-		strings.HasPrefix(key, "diff.") && strings.HasSuffix(key, ".command") ||
-		strings.HasPrefix(key, "merge.") && strings.HasSuffix(key, ".driver")
+	return entries, nil
 }
 
-func safeRemoteURL(value string) bool {
-	if value == "" || strings.TrimSpace(value) != value || strings.ContainsAny(value, "\x00\r\n") {
-		return false
+func allowedLocalConfig(project Project, entry localConfigEntry, seenURL, seenFetch *int) bool {
+	switch entry.key {
+	case "core.repositoryformatversion":
+		return entry.value == "0" || entry.value == "1"
+	case "extensions.objectformat":
+		return entry.value == "sha256"
+	case "core.filemode", "core.bare", "core.logallrefupdates", "core.ignorecase", "core.precomposeunicode":
+		return entry.value == "true" || entry.value == "false"
+	case "user.name", "user.email":
+		return entry.value != "" && !strings.ContainsRune(entry.value, 0)
+	case "remote." + strings.ToLower(project.Remote) + ".url":
+		(*seenURL)++
+		value, err := normalizeRemoteURL(entry.value, project.AllowLocalRemote)
+		return err == nil && value == project.RemoteURL
+	case "remote." + strings.ToLower(project.Remote) + ".fetch":
+		(*seenFetch)++
+		return entry.value == "+refs/heads/*:refs/remotes/"+project.Remote+"/*"
 	}
-	if filepath.IsAbs(value) {
-		_, err := canonicalDirectory(value)
-		return err == nil
+	if strings.HasPrefix(entry.key, "branch.") && strings.HasSuffix(entry.key, ".remote") {
+		return entry.value == project.Remote
 	}
-	if scpURLPattern.MatchString(value) && !strings.Contains(value, "::") {
-		return true
+	if strings.HasPrefix(entry.key, "branch.") && strings.HasSuffix(entry.key, ".merge") {
+		return literalBranchRef(entry.value)
 	}
-	parsed, err := url.Parse(value)
-	if err != nil || parsed.Host == "" {
-		return false
-	}
-	switch parsed.Scheme {
-	case "https", "git":
-	case "ssh":
-		if parsed.RawPath != "" || !sshPathPattern.MatchString(parsed.Path) {
-			return false
-		}
-	default:
-		return false
-	}
-	if parsed.User != nil {
-		if _, hasPassword := parsed.User.Password(); hasPassword {
-			return false
-		}
-	}
-	return true
+	return false
 }
 
-func fetchRemoteBranch(ctx context.Context, project Project, branch string) (string, func() error, error) {
+func literalBranchRef(value string) bool {
+	if !strings.HasPrefix(value, "refs/heads/") {
+		return false
+	}
+	branch := strings.TrimPrefix(value, "refs/heads/")
+	return branch != "" && !strings.ContainsAny(branch, " ~^:?*[\\") && !strings.Contains(branch, "..") && !strings.HasSuffix(branch, ".")
+}
+
+func (o *Operator) fetchRemoteBranch(ctx context.Context, project Project, branch string) (string, func() error, error) {
 	remoteRef := "refs/heads/" + branch
-	listed, err := runGit(ctx, project.RepoPath, "ls-remote", "--refs", project.Remote, remoteRef)
+	listed, err := o.runGit(ctx, project.RepoPath, "ls-remote", "--refs", project.RemoteURL, remoteRef)
 	if err != nil {
 		return "", nil, errors.New("inspect remote ref failed")
 	}
@@ -308,18 +373,18 @@ func fetchRemoteBranch(ctx context.Context, project Project, branch string) (str
 	if err != nil {
 		return "", nil, err
 	}
-	cleanup := refCleanup(project.RepoPath, temporary)
-	if _, err := runGit(ctx, project.RepoPath, "fetch", "--no-tags", project.Remote, remoteRef+":"+temporary); err != nil {
+	cleanup := o.refCleanup(project.RepoPath, temporary)
+	if _, err := o.runGit(ctx, project.RepoPath, fetchArgs(project.RemoteURL, remoteRef+":"+temporary)...); err != nil {
 		return "", nil, errors.Join(errors.New("fetch remote ref failed"), cleanup())
 	}
-	commit, err := resolveCommit(ctx, project.RepoPath, temporary)
+	commit, err := o.resolveCommit(ctx, project.RepoPath, temporary)
 	if err != nil {
 		return "", nil, errors.Join(errors.New("resolve fetched remote ref failed"), cleanup())
 	}
 	return commit, cleanup, nil
 }
 
-func fetchMergeBranches(ctx context.Context, project Project, taskBranch string) (string, string, func() error, error) {
+func (o *Operator) fetchMergeBranches(ctx context.Context, project Project, taskBranch string) (string, string, func() error, error) {
 	taskRef, err := temporaryRef("task")
 	if err != nil {
 		return "", "", nil, err
@@ -328,19 +393,19 @@ func fetchMergeBranches(ctx context.Context, project Project, taskBranch string)
 	if err != nil {
 		return "", "", nil, err
 	}
-	cleanup := refCleanup(project.RepoPath, taskRef, rcRef)
-	_, err = runGit(ctx, project.RepoPath, "fetch", "--no-tags", project.Remote,
-		"refs/heads/"+taskBranch+":"+taskRef,
-		"refs/heads/"+project.RCBranch+":"+rcRef,
-	)
-	if err != nil {
+	cleanup := o.refCleanup(project.RepoPath, taskRef, rcRef)
+	refspecs := []string{
+		"refs/heads/" + taskBranch + ":" + taskRef,
+		"refs/heads/" + project.RCBranch + ":" + rcRef,
+	}
+	if _, err := o.runGit(ctx, project.RepoPath, fetchArgs(project.RemoteURL, refspecs...)...); err != nil {
 		return "", "", nil, errors.Join(errors.New("fetch merge refs failed"), cleanup())
 	}
-	taskCommit, err := resolveCommit(ctx, project.RepoPath, taskRef)
+	taskCommit, err := o.resolveCommit(ctx, project.RepoPath, taskRef)
 	if err != nil {
 		return "", "", nil, errors.Join(errors.New("resolve remote task commit failed"), cleanup())
 	}
-	rcCommit, err := resolveCommit(ctx, project.RepoPath, rcRef)
+	rcCommit, err := o.resolveCommit(ctx, project.RepoPath, rcRef)
 	if err != nil {
 		return "", "", nil, errors.Join(errors.New("resolve remote RC commit failed"), cleanup())
 	}
@@ -355,13 +420,13 @@ func temporaryRef(label string) (string, error) {
 	return "refs/qqcodex/" + hex.EncodeToString(random[:]) + "/" + label, nil
 }
 
-func refCleanup(repo string, refs ...string) func() error {
+func (o *Operator) refCleanup(repo string, refs ...string) func() error {
 	return func() error {
 		ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
 		defer cancel()
 		var cleanupErr error
 		for _, ref := range refs {
-			if _, err := runGit(ctx, repo, "update-ref", "-d", ref); err != nil {
+			if _, err := o.runGit(ctx, repo, "update-ref", "-d", ref); err != nil {
 				cleanupErr = errors.Join(cleanupErr, errors.New("clean temporary Git ref failed"))
 			}
 		}
@@ -369,16 +434,16 @@ func refCleanup(repo string, refs ...string) func() error {
 	}
 }
 
-func resolveCommit(ctx context.Context, repo, revision string) (string, error) {
-	commit, err := runGit(ctx, repo, "rev-parse", "--verify", "--end-of-options", revision+"^{commit}")
+func (o *Operator) resolveCommit(ctx context.Context, repo, revision string) (string, error) {
+	commit, err := o.runGit(ctx, repo, "rev-parse", "--verify", "--end-of-options", revision+"^{commit}")
 	if err != nil || !commitPattern.MatchString(commit) {
 		return "", errors.New("invalid commit")
 	}
 	return commit, nil
 }
 
-func isAncestor(ctx context.Context, repo, ancestor, commit string) (bool, error) {
-	_, err := runGit(ctx, repo, "merge-base", "--is-ancestor", ancestor, commit)
+func (o *Operator) isAncestor(ctx context.Context, repo, ancestor, commit string) (bool, error) {
+	_, err := o.runGit(ctx, repo, "merge-base", "--is-ancestor", ancestor, commit)
 	if err == nil {
 		return true, nil
 	}
@@ -394,15 +459,19 @@ func reserveWorktreePath() (string, error) {
 	if err != nil {
 		return "", errors.New("reserve RC worktree failed")
 	}
+	if err := os.Chmod(root, 0o700); err != nil {
+		_ = os.RemoveAll(root)
+		return "", errors.New("secure RC worktree root failed")
+	}
 	return filepath.Join(root, "worktree"), nil
 }
 
-func cleanupWorktree(repo, worktree string, added bool) error {
+func (o *Operator) cleanupWorktree(repo, worktree string, added bool) error {
 	var cleanupErr error
 	ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
 	defer cancel()
 	if added {
-		if _, err := runGit(ctx, repo, "worktree", "remove", "--force", worktree); err != nil {
+		if _, err := o.runGit(ctx, repo, "worktree", "remove", "--force", worktree); err != nil {
 			cleanupErr = errors.Join(cleanupErr, errors.New("clean RC worktree failed"))
 		}
 	}
@@ -411,17 +480,45 @@ func cleanupWorktree(repo, worktree string, added bool) error {
 		cleanupErr = errors.Join(cleanupErr, errors.New("clean RC worktree directory failed"))
 	}
 	if !added || cleanupErr != nil {
-		if _, err := runGit(ctx, repo, "worktree", "prune"); err != nil {
+		if _, err := o.runGit(ctx, repo, "worktree", "prune"); err != nil {
 			cleanupErr = errors.Join(cleanupErr, errors.New("prune RC worktree registration failed"))
 		}
 	}
 	return cleanupErr
 }
 
-func runGit(ctx context.Context, repo string, args ...string) (string, error) {
-	argv := []string{"git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-C", repo}
+func runChecks(ctx context.Context, project Project, worktree string) error {
+	root := filepath.Dir(worktree)
+	home := filepath.Join(root, "check-home")
+	temp := filepath.Join(root, "check-tmp")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		return errors.New("create check home failed")
+	}
+	if err := os.MkdirAll(temp, 0o700); err != nil {
+		return errors.New("create check temporary directory failed")
+	}
+	env := fixedEnvironment(home, temp)
+	for i, check := range project.Checks {
+		argv := append(append([]string(nil), project.CheckRunner...), "--")
+		argv = append(argv, check...)
+		if _, err := runProcess(ctx, worktree, argv, env); err != nil {
+			return fmt.Errorf("RC check %d failed", i+1)
+		}
+	}
+	return nil
+}
+
+func (o *Operator) runGit(ctx context.Context, repo string, args ...string) (string, error) {
+	argv := []string{
+		o.gitBinary,
+		"-c", "core.hooksPath=/dev/null",
+		"-c", "core.fsmonitor=false",
+		// Git 2.43 accepts --no-push-option but does not clear configured push.pushOption.
+		"-c", "push.pushOption=",
+		"-C", repo,
+	}
 	argv = append(argv, args...)
-	return runProcess(ctx, repo, argv, os.Environ())
+	return runProcess(ctx, repo, argv, o.gitEnv)
 }
 
 type boundedBuffer struct {
@@ -474,28 +571,19 @@ func runProcess(ctx context.Context, dir string, argv, env []string) (string, er
 		if cause == nil {
 			cause = context.Canceled
 		}
-		return "", fmt.Errorf("process canceled: %w", cause)
+		return strings.TrimSpace(output.buffer.String()), fmt.Errorf("process canceled: %w", cause)
 	}
 	if output.truncated {
-		return "", errors.New("process output exceeded limit")
+		return strings.TrimSpace(output.buffer.String()), errors.New("process output exceeded limit")
 	}
 	if err != nil {
-		return "", err
+		return strings.TrimSpace(output.buffer.String()), err
 	}
 	return strings.TrimSpace(output.buffer.String()), nil
 }
 
 func checkEnvironment() []string {
-	var env []string
-	for _, name := range []string{
-		"PATH", "HOME", "LANG", "LC_ALL", "TZ", "TMPDIR", "TMP", "TEMP",
-		"XDG_CACHE_HOME", "GOCACHE", "GOMODCACHE", "GOPATH", "GOENV", "GOPROXY", "GOSUMDB", "CGO_ENABLED",
-	} {
-		if value, ok := os.LookupEnv(name); ok {
-			env = append(env, name+"="+value)
-		}
-	}
-	return env
+	return fixedEnvironment("/nonexistent", "/tmp")
 }
 
 func replaceEnvironment(base []string, values map[string]string) []string {
@@ -513,4 +601,23 @@ func replaceEnvironment(base []string, values map[string]string) []string {
 		result = append(result, name+"="+value)
 	}
 	return result
+}
+
+func gitEnvironment() []string {
+	home := "/nonexistent"
+	if value, ok := os.LookupEnv("HOME"); ok && filepath.IsAbs(value) {
+		home = filepath.Clean(value)
+	}
+	env := fixedEnvironment(home, "/tmp")
+	if socket, ok := os.LookupEnv("SSH_AUTH_SOCK"); ok && filepath.IsAbs(socket) {
+		if info, err := os.Lstat(socket); err == nil && info.Mode()&os.ModeSocket != 0 {
+			env = append(env, "SSH_AUTH_SOCK="+filepath.Clean(socket))
+		}
+	}
+	return env
+}
+
+func deployKey(projectID, taskID, rcCommit string) string {
+	sum := sha256.Sum256([]byte(projectID + "\x00" + taskID + "\x00" + rcCommit))
+	return hex.EncodeToString(sum[:])
 }

@@ -9,7 +9,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -53,7 +52,13 @@ func (c Client) call(ctx context.Context, wantCommit string, args ...string) (st
 	if err := validateArgv(c.Command); err != nil {
 		return "", errors.New("ops command is invalid")
 	}
-	argv := append(append([]string(nil), c.Command...), args...)
+	executable, err := trustedExecutable(c.Command[0], nil)
+	if err != nil {
+		return "", errors.New("ops command is invalid")
+	}
+	command := append([]string(nil), c.Command...)
+	command[0] = executable
+	argv := append(command, args...)
 	stdout, runErr := runClientProcess(ctx, argv)
 	response, decodeErr := decodeHelperResponse(stdout)
 	if decodeErr != nil {
@@ -189,13 +194,5 @@ func (b *limitedBytes) Write(p []byte) (int, error) {
 }
 
 func clientEnvironment() []string {
-	env := make([]string, 0, len(os.Environ()))
-	for _, entry := range os.Environ() {
-		name, _, ok := strings.Cut(entry, "=")
-		if ok && (name == "CODEX_API_KEY" || name == "OPENAI_API_KEY") {
-			continue
-		}
-		env = append(env, entry)
-	}
-	return env
+	return fixedEnvironment("/nonexistent", "/tmp")
 }
