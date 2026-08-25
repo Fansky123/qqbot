@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -30,9 +31,12 @@ const (
 	helperSpawn   = "QQ_CODEX_HELPER_SPAWN"
 	helperPID     = "QQ_CODEX_HELPER_PID"
 	helperChild   = "QQ_CODEX_HELPER_CHILD"
+	helperStdout  = "QQ_CODEX_HELPER_STDOUT"
+	helperDirty   = "QQ_CODEX_HELPER_DIRTY_TEMP"
 )
 
 type helperRecordData struct {
+	PID           int      `json:"pid"`
 	Args          []string `json:"args"`
 	Env           []string `json:"env"`
 	Dir           string   `json:"dir"`
@@ -49,7 +53,7 @@ func init() {
 	}
 	if os.Getenv(helperChild) == "1" {
 		pid := strconv.Itoa(os.Getpid())
-		_ = os.WriteFile(os.Getenv(helperPID), []byte(pid), 0o600)
+		helperMust(os.WriteFile(os.Getenv(helperPID), []byte(pid), 0o600))
 		for {
 			time.Sleep(time.Hour)
 		}
@@ -59,7 +63,7 @@ func init() {
 }
 
 func runCodexHelper() {
-	record := helperRecordData{Args: os.Args[1:], Env: os.Environ()}
+	record := helperRecordData{PID: os.Getpid(), Args: os.Args[1:], Env: os.Environ()}
 	record.Dir, _ = os.Getwd()
 	record.SchemaPath = flagValue(record.Args, "--output-schema")
 	record.LastPath = flagValue(record.Args, "-o")
@@ -76,27 +80,57 @@ func runCodexHelper() {
 		}
 		_ = os.WriteFile(record.LastPath, []byte(envOr(helperFinal, "final answer")), 0o600)
 	}
-	data, _ := json.Marshal(record)
-	_ = os.WriteFile(os.Getenv(helperRecord), data, 0o600)
+	data, err := json.Marshal(record)
+	helperMust(err)
+	helperMust(os.WriteFile(os.Getenv(helperRecord), data, 0o600))
+	if os.Getenv(helperDirty) == "schema" {
+		helperMust(os.Remove(record.SchemaPath))
+		helperMust(os.Mkdir(record.SchemaPath, 0o700))
+		helperMust(os.WriteFile(filepath.Join(record.SchemaPath, "retained"), []byte("private temp content"), 0o600))
+	} else if os.Getenv(helperDirty) == "remove-schema" {
+		helperMust(os.Remove(record.SchemaPath))
+	}
 
-	if os.Getenv(helperSpawn) == "1" {
+	if spawn := os.Getenv(helperSpawn); spawn != "" {
 		cmd := exec.Command(os.Args[0])
 		cmd.Env = append(os.Environ(), helperChild+"=1")
-		_ = cmd.Start()
+		if spawn == "detached" {
+			cmd.Stdout = os.Stdout
+			cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+		}
+		helperMust(cmd.Start())
 	}
 
-	fmt.Fprintln(os.Stdout, `{"type":"item.completed","thread_id":"unrelated"}`)
-	fmt.Fprintln(os.Stdout, `{"type":"thread.started","thread_id":"thread-123"}`)
-	if size, _ := strconv.Atoi(os.Getenv(helperLarge)); size > 0 {
-		fmt.Fprintf(os.Stdout, `{"type":"item.completed","data":"%s"}`+"\n", strings.Repeat("x", size))
+	if output, ok := os.LookupEnv(helperStdout); ok {
+		_, err = io.WriteString(os.Stdout, output)
+		helperMust(err)
+	} else {
+		helperPrintln(`{"type":"item.completed","thread_id":"unrelated"}`)
+		helperPrintln(`{"type":"thread.started","thread_id":"thread-123"}`)
+		if size, _ := strconv.Atoi(os.Getenv(helperLarge)); size > 0 {
+			_, err = fmt.Fprintf(os.Stdout, `{"type":"item.completed","data":"%s"}`+"\n", strings.Repeat("x", size))
+			helperMust(err)
+		}
+		helperPrintln(`{"type":"item.completed","item":{"type":"agent_message","text":"done"}}`)
 	}
-	fmt.Fprintln(os.Stdout, `{"type":"item.completed","item":{"type":"agent_message","text":"done"}}`)
 	_, _ = fmt.Fprint(os.Stderr, os.Getenv(helperStderr))
 	if delay, _ := time.ParseDuration(os.Getenv(helperSleep)); delay > 0 {
 		time.Sleep(delay)
 	}
 	if code, _ := strconv.Atoi(os.Getenv(helperExit)); code != 0 {
 		os.Exit(code)
+	}
+}
+
+func helperPrintln(line string) {
+	_, err := fmt.Fprintln(os.Stdout, line)
+	helperMust(err)
+}
+
+func helperMust(err error) {
+	if err != nil {
+		_, _ = fmt.Fprintln(os.Stderr, err)
+		os.Exit(98)
 	}
 }
 
@@ -118,7 +152,7 @@ func envOr(name, fallback string) string {
 
 func TestRunnerPlanArgumentsAndTemporaryFiles(t *testing.T) {
 	runner, req, recordPath := helperRunner(t)
-	prompt := "literal `code` $(touch nope); 'quoted' \"double\"\nsecond line"
+	prompt := "--dangerously-bypass-approvals-and-sandbox literal `code` $(touch nope); 'quoted' \"double\"\nsecond line"
 	req.Prompt = prompt
 
 	result, err := runner.Plan(context.Background(), req)
@@ -126,10 +160,11 @@ func TestRunnerPlanArgumentsAndTemporaryFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	record := readHelperRecord(t, recordPath)
-	want := []string{
-		"exec", "-C", req.WorkingDir, "--sandbox", "read-only", "--ephemeral",
-		"--output-schema", record.SchemaPath, "--json", "-o", record.LastPath, prompt,
-	}
+	want := append([]string{"exec"}, expectedPolicyArgs(runner.KeepEnv)...)
+	want = append(want,
+		"-C", req.WorkingDir, "--sandbox", "read-only", "--ephemeral",
+		"--output-schema", record.SchemaPath, "--json", "-o", record.LastPath, "--", prompt,
+	)
 	if !reflect.DeepEqual(record.Args, want) {
 		t.Fatalf("argv = %#v, want %#v", record.Args, want)
 	}
@@ -159,16 +194,15 @@ func TestRunnerPlanArgumentsAndTemporaryFiles(t *testing.T) {
 func TestRunnerExecuteArguments(t *testing.T) {
 	runner, req, recordPath := helperRunner(t)
 	req.GitCommonDir = t.TempDir()
-	req.Prompt = "make the requested change"
+	req.Prompt = "--dangerously-bypass-approvals-and-sandbox"
 
 	if _, err := runner.Execute(context.Background(), req); err != nil {
 		t.Fatal(err)
 	}
 	record := readHelperRecord(t, recordPath)
-	want := []string{
-		"exec", "-C", req.WorkingDir, "--sandbox", "workspace-write", "--add-dir", req.GitCommonDir,
-		"--json", "-o", record.LastPath, req.Prompt,
-	}
+	want := append([]string{"exec"}, expectedPolicyArgs(runner.KeepEnv)...)
+	want = append(want, "-C", req.WorkingDir, "--sandbox", "workspace-write", "--add-dir", req.GitCommonDir,
+		"--json", "-o", record.LastPath, "--", req.Prompt)
 	if !reflect.DeepEqual(record.Args, want) {
 		t.Fatalf("argv = %#v, want %#v", record.Args, want)
 	}
@@ -181,18 +215,23 @@ func TestRunnerExecuteArguments(t *testing.T) {
 func TestRunnerResumeArgumentsAndWorkingDirectory(t *testing.T) {
 	runner, req, recordPath := helperRunner(t)
 	req.SessionID = "session-exact"
-	req.Prompt = "continue literally"
+	req.Prompt = "--last"
 
 	if _, err := runner.Resume(context.Background(), req); err != nil {
 		t.Fatal(err)
 	}
 	record := readHelperRecord(t, recordPath)
-	want := []string{"exec", "resume", "--json", "-o", record.LastPath, req.SessionID, req.Prompt}
+	want := append([]string{"exec", "resume"}, expectedPolicyArgs(runner.KeepEnv)...)
+	want = append(want, "--json", "-o", record.LastPath, "--", req.SessionID, req.Prompt)
 	if !reflect.DeepEqual(record.Args, want) {
 		t.Fatalf("argv = %#v, want %#v", record.Args, want)
 	}
+	separator := slices.Index(record.Args, "--")
+	if separator < 0 {
+		t.Fatalf("resume argv lacks option terminator: %#v", record.Args)
+	}
 	for _, forbidden := range []string{"--last", "-C", "--sandbox", "--add-dir"} {
-		if slices.Contains(record.Args, forbidden) {
+		if slices.Contains(record.Args[:separator], forbidden) {
 			t.Fatalf("resume argv contains %q: %#v", forbidden, record.Args)
 		}
 	}
@@ -212,7 +251,7 @@ func TestRunnerSanitizesEnvironment(t *testing.T) {
 	setEnv(t, "ALLOWED_CUSTOM", "kept")
 	setEnv(t, "UNKNOWN_SECRET", "must-not-leak")
 	runner, req, recordPath := helperRunner(t)
-	runner.KeepEnv = append(runner.KeepEnv, "ALLOWED_CUSTOM", "PATH", "ALLOWED_CUSTOM")
+	runner.KeepEnv = append(runner.KeepEnv, "ALLOWED_CUSTOM", "PATH", "CODEX_API_KEY", "ALLOWED_CUSTOM")
 
 	if _, err := runner.Execute(context.Background(), withGitCommonDir(t, req)); err != nil {
 		t.Fatal(err)
@@ -224,6 +263,15 @@ func TestRunnerSanitizesEnvironment(t *testing.T) {
 	}
 	if !reflect.DeepEqual(record.Env, want) {
 		t.Fatalf("environment = %#v, want %#v", record.Env, want)
+	}
+	for _, arg := range record.Args {
+		if strings.Contains(arg, "filters.CODEX_API_KEY") {
+			t.Fatalf("CODEX_API_KEY exposed to tool subprocess policy: %q", arg)
+		}
+	}
+	wantPolicy := expectedPolicyArgs(runner.KeepEnv)
+	if len(record.Args) < 1+len(wantPolicy) || !slices.Equal(record.Args[1:1+len(wantPolicy)], wantPolicy) {
+		t.Fatalf("argv = %#v, want policy prefix %#v", record.Args, wantPolicy)
 	}
 }
 
@@ -262,6 +310,44 @@ func TestRunnerTimeoutKillsProcessGroup(t *testing.T) {
 	}
 	if processAlive(pid) {
 		t.Fatalf("descendant process %d survived cancellation", pid)
+	}
+}
+
+func TestRunnerCancellationWithDetachedStdoutPreservesSuccessfulExit(t *testing.T) {
+	runner, req, recordPath := helperRunner(t)
+	pidPath := filepath.Join(t.TempDir(), "detached.pid")
+	setEnv(t, helperSpawn, "detached")
+	setEnv(t, helperPID, pidPath)
+	runner.KeepEnv = append(runner.KeepEnv, helperSpawn, helperPID)
+	t.Cleanup(func() { killProcessFromFile(pidPath) })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	type outcome struct {
+		result Result
+		err    error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		result, err := runner.Plan(ctx, req)
+		done <- outcome{result, err}
+	}()
+
+	outerPID := waitForHelperPID(t, recordPath)
+	waitForProcessExit(t, outerPID)
+	cancel()
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("Plan() error = %v, want successful outer process result", got.err)
+		}
+		if got.result.SessionID != "thread-123" || len(got.result.EventsJSONL) == 0 {
+			t.Fatalf("result = %#v, want retained events and session", got.result)
+		}
+	case <-time.After(2 * time.Second):
+		killProcessFromFile(pidPath)
+		t.Fatal("Plan did not return after context cancellation closed retained stdout")
 	}
 }
 
@@ -359,6 +445,91 @@ func TestRunnerOnlyUsesThreadStartedSessionID(t *testing.T) {
 	}
 }
 
+func TestRunnerRejectsMalformedAndNonObjectJSONLWithPartialResult(t *testing.T) {
+	tests := []struct {
+		name string
+		line string
+	}{
+		{"malformed", `{`},
+		{"array", `[]`},
+		{"string", `"text"`},
+		{"null", `null`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runner, req, _ := helperRunner(t)
+			prefix := `{"type":"thread.started","thread_id":"session-good"}` + "\n"
+			setEnv(t, helperStdout, prefix+tt.line+"\n")
+			runner.KeepEnv = append(runner.KeepEnv, helperStdout)
+
+			result, err := runner.Plan(context.Background(), req)
+			if err == nil || !strings.Contains(err.Error(), "scan codex JSONL") {
+				t.Fatalf("error = %v, want JSONL scan error", err)
+			}
+			if result.SessionID != "session-good" || string(result.EventsJSONL) != prefix {
+				t.Fatalf("partial result = %#v, want only valid prior event", result)
+			}
+		})
+	}
+}
+
+func TestRunnerRejectsInvalidThreadStartedSessionID(t *testing.T) {
+	tests := []struct {
+		name    string
+		event   string
+		wantErr string
+	}{
+		{"missing", `{"type":"thread.started"}`, "session ID"},
+		{"empty", `{"type":"thread.started","thread_id":""}`, "session ID"},
+		{"option", `{"type":"thread.started","thread_id":"--last"}`, "session ID"},
+		{"whitespace", `{"type":"thread.started","thread_id":"session bad"}`, "session ID"},
+		{"wrong type", `{"type":"thread.started","thread_id":7}`, "session ID"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runner, req, _ := helperRunner(t)
+			prefix := `{"type":"item.completed"}` + "\n"
+			setEnv(t, helperStdout, prefix+tt.event+"\n")
+			runner.KeepEnv = append(runner.KeepEnv, helperStdout)
+
+			result, err := runner.Plan(context.Background(), req)
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error = %v, want %q", err, tt.wantErr)
+			}
+			if result.SessionID != "" || string(result.EventsJSONL) != prefix {
+				t.Fatalf("partial result = %#v, want only prior event", result)
+			}
+		})
+	}
+}
+
+func TestRunnerRequiresSessionIDAfterSuccessfulPersistentInvocation(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(Runner, Request) (Result, error)
+	}{
+		{"execute", func(r Runner, req Request) (Result, error) {
+			return r.Execute(context.Background(), withGitCommonDir(t, req))
+		}},
+		{"resume", func(r Runner, req Request) (Result, error) {
+			req.SessionID = "existing-session"
+			return r.Resume(context.Background(), req)
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runner, req, _ := helperRunner(t)
+			setEnv(t, helperStdout, `{"type":"item.completed"}`+"\n")
+			runner.KeepEnv = append(runner.KeepEnv, helperStdout)
+
+			result, err := tt.run(runner, req)
+			if err == nil || !strings.Contains(err.Error(), "session ID") {
+				t.Fatalf("result = %#v, error = %v, want missing session error", result, err)
+			}
+		})
+	}
+}
+
 func TestRunnerRemovesTemporaryFilesAfterFailure(t *testing.T) {
 	runner, req, recordPath := helperRunner(t)
 	setEnv(t, helperExit, "9")
@@ -389,6 +560,91 @@ func TestRunnerRemovesTemporaryFilesWhenStartFails(t *testing.T) {
 	}
 }
 
+func TestRunnerReportsTemporaryCleanupFailureWithoutLosingResult(t *testing.T) {
+	tests := []struct {
+		name     string
+		exitCode string
+		want     []string
+	}{
+		{"cleanup only", "", []string{"remove private codex temporary file"}},
+		{"joined with process failure", "7", []string{"codex planning failed", "remove private codex temporary file"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runner, req, _ := helperRunner(t)
+			setEnv(t, helperDirty, "schema")
+			runner.KeepEnv = append(runner.KeepEnv, helperDirty)
+			if tt.exitCode != "" {
+				setEnv(t, helperExit, tt.exitCode)
+				runner.KeepEnv = append(runner.KeepEnv, helperExit)
+			}
+
+			result, err := runner.Plan(context.Background(), req)
+			if err == nil {
+				t.Fatal("expected checked cleanup error")
+			}
+			for _, fragment := range tt.want {
+				if !strings.Contains(err.Error(), fragment) {
+					t.Errorf("error = %v, want %q", err, fragment)
+				}
+			}
+			if result.SessionID != "thread-123" || result.Final != "final answer" {
+				t.Fatalf("result = %#v, want successful data retained", result)
+			}
+			if strings.Contains(err.Error(), "private temp content") {
+				t.Fatalf("temporary content leaked in error: %v", err)
+			}
+		})
+	}
+}
+
+func TestRunnerIgnoresAlreadyRemovedTemporaryFile(t *testing.T) {
+	runner, req, _ := helperRunner(t)
+	setEnv(t, helperDirty, "remove-schema")
+	runner.KeepEnv = append(runner.KeepEnv, helperDirty)
+
+	result, err := runner.Plan(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.SessionID != "thread-123" || result.Final != "final answer" {
+		t.Fatalf("result = %#v, want complete result", result)
+	}
+}
+
+func TestRunnerRejectsRepoRelativeBinary(t *testing.T) {
+	runner, req, recordPath := helperRunner(t)
+	localBinary := filepath.Join(req.WorkingDir, "codex")
+	if err := os.Symlink(os.Args[0], localBinary); err != nil {
+		t.Fatal(err)
+	}
+	runner.Binary = "./codex"
+
+	_, err := runner.Plan(context.Background(), req)
+	if err == nil || !strings.Contains(err.Error(), "binary") {
+		t.Fatalf("error = %v, want relative binary validation error", err)
+	}
+	assertNotCreated(t, recordPath)
+}
+
+func TestRunnerResolvesBareBinaryBeforeChangingDirectory(t *testing.T) {
+	runner, req, recordPath := helperRunner(t)
+	binDir := t.TempDir()
+	if err := os.Symlink(os.Args[0], filepath.Join(binDir, "codex-helper")); err != nil {
+		t.Fatal(err)
+	}
+	setEnv(t, "PATH", binDir)
+	runner.Binary = "codex-helper"
+
+	if _, err := runner.Plan(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	record := readHelperRecord(t, recordPath)
+	if record.Dir != req.WorkingDir {
+		t.Fatalf("working directory = %q, want %q", record.Dir, req.WorkingDir)
+	}
+}
+
 func TestRunnerValidatesBeforeSpawning(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -408,6 +664,11 @@ func TestRunnerValidatesBeforeSpawning(t *testing.T) {
 		{"empty git common directory", "execute", func(_ *Runner, q *Request) { q.GitCommonDir = "" }},
 		{"relative git common directory", "execute", func(_ *Runner, q *Request) { q.GitCommonDir = "relative" }},
 		{"empty session ID", "resume", func(_ *Runner, q *Request) { q.SessionID = "" }},
+		{"option session ID", "resume", func(_ *Runner, q *Request) { q.SessionID = "--last" }},
+		{"leading dash session ID", "resume", func(_ *Runner, q *Request) { q.SessionID = "-session" }},
+		{"whitespace session ID", "resume", func(_ *Runner, q *Request) { q.SessionID = "session bad" }},
+		{"slash session ID", "resume", func(_ *Runner, q *Request) { q.SessionID = "session/bad" }},
+		{"long session ID", "resume", func(_ *Runner, q *Request) { q.SessionID = strings.Repeat("a", 129) }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -433,6 +694,19 @@ func TestRunnerValidatesBeforeSpawning(t *testing.T) {
 			}
 			assertNotCreated(t, recordPath)
 		})
+	}
+}
+
+func TestSessionIDValidationBoundaries(t *testing.T) {
+	valid := []string{
+		"session-123",
+		"019c10d9-a29a-73c2-9a48-d131fcde8d46",
+		"a" + strings.Repeat("x", 127),
+	}
+	for _, sessionID := range valid {
+		if err := validateSessionID(sessionID); err != nil {
+			t.Errorf("validateSessionID(%q) error = %v", sessionID, err)
+		}
 	}
 }
 
@@ -511,7 +785,10 @@ func helperRunner(t *testing.T) (Runner, Request, string) {
 	recordPath := filepath.Join(t.TempDir(), "record.json")
 	setEnv(t, helperEnabled, "1")
 	setEnv(t, helperRecord, recordPath)
-	for _, name := range []string{helperFinal, helperStderr, helperExit, helperSleep, helperLarge, helperSpawn, helperPID, helperChild} {
+	for _, name := range []string{
+		helperFinal, helperStderr, helperExit, helperSleep, helperLarge, helperSpawn,
+		helperPID, helperChild, helperStdout, helperDirty,
+	} {
 		unsetEnv(t, name)
 	}
 	workingDir := t.TempDir()
@@ -555,6 +832,26 @@ func countArg(args []string, target string) int {
 		}
 	}
 	return count
+}
+
+func expectedPolicyArgs(keep []string) []string {
+	args := []string{
+		"-c", "shell_environment_policy.inherit=all",
+		"-c", "shell_environment_policy.ignore_default_excludes=false",
+	}
+	names := append([]string{"PATH", "HOME", "LANG", "TMPDIR", "TMP", "TEMP"}, keep...)
+	seen := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		if name == "CODEX_API_KEY" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		args = append(args, "-c", `shell_environment_policy.filters.`+name+`="include"`)
+	}
+	return args
 }
 
 func assertRemoved(t *testing.T, path string) {
@@ -601,4 +898,44 @@ func processAlive(pid int) bool {
 	}
 	fields := strings.Fields(string(data))
 	return len(fields) < 3 || fields[2] != "Z"
+}
+
+func killProcessFromFile(path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	pid, err := strconv.Atoi(string(data))
+	if err != nil {
+		return
+	}
+	_ = syscall.Kill(pid, syscall.SIGKILL)
+}
+
+func waitForHelperPID(t *testing.T, path string) int {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			var record helperRecordData
+			if json.Unmarshal(data, &record) == nil && record.PID > 0 {
+				return record.PID
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("helper record %q did not contain a PID", path)
+	return 0
+}
+
+func waitForProcessExit(t *testing.T, pid int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for processAlive(pid) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if processAlive(pid) {
+		t.Fatalf("helper process %d did not exit", pid)
+	}
 }

@@ -14,6 +14,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -28,6 +30,7 @@ var (
 
 	taskIDPattern  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 	envNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	sessionPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 )
 
 type Request struct {
@@ -78,8 +81,13 @@ func (r Runner) Resume(ctx context.Context, req Request) (Result, error) {
 	return r.run(ctx, req, invocationResume)
 }
 
-func (r Runner) run(parent context.Context, req Request, kind invocation) (Result, error) {
-	env, err := r.validate(req, kind)
+func (r Runner) run(parent context.Context, req Request, kind invocation) (result Result, runErr error) {
+	var temporaryPaths []string
+	defer func() {
+		runErr = errors.Join(runErr, removeTemporaryFiles(temporaryPaths))
+	}()
+
+	binary, env, toolEnv, err := r.validate(req, kind)
 	if err != nil {
 		return Result{}, err
 	}
@@ -102,7 +110,7 @@ func (r Runner) run(parent context.Context, req Request, kind invocation) (Resul
 		_ = stderr.Close()
 		return Result{}, err
 	}
-	defer os.Remove(lastPath)
+	temporaryPaths = append(temporaryPaths, lastPath)
 
 	var schemaPath string
 	if kind == invocationPlan {
@@ -111,28 +119,18 @@ func (r Runner) run(parent context.Context, req Request, kind invocation) (Resul
 			_ = stderr.Close()
 			return Result{}, err
 		}
-		defer os.Remove(schemaPath)
+		temporaryPaths = append(temporaryPaths, schemaPath)
 	}
 
-	args := invocationArgs(kind, req, schemaPath, lastPath)
+	args := invocationArgs(kind, req, schemaPath, lastPath, toolEnv)
 	ctx, cancel := context.WithTimeout(parent, req.Timeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, r.Binary, args...)
+	cmd := exec.CommandContext(ctx, binary, args...)
 	cmd.Dir = req.WorkingDir
 	cmd.Env = env
 	cmd.Stderr = stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.WaitDelay = time.Second
-	cmd.Cancel = func() error {
-		if cmd.Process == nil {
-			return os.ErrProcessDone
-		}
-		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		if errors.Is(err, syscall.ESRCH) {
-			return os.ErrProcessDone
-		}
-		return err
-	}
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -141,6 +139,16 @@ func (r Runner) run(parent context.Context, req Request, kind invocation) (Resul
 			return Result{}, closeErr
 		}
 		return Result{}, fmt.Errorf("open codex JSONL stream: %w", err)
+	}
+	var canceled atomic.Bool
+	var cancelOnce sync.Once
+	var cancelErr error
+	cmd.Cancel = func() error {
+		cancelOnce.Do(func() {
+			canceled.Store(true)
+			cancelErr = errors.Join(killProcessGroup(cmd.Process), closePipe(stdout))
+		})
+		return cancelErr
 	}
 	if err := cmd.Start(); err != nil {
 		result, finalErr := readFinal(lastPath, Result{})
@@ -154,19 +162,44 @@ func (r Runner) run(parent context.Context, req Request, kind invocation) (Resul
 		return result, fmt.Errorf("start codex %s: %w", kind, err)
 	}
 
-	result, scanErr := scanEvents(stdout)
-	if scanErr != nil {
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	type scanOutcome struct {
+		result Result
+		err    error
+	}
+	scanned := make(chan scanOutcome, 1)
+	go func() {
+		result, err := scanEvents(stdout)
+		scanned <- scanOutcome{result: result, err: err}
+	}()
+
+	var outcome scanOutcome
+	select {
+	case outcome = <-scanned:
+	case <-ctx.Done():
+		_ = cmd.Cancel()
+		outcome = <-scanned
+	}
+	if outcome.err != nil && !errors.Is(outcome.err, os.ErrClosed) {
+		_ = killProcessGroup(cmd.Process)
 	}
 	waitErr := cmd.Wait()
-	result, finalErr := readFinal(lastPath, result)
+	if canceled.Load() && cmd.ProcessState != nil && cmd.ProcessState.Success() {
+		waitErr = nil
+	}
+	var finalErr error
+	result, finalErr = readFinal(lastPath, outcome.result)
 	closeErr := closeLog(stderr)
 
-	if ctx.Err() != nil {
-		return result, fmt.Errorf("codex %s canceled: %w", kind, ctx.Err())
+	var protocolErr *jsonlProtocolError
+	if outcome.err != nil && (!canceled.Load() || errors.As(outcome.err, &protocolErr)) {
+		return result, fmt.Errorf("scan codex JSONL: %w", outcome.err)
 	}
-	if scanErr != nil {
-		return result, fmt.Errorf("scan codex JSONL: %w", scanErr)
+	if canceled.Load() && waitErr != nil {
+		cause := ctx.Err()
+		if cause == nil {
+			cause = context.Canceled
+		}
+		return result, fmt.Errorf("codex %s canceled: %w", kind, cause)
 	}
 	if waitErr != nil {
 		return result, fmt.Errorf("codex %s failed: %w", kind, waitErr)
@@ -177,40 +210,110 @@ func (r Runner) run(parent context.Context, req Request, kind invocation) (Resul
 	if closeErr != nil {
 		return result, closeErr
 	}
+	if kind != invocationPlan && result.SessionID == "" {
+		return result, fmt.Errorf("codex %s completed without a session ID", kind)
+	}
 	return result, nil
 }
 
-func (r Runner) validate(req Request, kind invocation) ([]string, error) {
+func removeTemporaryFiles(paths []string) error {
+	var cleanupErr error
+	for _, path := range paths {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove private codex temporary file: %w", err))
+		}
+	}
+	return cleanupErr
+}
+
+func killProcessGroup(process *os.Process) error {
+	if process == nil {
+		return os.ErrProcessDone
+	}
+	err := syscall.Kill(-process.Pid, syscall.SIGKILL)
+	if errors.Is(err, syscall.ESRCH) {
+		return os.ErrProcessDone
+	}
+	return err
+}
+
+func closePipe(pipe io.Closer) error {
+	err := pipe.Close()
+	if errors.Is(err, os.ErrClosed) {
+		return nil
+	}
+	return err
+}
+
+func (r Runner) validate(req Request, kind invocation) (string, []string, []string, error) {
 	if r.Binary == "" {
-		return nil, fmt.Errorf("codex binary is required")
+		return "", nil, nil, fmt.Errorf("codex binary is required")
+	}
+	binary, err := resolveBinary(r.Binary)
+	if err != nil {
+		return "", nil, nil, err
 	}
 	if r.LogDir == "" {
-		return nil, fmt.Errorf("codex log directory is required")
+		return "", nil, nil, fmt.Errorf("codex log directory is required")
 	}
 	if !filepath.IsAbs(r.LogDir) {
-		return nil, fmt.Errorf("codex log directory must be absolute")
+		return "", nil, nil, fmt.Errorf("codex log directory must be absolute")
 	}
 	if !taskIDPattern.MatchString(req.TaskID) || req.TaskID == "." || req.TaskID == ".." {
-		return nil, fmt.Errorf("invalid task ID %q", req.TaskID)
+		return "", nil, nil, fmt.Errorf("invalid task ID %q", req.TaskID)
 	}
 	if err := requireDirectory("working directory", req.WorkingDir); err != nil {
-		return nil, err
+		return "", nil, nil, err
 	}
 	if req.Prompt == "" {
-		return nil, fmt.Errorf("codex prompt is required")
+		return "", nil, nil, fmt.Errorf("codex prompt is required")
 	}
 	if req.Timeout <= 0 {
-		return nil, fmt.Errorf("codex timeout must be positive")
+		return "", nil, nil, fmt.Errorf("codex timeout must be positive")
 	}
 	if kind == invocationExecute {
 		if err := requireDirectory("Git common directory", req.GitCommonDir); err != nil {
-			return nil, err
+			return "", nil, nil, err
 		}
 	}
-	if kind == invocationResume && req.SessionID == "" {
-		return nil, fmt.Errorf("codex session ID is required")
+	if kind == invocationResume {
+		if err := validateSessionID(req.SessionID); err != nil {
+			return "", nil, nil, err
+		}
 	}
-	return sanitizedEnvironment(r.KeepEnv)
+	env, toolEnv, err := sanitizedEnvironment(r.KeepEnv)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	return binary, env, toolEnv, nil
+}
+
+func resolveBinary(binary string) (string, error) {
+	if !filepath.IsAbs(binary) && strings.ContainsRune(binary, filepath.Separator) {
+		return "", fmt.Errorf("codex binary must be absolute or a bare executable name")
+	}
+	if filepath.IsAbs(binary) {
+		return filepath.Clean(binary), nil
+	}
+	resolved, err := exec.LookPath(binary)
+	if err != nil {
+		return "", fmt.Errorf("resolve codex binary: %w", err)
+	}
+	if filepath.IsAbs(resolved) {
+		return resolved, nil
+	}
+	resolved, err = filepath.Abs(resolved)
+	if err != nil {
+		return "", fmt.Errorf("make codex binary path absolute: %w", err)
+	}
+	return resolved, nil
+}
+
+func validateSessionID(sessionID string) error {
+	if !sessionPattern.MatchString(sessionID) {
+		return fmt.Errorf("invalid codex session ID")
+	}
+	return nil
 }
 
 func requireDirectory(label, path string) error {
@@ -230,14 +333,15 @@ func requireDirectory(label, path string) error {
 	return nil
 }
 
-func sanitizedEnvironment(keep []string) ([]string, error) {
-	names := append([]string{"CODEX_API_KEY", "PATH", "HOME", "LANG", "TMPDIR", "TMP", "TEMP"}, keep...)
+func sanitizedEnvironment(keep []string) ([]string, []string, error) {
+	toolNames, err := toolEnvironmentNames(keep)
+	if err != nil {
+		return nil, nil, err
+	}
+	names := append([]string{"CODEX_API_KEY"}, toolNames...)
 	seen := make(map[string]struct{}, len(names))
 	env := make([]string, 0, len(names))
 	for _, name := range names {
-		if !envNamePattern.MatchString(name) {
-			return nil, fmt.Errorf("invalid environment variable name %q", name)
-		}
 		if _, exists := seen[name]; exists {
 			continue
 		}
@@ -246,7 +350,27 @@ func sanitizedEnvironment(keep []string) ([]string, error) {
 			env = append(env, name+"="+value)
 		}
 	}
-	return env, nil
+	return env, toolNames, nil
+}
+
+func toolEnvironmentNames(keep []string) ([]string, error) {
+	names := append([]string{"PATH", "HOME", "LANG", "TMPDIR", "TMP", "TEMP"}, keep...)
+	seen := make(map[string]struct{}, len(names))
+	allowed := make([]string, 0, len(names))
+	for _, name := range names {
+		if !envNamePattern.MatchString(name) {
+			return nil, fmt.Errorf("invalid environment variable name %q", name)
+		}
+		if name == "CODEX_API_KEY" {
+			continue
+		}
+		if _, exists := seen[name]; exists {
+			continue
+		}
+		seen[name] = struct{}{}
+		allowed = append(allowed, name)
+	}
+	return allowed, nil
 }
 
 func ensurePrivateDir(path string) error {
@@ -287,23 +411,48 @@ func privateTemp(dir, pattern string, content []byte) (string, error) {
 	return path, nil
 }
 
-func invocationArgs(kind invocation, req Request, schemaPath, lastPath string) []string {
+func invocationArgs(kind invocation, req Request, schemaPath, lastPath string, toolEnv []string) []string {
+	// The Codex process receives CODEX_API_KEY, while this CLI policy only allows
+	// explicitly named non-auth variables into model-invoked tool subprocesses.
+	policy := environmentPolicyArgs(toolEnv)
 	switch kind {
 	case invocationPlan:
-		return []string{
-			"exec", "-C", req.WorkingDir, "--sandbox", "read-only", "--ephemeral",
-			"--output-schema", schemaPath, "--json", "-o", lastPath, req.Prompt,
-		}
+		args := append([]string{"exec"}, policy...)
+		return append(args, "-C", req.WorkingDir, "--sandbox", "read-only", "--ephemeral",
+			"--output-schema", schemaPath, "--json", "-o", lastPath, "--", req.Prompt)
 	case invocationExecute:
-		return []string{
-			"exec", "-C", req.WorkingDir, "--sandbox", "workspace-write", "--add-dir", req.GitCommonDir,
-			"--json", "-o", lastPath, req.Prompt,
-		}
+		args := append([]string{"exec"}, policy...)
+		return append(args, "-C", req.WorkingDir, "--sandbox", "workspace-write", "--add-dir", req.GitCommonDir,
+			"--json", "-o", lastPath, "--", req.Prompt)
 	case invocationResume:
-		return []string{"exec", "resume", "--json", "-o", lastPath, req.SessionID, req.Prompt}
+		args := append([]string{"exec", "resume"}, policy...)
+		return append(args, "--json", "-o", lastPath, "--", req.SessionID, req.Prompt)
 	default:
 		panic("unknown codex invocation")
 	}
+}
+
+func environmentPolicyArgs(names []string) []string {
+	args := []string{
+		"-c", "shell_environment_policy.inherit=all",
+		"-c", "shell_environment_policy.ignore_default_excludes=false",
+	}
+	for _, name := range names {
+		args = append(args, "-c", `shell_environment_policy.filters.`+name+`="include"`)
+	}
+	return args
+}
+
+type jsonlProtocolError struct {
+	err error
+}
+
+func (e *jsonlProtocolError) Error() string {
+	return e.err.Error()
+}
+
+func (e *jsonlProtocolError) Unwrap() error {
+	return e.err
 }
 
 func scanEvents(reader io.Reader) (Result, error) {
@@ -311,17 +460,35 @@ func scanEvents(reader io.Reader) (Result, error) {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 64*1024), maxEventBytes)
 	for scanner.Scan() {
-		line := scanner.Bytes()
-		result.EventsJSONL = append(result.EventsJSONL, line...)
-		result.EventsJSONL = append(result.EventsJSONL, '\n')
+		rawLine := scanner.Bytes()
+		line := bytes.TrimSpace(rawLine)
+		if len(line) == 0 {
+			continue
+		}
+		var event map[string]json.RawMessage
+		if err := json.Unmarshal(line, &event); err != nil {
+			return result, &jsonlProtocolError{err: fmt.Errorf("decode event object: %w", err)}
+		}
+		if event == nil {
+			return result, &jsonlProtocolError{err: fmt.Errorf("event must be a JSON object")}
+		}
 
-		var event struct {
-			Type     string `json:"type"`
-			ThreadID string `json:"thread_id"`
+		var eventType string
+		_ = json.Unmarshal(event["type"], &eventType)
+		if eventType == "thread.started" {
+			var sessionID string
+			if err := json.Unmarshal(event["thread_id"], &sessionID); err != nil {
+				return result, &jsonlProtocolError{err: fmt.Errorf("decode thread.started session ID: %w", err)}
+			}
+			if err := validateSessionID(sessionID); err != nil {
+				return result, &jsonlProtocolError{err: err}
+			}
+			if result.SessionID == "" {
+				result.SessionID = sessionID
+			}
 		}
-		if err := json.Unmarshal(line, &event); err == nil && event.Type == "thread.started" && result.SessionID == "" {
-			result.SessionID = event.ThreadID
-		}
+		result.EventsJSONL = append(result.EventsJSONL, rawLine...)
+		result.EventsJSONL = append(result.EventsJSONL, '\n')
 	}
 	return result, scanner.Err()
 }
