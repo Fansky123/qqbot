@@ -22,7 +22,11 @@ import (
 	"qqcodex/internal/model"
 )
 
-const maxEventBytes = 1 << 20
+const (
+	maxEventBytes        = 1 << 20
+	maxEventsResultBytes = 1 << 20
+	maxStderrBytes       = 1 << 20
+)
 
 var (
 	//go:embed schema.json
@@ -55,10 +59,15 @@ type Plan struct {
 	Risks   []string `json:"risks"`
 }
 
+type LogSink interface {
+	Append(taskID, stream string, data []byte) error
+}
+
 type Runner struct {
 	Binary  string
 	KeepEnv []string
 	LogDir  string
+	Log     LogSink
 }
 
 type invocation int
@@ -104,19 +113,8 @@ func (r Runner) run(parent context.Context, req Request, kind invocation) (resul
 		return Result{}, err
 	}
 
-	stderrPath := filepath.Join(r.LogDir, req.TaskID+".stderr.log")
-	stderr, err := os.OpenFile(stderrPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-	if err != nil {
-		return Result{}, fmt.Errorf("open private codex stderr log: %w", err)
-	}
-	if err := stderr.Chmod(0o600); err != nil {
-		_ = stderr.Close()
-		return Result{}, fmt.Errorf("secure private codex stderr log: %w", err)
-	}
-
 	lastPath, err := privateTemp(r.LogDir, req.TaskID+"-last-*.tmp", nil)
 	if err != nil {
-		_ = stderr.Close()
 		return Result{}, err
 	}
 	temporaryPaths = append(temporaryPaths, lastPath)
@@ -125,7 +123,6 @@ func (r Runner) run(parent context.Context, req Request, kind invocation) (resul
 	if kind == invocationPlan {
 		schemaPath, err = privateTemp(r.LogDir, req.TaskID+"-schema-*.json.tmp", planSchema)
 		if err != nil {
-			_ = stderr.Close()
 			return Result{}, err
 		}
 		temporaryPaths = append(temporaryPaths, schemaPath)
@@ -137,16 +134,13 @@ func (r Runner) run(parent context.Context, req Request, kind invocation) (resul
 	cmd := exec.CommandContext(ctx, binary, args...)
 	cmd.Dir = req.WorkingDir
 	cmd.Env = env
-	cmd.Stderr = stderr
+	var stderr boundedCapture
+	cmd.Stderr = &stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.WaitDelay = time.Second
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		closeErr := closeLog(stderr)
-		if closeErr != nil {
-			return Result{}, closeErr
-		}
 		return Result{}, fmt.Errorf("open codex JSONL stream: %w", err)
 	}
 	var canceled atomic.Bool
@@ -161,12 +155,8 @@ func (r Runner) run(parent context.Context, req Request, kind invocation) (resul
 	}
 	if err := cmd.Start(); err != nil {
 		result, finalErr := readFinal(lastPath, Result{})
-		closeErr := closeLog(stderr)
 		if finalErr != nil {
 			return result, finalErr
-		}
-		if closeErr != nil {
-			return result, closeErr
 		}
 		return result, fmt.Errorf("start codex %s: %w", kind, err)
 	}
@@ -177,7 +167,7 @@ func (r Runner) run(parent context.Context, req Request, kind invocation) (resul
 	}
 	scanned := make(chan scanOutcome, 1)
 	go func() {
-		result, err := scanEvents(stdout)
+		result, err := scanEvents(stdout, r.Log, req.TaskID)
 		scanned <- scanOutcome{result: result, err: err}
 	}()
 
@@ -194,26 +184,32 @@ func (r Runner) run(parent context.Context, req Request, kind invocation) (resul
 	waitErr := cmd.Wait()
 	var finalErr error
 	result, finalErr = readFinal(lastPath, outcome.result)
-	closeErr := closeLog(stderr)
-
+	logErr := errors.Join(
+		appendLog(r.Log, req.TaskID, "codex.stderr", stderr.Bytes()),
+		appendLog(r.Log, req.TaskID, "codex.final", []byte(result.Final)),
+	)
+	var errs []error
 	if canceled.Load() {
 		cause := ctx.Err()
 		if cause == nil {
 			cause = context.Canceled
 		}
-		return result, fmt.Errorf("codex %s canceled: %w", kind, cause)
+		errs = append(errs, fmt.Errorf("codex %s canceled: %w", kind, cause))
 	}
 	if outcome.err != nil {
-		return result, fmt.Errorf("scan codex JSONL: %w", outcome.err)
+		errs = append(errs, fmt.Errorf("scan codex JSONL: %w", outcome.err))
 	}
-	if waitErr != nil {
-		return result, fmt.Errorf("codex %s failed: %w", kind, waitErr)
+	if waitErr != nil && !canceled.Load() {
+		errs = append(errs, fmt.Errorf("codex %s failed: %w", kind, waitErr))
 	}
 	if finalErr != nil {
-		return result, finalErr
+		errs = append(errs, finalErr)
 	}
-	if closeErr != nil {
-		return result, closeErr
+	if logErr != nil {
+		errs = append(errs, logErr)
+	}
+	if err := errors.Join(errs...); err != nil {
+		return result, err
 	}
 	if kind != invocationPlan && result.SessionID == "" {
 		return result, fmt.Errorf("codex %s completed without a session ID", kind)
@@ -534,7 +530,7 @@ func environmentPolicyArgs(names []string) []string {
 	return args
 }
 
-func scanEvents(reader io.Reader) (Result, error) {
+func scanEvents(reader io.Reader, log LogSink, taskID string) (Result, error) {
 	var result Result
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 64*1024), maxEventBytes)
@@ -566,8 +562,15 @@ func scanEvents(reader io.Reader) (Result, error) {
 				result.SessionID = sessionID
 			}
 		}
-		result.EventsJSONL = append(result.EventsJSONL, rawLine...)
-		result.EventsJSONL = append(result.EventsJSONL, '\n')
+		loggedLine := make([]byte, len(rawLine)+1)
+		copy(loggedLine, rawLine)
+		loggedLine[len(rawLine)] = '\n'
+		if err := appendLog(log, taskID, "codex.events", loggedLine); err != nil {
+			return result, err
+		}
+		if len(result.EventsJSONL)+len(loggedLine) <= maxEventsResultBytes {
+			result.EventsJSONL = append(result.EventsJSONL, loggedLine...)
+		}
 	}
 	return result, scanner.Err()
 }
@@ -581,15 +584,42 @@ func readFinal(path string, result Result) (Result, error) {
 	return result, nil
 }
 
-func closeLog(file *os.File) error {
-	if err := file.Sync(); err != nil {
-		_ = file.Close()
-		return fmt.Errorf("sync private codex stderr log: %w", err)
+func appendLog(log LogSink, taskID, stream string, data []byte) error {
+	if log == nil || len(data) == 0 {
+		return nil
 	}
-	if err := file.Close(); err != nil {
-		return fmt.Errorf("close private codex stderr log: %w", err)
+	if err := log.Append(taskID, stream, data); err != nil {
+		return fmt.Errorf("append %s task log: %w", stream, err)
 	}
 	return nil
+}
+
+type boundedCapture struct {
+	buffer    bytes.Buffer
+	truncated bool
+}
+
+func (c *boundedCapture) Write(p []byte) (int, error) {
+	want := len(p)
+	remaining := maxStderrBytes - c.buffer.Len()
+	if remaining > len(p) {
+		remaining = len(p)
+	}
+	if remaining > 0 {
+		_, _ = c.buffer.Write(p[:remaining])
+	}
+	if remaining < len(p) {
+		c.truncated = true
+	}
+	return want, nil
+}
+
+func (c *boundedCapture) Bytes() []byte {
+	data := append([]byte(nil), c.buffer.Bytes()...)
+	if c.truncated {
+		data = append(data, []byte("\n[codex stderr truncated after 1048576 bytes]\n")...)
+	}
+	return data
 }
 
 func (kind invocation) String() string {

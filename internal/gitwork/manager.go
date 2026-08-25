@@ -3,8 +3,10 @@ package gitwork
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -148,7 +150,7 @@ func deleteTaskBranchIfUnattached(ctx context.Context, repo, branch string) erro
 	return nil
 }
 
-func (m Manager) RunChecks(ctx context.Context, project config.Project, worktree string) error {
+func (m Manager) RunChecks(ctx context.Context, project config.Project, worktree string, output io.Writer) error {
 	root, err := m.resolveRoot(false)
 	if err != nil {
 		return err
@@ -157,22 +159,44 @@ func (m Manager) RunChecks(ctx context.Context, project config.Project, worktree
 	if err != nil {
 		return fmt.Errorf("resolve worktree: %w", err)
 	}
+	if output == nil {
+		return errors.New("check output writer is required")
+	}
 
 	for i, check := range project.Checks {
 		if len(check) == 0 || check[0] == "" {
 			return fmt.Errorf("check %d has no executable", i+1)
 		}
-		if err := runCheck(ctx, worktree, check); err != nil {
-			return fmt.Errorf("check %d: %w", i+1, err)
+		encoded, err := json.Marshal(check)
+		if err != nil {
+			return fmt.Errorf("encode check %d argv: %w", i+1, err)
+		}
+		if err := writeCheckOutput(output, fmt.Sprintf("check %d argv: %s\n", i+1, encoded)); err != nil {
+			return fmt.Errorf("write check %d argv: %w", i+1, err)
+		}
+		result, runErr := runSubprocess(ctx, worktree, check)
+		formatted := result.formattedOutput("check")
+		logErr := writeCheckOutput(output, fmt.Sprintf("check %d combined output:\n%s\n", i+1, formatted))
+		if runErr != nil {
+			return errors.Join(
+				fmt.Errorf("check %d failed: %w: %s", i+1, runErr, formatted),
+				logErr,
+			)
+		}
+		if logErr != nil {
+			return fmt.Errorf("write check %d output: %w", i+1, logErr)
 		}
 	}
 	return nil
 }
 
-func runCheck(ctx context.Context, worktree string, check []string) error {
-	result, err := runSubprocess(ctx, worktree, check)
+func writeCheckOutput(output io.Writer, value string) error {
+	written, err := io.WriteString(output, value)
 	if err != nil {
-		return fmt.Errorf("failed: %w: %s", err, result.formattedOutput("check"))
+		return err
+	}
+	if written != len(value) {
+		return io.ErrShortWrite
 	}
 	return nil
 }

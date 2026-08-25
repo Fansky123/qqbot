@@ -13,11 +13,13 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 
 	"qqcodex/internal/model"
+	"qqcodex/internal/tasklog"
 )
 
 const (
@@ -33,6 +35,7 @@ const (
 	helperChild   = "QQ_CODEX_HELPER_CHILD"
 	helperStdout  = "QQ_CODEX_HELPER_STDOUT"
 	helperDirty   = "QQ_CODEX_HELPER_DIRTY_TEMP"
+	helperMany    = "QQ_CODEX_HELPER_MANY_EVENTS"
 )
 
 type helperRecordData struct {
@@ -117,6 +120,11 @@ func runCodexHelper() {
 	} else {
 		helperPrintln(`{"type":"item.completed","thread_id":"unrelated"}`)
 		helperPrintln(`{"type":"thread.started","thread_id":"thread-123"}`)
+		if count, _ := strconv.Atoi(os.Getenv(helperMany)); count > 0 {
+			for i := range count {
+				helperPrintln(fmt.Sprintf(`{"type":"item.completed","index":%d,"data":"%s"}`, i, strings.Repeat("e", 128)))
+			}
+		}
 		if size, _ := strconv.Atoi(os.Getenv(helperLarge)); size > 0 {
 			_, err = fmt.Fprintf(os.Stdout, `{"type":"item.completed","data":"%s"}`+"\n", strings.Repeat("x", size))
 			helperMust(err)
@@ -477,10 +485,13 @@ func TestRunnerCancellationWithDetachedStdoutReturnsContextErrorAndPartialResult
 
 func TestRunnerReturnsPartialResultWithoutStderrOnFailure(t *testing.T) {
 	runner, req, _ := helperRunner(t)
+	req.TaskID = "T-ABCDEF012345"
 	setEnv(t, helperFinal, "partial final")
 	setEnv(t, helperStderr, "private-secret-stderr")
 	setEnv(t, helperExit, "7")
 	runner.KeepEnv = append(runner.KeepEnv, helperFinal, helperStderr, helperExit)
+	sink := &recordingLogSink{}
+	runner.Log = sink
 
 	result, err := runner.Plan(context.Background(), req)
 	if err == nil {
@@ -492,34 +503,8 @@ func TestRunnerReturnsPartialResultWithoutStderrOnFailure(t *testing.T) {
 	if strings.Contains(err.Error(), "private-secret-stderr") || strings.Contains(string(result.EventsJSONL), "private-secret-stderr") || strings.Contains(result.Final, "private-secret-stderr") {
 		t.Fatalf("stderr leaked through returned data: result=%#v error=%v", result, err)
 	}
-	entries, readErr := os.ReadDir(runner.LogDir)
-	if readErr != nil {
-		t.Fatal(readErr)
-	}
-	var found bool
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		path := filepath.Join(runner.LogDir, entry.Name())
-		data, readErr := os.ReadFile(path)
-		if readErr != nil {
-			t.Fatal(readErr)
-		}
-		if string(data) != "private-secret-stderr" {
-			continue
-		}
-		found = true
-		info, statErr := entry.Info()
-		if statErr != nil {
-			t.Fatal(statErr)
-		}
-		if info.Mode().Perm() != 0o600 {
-			t.Fatalf("stderr log mode = %o, want 600", info.Mode().Perm())
-		}
-	}
-	if !found {
-		t.Fatal("private stderr log not found")
+	if got := sink.joined("codex.stderr"); got != "private-secret-stderr" {
+		t.Fatalf("codex.stderr = %q", got)
 	}
 	info, statErr := os.Stat(runner.LogDir)
 	if statErr != nil {
@@ -527,6 +512,106 @@ func TestRunnerReturnsPartialResultWithoutStderrOnFailure(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0o700 {
 		t.Fatalf("log directory mode = %o, want 700", info.Mode().Perm())
+	}
+}
+
+func TestRunnerRoutesEventsStderrAndFinalToLogSink(t *testing.T) {
+	runner, req, _ := helperRunner(t)
+	req.TaskID = "T-ABCDEF012345"
+	setEnv(t, helperStderr, "private helper detail\n")
+	runner.KeepEnv = append(runner.KeepEnv, helperStderr)
+	sink := &recordingLogSink{}
+	runner.Log = sink
+
+	result, err := runner.Plan(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := sink.joined("codex.events"); !strings.Contains(got, `"thread.started"`) {
+		t.Fatalf("codex.events = %q, want JSONL events", got)
+	}
+	if got := sink.joined("codex.stderr"); got != "private helper detail\n" {
+		t.Fatalf("codex.stderr = %q", got)
+	}
+	if got := sink.joined("codex.final"); got != result.Final {
+		t.Fatalf("codex.final = %q, want %q", got, result.Final)
+	}
+	for _, entry := range sink.entriesCopy() {
+		if entry.taskID != req.TaskID {
+			t.Fatalf("logged task ID = %q, want %q", entry.taskID, req.TaskID)
+		}
+	}
+	entries, readErr := os.ReadDir(runner.LogDir)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".stderr.log") {
+			t.Fatalf("raw stderr file remains: %s", entry.Name())
+		}
+	}
+}
+
+func TestRunnerBoundsReturnedEventsWhileLoggingEveryLine(t *testing.T) {
+	runner, req, _ := helperRunner(t)
+	req.TaskID = "T-ABCDEF012345"
+	setEnv(t, helperMany, "12000")
+	runner.KeepEnv = append(runner.KeepEnv, helperMany)
+	sink := &recordingLogSink{}
+	runner.Log = sink
+
+	result, err := runner.Plan(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.EventsJSONL) > 1<<20 {
+		t.Fatalf("returned events length = %d, want <= 1 MiB", len(result.EventsJSONL))
+	}
+	if got := strings.Count(sink.joined("codex.events"), "\n"); got != 12003 {
+		t.Fatalf("logged event count = %d, want 12003", got)
+	}
+}
+
+func TestRunnerFailsAndCancelsWhenEventLoggingFails(t *testing.T) {
+	runner, req, _ := helperRunner(t)
+	req.TaskID = "T-ABCDEF012345"
+	wantErr := errors.New("audit sink unavailable")
+	runner.Log = failingLogSink{stream: "codex.events", err: wantErr}
+
+	_, err := runner.Plan(context.Background(), req)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("Plan() error = %v, want audit sink error", err)
+	}
+}
+
+func TestRunnerTaskLogIntegrationRedactsEveryStream(t *testing.T) {
+	runner, req, _ := helperRunner(t)
+	req.TaskID = "T-ABCDEF012345"
+	secret := "company-codex-secret"
+	setEnv(t, helperStdout, `{"type":"thread.started","thread_id":"thread-123","data":"`+secret+`"}`+"\n")
+	setEnv(t, helperStderr, "CODEX_API_KEY="+secret+"\n")
+	setEnv(t, helperFinal, "Bearer "+secret)
+	runner.KeepEnv = append(runner.KeepEnv, helperStdout, helperStderr, helperFinal)
+	store, err := tasklog.Open(filepath.Join(t.TempDir(), "task-logs"), []string{secret})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner.Log = store
+
+	if _, err := runner.Plan(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Summary(req.TaskID, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(got, secret) {
+		t.Fatalf("task log leaked secret: %s", got)
+	}
+	for _, stream := range []string{"codex.events", "codex.stderr", "codex.final"} {
+		if !strings.Contains(got, `"stream":"`+stream+`"`) {
+			t.Fatalf("task log lacks %s: %s", stream, got)
+		}
 	}
 }
 
@@ -988,7 +1073,7 @@ func helperRunner(t *testing.T) (Runner, Request, string) {
 	setEnv(t, helperRecord, recordPath)
 	for _, name := range []string{
 		helperFinal, helperStderr, helperExit, helperSleep, helperLarge, helperSpawn,
-		helperPID, helperChild, helperStdout, helperDirty,
+		helperPID, helperChild, helperStdout, helperDirty, helperMany,
 	} {
 		unsetEnv(t, name)
 	}
@@ -1004,6 +1089,52 @@ func helperRunner(t *testing.T) (Runner, Request, string) {
 			Prompt:     "test prompt",
 			Timeout:    5 * time.Second,
 		}, recordPath
+}
+
+type logEntry struct {
+	taskID string
+	stream string
+	data   string
+}
+
+type recordingLogSink struct {
+	mu      sync.Mutex
+	entries []logEntry
+}
+
+func (s *recordingLogSink) Append(taskID, stream string, data []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.entries = append(s.entries, logEntry{taskID: taskID, stream: stream, data: string(data)})
+	return nil
+}
+
+func (s *recordingLogSink) entriesCopy() []logEntry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]logEntry(nil), s.entries...)
+}
+
+func (s *recordingLogSink) joined(stream string) string {
+	var value strings.Builder
+	for _, entry := range s.entriesCopy() {
+		if entry.stream == stream {
+			value.WriteString(entry.data)
+		}
+	}
+	return value.String()
+}
+
+type failingLogSink struct {
+	stream string
+	err    error
+}
+
+func (s failingLogSink) Append(_ string, stream string, _ []byte) error {
+	if stream == s.stream {
+		return s.err
+	}
+	return nil
 }
 
 func withGitCommonDir(t *testing.T, req Request) Request {

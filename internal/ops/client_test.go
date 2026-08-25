@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -116,7 +117,7 @@ func TestClientRejectsUntrustedExecutable(t *testing.T) {
 	repo := filepath.Join(privateTempDir(t), "source")
 	git(t, filepath.Dir(repo), "init", repo)
 	workerOwned := writeExecutable(t, filepath.Join(privateTempDir(t), "qqcodex-ops"), "#!/bin/sh\nexit 0\n")
-	if _, err := NewClient([]string{workerOwned, "-config", "/etc/hosts"}, map[string]string{"order-api": repo}); err == nil {
+	if _, err := NewClient([]string{workerOwned, "-config", "/etc/hosts"}, map[string]string{"order-api": repo}, nil); err == nil {
 		t.Fatal("NewClient() error = nil, want worker-owned executable rejection")
 	}
 }
@@ -126,7 +127,7 @@ func TestNewClientAcceptsOnlyRootOwnedExecutables(t *testing.T) {
 	git(t, filepath.Dir(repo), "init", repo)
 	rootCommand := realExecutable(t, "true")
 	validCommand := []string{rootCommand, "-config", "/etc/hosts"}
-	client, err := NewClient(validCommand, map[string]string{"order-api": repo})
+	client, err := NewClient(validCommand, map[string]string{"order-api": repo}, nil)
 	if err != nil {
 		t.Fatalf("NewClient() rejected root-owned command and source Git: %v", err)
 	}
@@ -138,7 +139,7 @@ func TestNewClientAcceptsOnlyRootOwnedExecutables(t *testing.T) {
 	gitDir := privateTempDir(t)
 	writeExecutable(t, filepath.Join(gitDir, "git"), "#!/bin/sh\nexec /usr/bin/git \"$@\"\n")
 	t.Setenv("PATH", gitDir+":/usr/bin:/bin")
-	if _, err := NewClient([]string{rootCommand, "-config", "/etc/hosts"}, map[string]string{"order-api": repo}); err == nil {
+	if _, err := NewClient([]string{rootCommand, "-config", "/etc/hosts"}, map[string]string{"order-api": repo}, nil); err == nil {
 		t.Fatal("NewClient() error = nil, want worker-owned source Git rejection")
 	}
 }
@@ -168,7 +169,7 @@ func TestNewClientRejectsCommandsOutsideFixedContract(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if _, err := NewClient(tt.command, map[string]string{"order-api": repo}); err == nil {
+			if _, err := NewClient(tt.command, map[string]string{"order-api": repo}, nil); err == nil {
 				t.Fatal("NewClient() error = nil, want fixed command rejection")
 			}
 		})
@@ -180,6 +181,51 @@ func TestClientDoesNotExposeHelperStderr(t *testing.T) {
 	err := client.Sync(context.Background(), "order-api")
 	if err == nil || err.Error() != "public failure" {
 		t.Fatalf("Sync() error = %v, want only public JSON error", err)
+	}
+}
+
+func TestClientLogsTaskHelperStderrWithoutExposingIt(t *testing.T) {
+	sink := &opsRecordingSink{}
+	client := mustNewClientWithLog(t, helperCommand(t, filepath.Join(t.TempDir(), "argv.json"), "secret-stderr"), nil, sink)
+	_, err := client.MergeRC(context.Background(), "order-api", testTaskID, strings.Repeat("a", 40))
+	if err == nil || err.Error() != "public failure" {
+		t.Fatalf("MergeRC() error = %v, want only public JSON error", err)
+	}
+	if got := sink.joined("ops.stderr"); got != "PRIVATE-OPS-CREDENTIAL\n" {
+		t.Fatalf("ops.stderr = %q", got)
+	}
+}
+
+func TestClientDoesNotFailCompletedActionWhenTaskLogFails(t *testing.T) {
+	wantErr := errors.New("task log unavailable")
+	record := filepath.Join(t.TempDir(), "argv.json")
+	client := mustNewClientWithLog(t, helperCommand(t, record, "success-stderr"), nil, opsFailingSink{err: wantErr})
+	commit := strings.Repeat("a", 40)
+
+	got, err := client.MergeRC(context.Background(), "order-api", testTaskID, commit)
+	if err != nil || got != commit {
+		t.Fatalf("MergeRC() = %q, %v; want completed commit despite audit failure", got, err)
+	}
+}
+
+func TestClientDoesNotCreatePerTaskLogForSync(t *testing.T) {
+	sink := &opsRecordingSink{}
+	client := mustNewClientWithLog(t, helperCommand(t, filepath.Join(t.TempDir(), "argv.json"), "success-stderr"), nil, sink)
+	if err := client.Sync(context.Background(), "order-api"); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.entries) != 0 {
+		t.Fatalf("Sync() task logs = %#v, want none without task ID", sink.entries)
+	}
+}
+
+func TestClientJoinsTaskLogFailureWithFailedAction(t *testing.T) {
+	wantErr := errors.New("task log unavailable")
+	client := mustNewClientWithLog(t, helperCommand(t, filepath.Join(t.TempDir(), "argv.json"), "secret-stderr"), nil, opsFailingSink{err: wantErr})
+
+	_, err := client.MergeRC(context.Background(), "order-api", testTaskID, strings.Repeat("a", 40))
+	if !errors.Is(err, wantErr) || !strings.Contains(err.Error(), "public failure") {
+		t.Fatalf("MergeRC() error = %v, want public and audit failures", err)
 	}
 }
 
@@ -244,6 +290,13 @@ func TestOpsClientHelper(t *testing.T) {
 		_, _ = os.Stderr.WriteString("PRIVATE-OPS-CREDENTIAL\n")
 		_, _ = os.Stdout.WriteString(`{"ok":false,"error":"public failure"}`)
 		os.Exit(1)
+	case "success-stderr":
+		_, _ = os.Stderr.WriteString("PRIVATE-OPS-CREDENTIAL\n")
+		if len(args) > 0 && args[0] == "merge" {
+			_, _ = os.Stdout.WriteString(`{"ok":true,"rc_commit":"` + commit + `"}`)
+		} else {
+			_, _ = os.Stdout.WriteString(`{"ok":true}`)
+		}
 	default:
 		os.Exit(121)
 	}
@@ -320,12 +373,54 @@ func copiedTestExecutable(t *testing.T, name string) string {
 
 func mustNewClient(t *testing.T, command []string, sourceRepos map[string]string) *Client {
 	t.Helper()
-	client, err := newClient(command, sourceRepos, true)
+	client, err := newClient(command, sourceRepos, true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return client
 }
+
+func mustNewClientWithLog(t *testing.T, command []string, sourceRepos map[string]string, log LogSink) *Client {
+	t.Helper()
+	client, err := newClient(command, sourceRepos, true, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client
+}
+
+type opsLogEntry struct {
+	stream string
+	data   string
+}
+
+type opsRecordingSink struct {
+	mu      sync.Mutex
+	entries []opsLogEntry
+}
+
+func (s *opsRecordingSink) Append(_ string, stream string, data []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.entries = append(s.entries, opsLogEntry{stream: stream, data: string(data)})
+	return nil
+}
+
+func (s *opsRecordingSink) joined(stream string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var value strings.Builder
+	for _, entry := range s.entries {
+		if entry.stream == stream {
+			value.WriteString(entry.data)
+		}
+	}
+	return value.String()
+}
+
+type opsFailingSink struct{ err error }
+
+func (s opsFailingSink) Append(string, string, []byte) error { return s.err }
 
 func clientTaskSource(t *testing.T) (string, string) {
 	t.Helper()

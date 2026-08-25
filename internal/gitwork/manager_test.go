@@ -3,8 +3,10 @@ package gitwork
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,6 +17,7 @@ import (
 	"time"
 
 	"qqcodex/internal/config"
+	"qqcodex/internal/tasklog"
 )
 
 const (
@@ -379,7 +382,7 @@ func TestManagerRunChecksDoesNotInvokeShell(t *testing.T) {
 	payload := "$(touch " + marker + ")"
 	project := config.Project{Checks: [][]string{checkHelperCommand("record-argument", payload, record)}}
 
-	if err := (Manager{Root: root}).RunChecks(context.Background(), project, worktree); err != nil {
+	if err := (Manager{Root: root}).RunChecks(context.Background(), project, worktree, io.Discard); err != nil {
 		t.Fatal(err)
 	}
 	got, err := os.ReadFile(record)
@@ -394,6 +397,77 @@ func TestManagerRunChecksDoesNotInvokeShell(t *testing.T) {
 	}
 }
 
+func TestManagerRunChecksWritesLiteralArgvAndCombinedOutput(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	worktree := filepath.Join(root, "worktree")
+	if err := os.Mkdir(worktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	payload := "$(touch must-stay-literal)"
+	check := checkHelperCommand("print-output", payload)
+	project := config.Project{Checks: [][]string{check}}
+	var output bytes.Buffer
+
+	if err := (Manager{Root: root}).RunChecks(context.Background(), project, worktree, &output); err != nil {
+		t.Fatal(err)
+	}
+	got := output.String()
+	encoded, err := json.Marshal(check)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "check 1 argv: "+string(encoded)+"\n") || !strings.Contains(got, "combined output:\n"+payload+"\n") {
+		t.Fatalf("check log = %q, want deterministic argv and output", got)
+	}
+}
+
+func TestManagerRunChecksPropagatesWriterFailureBeforeExecution(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	worktree := filepath.Join(root, "worktree")
+	if err := os.Mkdir(worktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(root, "ran")
+	wantErr := errors.New("task log unavailable")
+	project := config.Project{Checks: [][]string{checkHelperCommand("record-argument", "ran", marker)}}
+
+	err := (Manager{Root: root}).RunChecks(context.Background(), project, worktree, errorWriter{err: wantErr})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("RunChecks() error = %v, want writer error", err)
+	}
+	if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
+		t.Fatalf("check ran after argv audit failure: %v", statErr)
+	}
+}
+
+func TestManagerRunChecksFramesCompleteRecordsForTaskLogRedaction(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	worktree := filepath.Join(root, "worktree")
+	if err := os.Mkdir(worktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	secret := "check-output-secret"
+	store, err := tasklog.Open(filepath.Join(root, "logs"), []string{secret})
+	if err != nil {
+		t.Fatal(err)
+	}
+	project := config.Project{Checks: [][]string{checkHelperCommand("print-output", secret)}}
+
+	if err := (Manager{Root: root}).RunChecks(context.Background(), project, worktree, store.Writer(firstTaskID, "checks")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Summary(firstTaskID, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(got, secret) || !strings.Contains(got, "[REDACTED]") {
+		t.Fatalf("check task log was not redacted: %s", got)
+	}
+}
+
 func TestManagerSubprocessesUseMinimalEnvironment(t *testing.T) {
 	t.Run("configured check", func(t *testing.T) {
 		root := t.TempDir()
@@ -405,7 +479,7 @@ func TestManagerSubprocessesUseMinimalEnvironment(t *testing.T) {
 		setSensitiveEnvironment(t)
 
 		project := config.Project{Checks: [][]string{checkHelperCommand("record-environment", record)}}
-		if err := (Manager{Root: root}).RunChecks(context.Background(), project, worktree); err != nil {
+		if err := (Manager{Root: root}).RunChecks(context.Background(), project, worktree, io.Discard); err != nil {
 			t.Fatal(err)
 		}
 		assertMinimalEnvironment(t, record)
@@ -541,9 +615,10 @@ func TestManagerRunChecksCancellationKillsProcessGroup(t *testing.T) {
 	defer cancel()
 
 	done := make(chan error, 1)
+	var output bytes.Buffer
 	go func() {
 		project := config.Project{Checks: [][]string{checkHelperCommand("spawn-child", pidPath)}}
-		done <- (Manager{Root: root}).RunChecks(ctx, project, worktree)
+		done <- (Manager{Root: root}).RunChecks(ctx, project, worktree, &output)
 	}()
 
 	pid := waitForPIDFile(t, pidPath)
@@ -555,6 +630,9 @@ func TestManagerRunChecksCancellationKillsProcessGroup(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "check-output-before-cancel") {
 			t.Fatalf("RunChecks() cancellation error lost captured output: %v", err)
+		}
+		if !strings.Contains(output.String(), "check-output-before-cancel") {
+			t.Fatalf("RunChecks() audit output lost cancellation output: %q", output.String())
 		}
 	case <-time.After(2 * time.Second):
 		killProcessFromFile(pidPath)
@@ -580,7 +658,7 @@ func TestManagerRunChecksCancellationBoundsDetachedOutput(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		project := config.Project{Checks: [][]string{checkHelperCommand("spawn-detached-child", pidPath)}}
-		done <- (Manager{Root: root}).RunChecks(ctx, project, worktree)
+		done <- (Manager{Root: root}).RunChecks(ctx, project, worktree, io.Discard)
 	}()
 
 	waitForPIDFile(t, pidPath)
@@ -607,7 +685,7 @@ func TestManagerRunChecksBoundsFailureOutput(t *testing.T) {
 	}
 	project := config.Project{Checks: [][]string{checkHelperCommand("large-output")}}
 
-	err := (Manager{Root: root}).RunChecks(context.Background(), project, worktree)
+	err := (Manager{Root: root}).RunChecks(context.Background(), project, worktree, io.Discard)
 	if err == nil {
 		t.Fatal("RunChecks() error = nil, want failed check error")
 	}
@@ -640,6 +718,8 @@ func TestGitworkCheckHelperProcess(t *testing.T) {
 		}
 		_, _ = os.Stderr.WriteString("TAIL\n")
 		os.Exit(7)
+	case "print-output":
+		_, _ = fmt.Fprintln(os.Stdout, args[1])
 	case "spawn-child", "spawn-detached-child":
 		childArgs := checkHelperCommand("hold-output")
 		child := exec.Command(childArgs[0], childArgs[1:]...)
@@ -659,6 +739,10 @@ func TestGitworkCheckHelperProcess(t *testing.T) {
 	}
 }
 
+type errorWriter struct{ err error }
+
+func (w errorWriter) Write([]byte) (int, error) { return 0, w.err }
+
 func TestManagerRejectsWorktreeOutsideRoot(t *testing.T) {
 	t.Parallel()
 
@@ -666,7 +750,7 @@ func TestManagerRejectsWorktreeOutsideRoot(t *testing.T) {
 	manager := Manager{Root: fixture.worktreeRoot}
 	outside := t.TempDir()
 
-	if err := manager.RunChecks(context.Background(), fixture.project, outside); err == nil {
+	if err := manager.RunChecks(context.Background(), fixture.project, outside, io.Discard); err == nil {
 		t.Fatal("RunChecks() error = nil, want containment error")
 	}
 	if err := manager.Remove(context.Background(), fixture.project.RepoPath, outside); err == nil {

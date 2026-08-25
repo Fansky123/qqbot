@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,6 +26,11 @@ type Client struct {
 	sourceRepos    map[string]string
 	sourceGit      string
 	maxBundleBytes int64
+	log            LogSink
+}
+
+type LogSink interface {
+	Append(taskID, stream string, data []byte) error
 }
 
 type helperResponse struct {
@@ -33,7 +39,7 @@ type helperResponse struct {
 	RCCommit string `json:"rc_commit,omitempty"`
 }
 
-func NewClient(command []string, sourceRepos map[string]string) (*Client, error) {
+func NewClient(command []string, sourceRepos map[string]string, log LogSink) (*Client, error) {
 	if len(command) != 3 || command[1] != "-config" {
 		return nil, errors.New("ops command is invalid")
 	}
@@ -43,10 +49,10 @@ func NewClient(command []string, sourceRepos map[string]string) (*Client, error)
 	}
 	clonedCommand := append([]string(nil), command...)
 	clonedCommand[2] = configPath
-	return newClient(clonedCommand, sourceRepos, false)
+	return newClient(clonedCommand, sourceRepos, false, log)
 }
 
-func newClient(command []string, sourceRepos map[string]string, allowCurrentUID bool) (*Client, error) {
+func newClient(command []string, sourceRepos map[string]string, allowCurrentUID bool, log LogSink) (*Client, error) {
 	if err := validateArgv(command); err != nil {
 		return nil, errors.New("ops command is invalid")
 	}
@@ -80,6 +86,7 @@ func newClient(command []string, sourceRepos map[string]string, allowCurrentUID 
 		sourceRepos:    repositories,
 		sourceGit:      sourceGit,
 		maxBundleBytes: maxTaskBundleBytes,
+		log:            log,
 	}, nil
 }
 
@@ -284,36 +291,53 @@ func (c *Client) call(ctx context.Context, wantCommit string, stdin io.Reader, a
 		return "", errors.New("ops command is invalid")
 	}
 	argv := append(append([]string(nil), c.command...), args...)
-	stdout, runErr := runClientProcess(ctx, argv, stdin)
+	stdout, stderr, runErr := runClientProcess(ctx, argv, stdin)
+	taskID := ""
+	if args[0] != "sync" {
+		taskID = args[4]
+	}
+	logErr := appendTaskLog(c.log, taskID, "ops.stderr", stderr)
+	finish := func(value string, resultErr error) (string, error) {
+		if logErr == nil {
+			return value, resultErr
+		}
+		if resultErr != nil {
+			return value, errors.Join(resultErr, logErr)
+		}
+		// The helper has confirmed the external mutation. Surface the audit failure
+		// to service logs without returning a retryable action error.
+		slog.ErrorContext(ctx, "append completed ops action to task log", "task_id", taskID, "error", logErr)
+		return value, nil
+	}
 	response, decodeErr := decodeHelperResponse(stdout)
 	if decodeErr != nil {
 		if runErr != nil {
-			return "", errors.New("ops helper failed with an invalid response")
+			return finish("", errors.New("ops helper failed with an invalid response"))
 		}
-		return "", decodeErr
+		return finish("", decodeErr)
 	}
 	if *response.OK {
 		if runErr != nil {
-			return "", errors.New("ops helper reported success with a non-zero exit status")
+			return finish("", errors.New("ops helper reported success with a non-zero exit status"))
 		}
 		if response.Error != "" {
-			return "", errors.New("ops helper success response contains an error")
+			return finish("", errors.New("ops helper success response contains an error"))
 		}
 		if wantCommit == "merge" {
 			if !commitPattern.MatchString(response.RCCommit) {
-				return "", errors.New("ops helper returned an invalid RC commit")
+				return finish("", errors.New("ops helper returned an invalid RC commit"))
 			}
-			return response.RCCommit, nil
+			return finish(response.RCCommit, nil)
 		}
 		if response.RCCommit != "" {
-			return "", errors.New("ops helper returned an unexpected RC commit")
+			return finish("", errors.New("ops helper returned an unexpected RC commit"))
 		}
-		return "", nil
+		return finish("", nil)
 	}
 	if runErr == nil || response.Error == "" || response.RCCommit != "" {
-		return "", errors.New("ops helper returned an invalid failure response")
+		return finish("", errors.New("ops helper returned an invalid failure response"))
 	}
-	return "", errors.New(response.Error)
+	return finish("", errors.New(response.Error))
 }
 
 func validateClientInputs(args []string) error {
@@ -368,7 +392,7 @@ func decodeHelperResponse(data []byte) (helperResponse, error) {
 	return response, nil
 }
 
-func runClientProcess(ctx context.Context, argv []string, stdin io.Reader) ([]byte, error) {
+func runClientProcess(ctx context.Context, argv []string, stdin io.Reader) ([]byte, []byte, error) {
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Env = clientEnvironment()
 	cmd.Stdin = stdin
@@ -382,14 +406,28 @@ func runClientProcess(ctx context.Context, argv []string, stdin io.Reader) ([]by
 	var canceled atomic.Bool
 	cmd.Cancel = processGroupCancel(cmd, &canceled)
 	err := cmd.Run()
+	stderrBytes := append([]byte(nil), stderr.buffer.Bytes()...)
+	if stderr.truncated {
+		stderrBytes = append(stderrBytes, []byte("\n[ops stderr truncated]\n")...)
+	}
 	if canceled.Load() {
 		cause := ctx.Err()
 		if cause == nil {
 			cause = context.Canceled
 		}
-		return stdout.bytes, fmt.Errorf("ops helper canceled: %w", cause)
+		return stdout.bytes, stderrBytes, fmt.Errorf("ops helper canceled: %w", cause)
 	}
-	return stdout.bytes, err
+	return stdout.bytes, stderrBytes, err
+}
+
+func appendTaskLog(log LogSink, taskID, stream string, data []byte) error {
+	if log == nil || taskID == "" || len(data) == 0 {
+		return nil
+	}
+	if err := log.Append(taskID, stream, data); err != nil {
+		return fmt.Errorf("append %s task log: %w", stream, err)
+	}
+	return nil
 }
 
 type limitedBytes struct {
