@@ -1,12 +1,15 @@
 package tasklog
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"golang.org/x/sys/unix"
@@ -166,7 +169,7 @@ func TestSummaryIsUnicodeSafeBoundedAndReredacted(t *testing.T) {
 	t.Parallel()
 	store := openStore(t, []string{"summary-secret"})
 	path := filepath.Join(store.Root, testTaskID+".log")
-	if err := os.WriteFile(path, []byte(strings.Repeat("旧", 2000)+" summary-secret 尾部🙂"), 0o600); err != nil {
+	if err := os.WriteFile(path, rawLogRecord(t, strings.Repeat("旧", 2000)+" summary-secret 尾部🙂"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -188,13 +191,11 @@ func TestSummaryIsUnicodeSafeBoundedAndReredacted(t *testing.T) {
 	}
 }
 
-func TestSummaryRedactsSecretCrossingTailReadBoundary(t *testing.T) {
+func TestSummaryReredactsCompleteRecord(t *testing.T) {
 	t.Parallel()
 	secret := "boundary-secret-value"
 	store := openStore(t, []string{secret})
-	cut := len(secret) / 2
-	suffix := strings.Repeat("y", maxSummaryReadBytes-(len(secret)-cut))
-	data := []byte("prefix-" + secret + suffix)
+	data := rawLogRecord(t, "prefix-"+secret+strings.Repeat("y", 100))
 	if err := os.WriteFile(filepath.Join(store.Root, testTaskID+".log"), data, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -203,8 +204,8 @@ func TestSummaryRedactsSecretCrossingTailReadBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(got, secret[cut:]) || !strings.Contains(got, "[REDACTED]") {
-		t.Fatalf("Summary() leaked secret suffix across tail boundary")
+	if strings.Contains(got, secret) || !strings.Contains(got, "[REDACTED]") {
+		t.Fatalf("Summary() did not re-redact complete record")
 	}
 }
 
@@ -239,22 +240,112 @@ func TestOpenBoundsConfiguredSecretsByBytes(t *testing.T) {
 	}
 }
 
-func TestSummaryRedactsMaximumSecretAcrossTailBoundary(t *testing.T) {
+func TestSummaryDiscardsPartialSensitiveRecordAtReadBoundary(t *testing.T) {
 	t.Parallel()
 	secret := strings.Repeat("s", maxRedactionOverlap)
-	store := openStore(t, []string{secret})
-	data := []byte("outside-tail" + secret + strings.Repeat("y", maxSummaryReadBytes))
+	bearer := strings.Repeat("b", maxRedactionOverlap)
+	tests := []struct {
+		name      string
+		sensitive string
+		data      string
+		secrets   []string
+	}{
+		{name: "configured secret", sensitive: secret, data: secret, secrets: []string{secret}},
+		{name: "bearer token", sensitive: bearer, data: "Authorization: Bearer " + bearer},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := openStore(t, tt.secrets)
+			data, sensitiveOffset := boundaryLog(t, tt.data, tt.sensitive)
+			readWindow := maxSummaryReadBytes + maxRedactionOverlap
+			if got := len(data) - readWindow; got != sensitiveOffset+1 {
+				t.Fatalf("read offset = %d, want one byte after sensitive offset %d", got, sensitiveOffset)
+			}
+			if err := os.WriteFile(filepath.Join(store.Root, testTaskID+".log"), data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			got, err := store.Summary(testTaskID, readWindow+100)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(got, tt.sensitive[1:]) {
+				t.Fatal("Summary() leaked suffix from partial sensitive record")
+			}
+			if !strings.Contains(got, "useful-tail") {
+				t.Fatalf("Summary() discarded later valid record: %q", got[len(got)-min(len(got), 200):])
+			}
+		})
+	}
+}
+
+func TestSummarySkipsMalformedAndTrailingPartialRecords(t *testing.T) {
+	t.Parallel()
+	store := openStore(t, nil)
+	data := append([]byte("PRIVATE-MALFORMED-DATA\n"), rawLogRecord(t, "useful-tail")...)
+	data = append(data, []byte(`{"time":"PRIVATE-TRAILING-DATA"`)...)
 	if err := os.WriteFile(filepath.Join(store.Root, testTaskID+".log"), data, 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	got, err := store.Summary(testTaskID, maxSummaryReadBytes+100)
+	got, err := store.Summary(testTaskID, 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(got, secret) || !strings.Contains(got, "[REDACTED]") {
-		t.Fatal("Summary() leaked exact-limit secret across tail boundary")
+	if strings.Contains(got, "PRIVATE-") || !strings.Contains(got, "useful-tail") {
+		t.Fatalf("Summary() returned malformed data or lost valid record: %q", got)
 	}
+}
+
+func TestSummaryReturnsEmptyWhenNoCompleteRecordRemains(t *testing.T) {
+	t.Parallel()
+	store := openStore(t, nil)
+	if err := os.WriteFile(filepath.Join(store.Root, testTaskID+".log"), []byte("PRIVATE-INCOMPLETE"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Summary(testTaskID, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "" {
+		t.Fatalf("Summary() = %q, want empty for incomplete record", got)
+	}
+}
+
+func boundaryLog(t *testing.T, firstData, sensitive string) ([]byte, int) {
+	t.Helper()
+	prefix := rawLogRecord(t, "prefix")
+	sensitiveRecord := rawLogRecord(t, firstData)
+	tail := rawLogRecord(t, "useful-tail")
+	withinRecord := bytes.Index(sensitiveRecord, []byte(sensitive))
+	if withinRecord < 0 {
+		t.Fatal("sensitive value not found in test record")
+	}
+	readWindow := maxSummaryReadBytes + maxRedactionOverlap
+	paddingLength := readWindow + 1 - (len(sensitiveRecord) - withinRecord) - len(tail)
+	emptyPadding := rawLogRecord(t, "")
+	if paddingLength < len(emptyPadding) {
+		t.Fatal("invalid boundary test padding")
+	}
+	padding := rawLogRecord(t, strings.Repeat("y", paddingLength-len(emptyPadding)))
+	if len(padding) != paddingLength {
+		t.Fatalf("padding record length = %d, want %d", len(padding), paddingLength)
+	}
+	data := bytes.Join([][]byte{prefix, sensitiveRecord, padding, tail}, nil)
+	return data, len(prefix) + withinRecord
+}
+
+func rawLogRecord(t *testing.T, data string) []byte {
+	t.Helper()
+	encoded, err := json.Marshal(record{
+		Time:   time.Date(2026, time.August, 26, 0, 0, 0, 0, time.UTC).Format(time.RFC3339Nano),
+		Stream: "test",
+		Data:   data,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return append(encoded, '\n')
 }
 
 func TestStoreRejectsSymlinkTaskFileAndSafeRemove(t *testing.T) {

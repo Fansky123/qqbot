@@ -1,6 +1,7 @@
 package tasklog
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -188,22 +189,81 @@ func (s *Store) Summary(taskID string, maxRunes int) (string, error) {
 		readSize = maxSummaryReadBytes + maxRedactionOverlap
 	}
 	data := make([]byte, int(readSize))
-	_, readErr := file.ReadAt(data, info.Size()-readSize)
+	offset := info.Size() - readSize
+	_, readErr := file.ReadAt(data, offset)
 	if errors.Is(readErr, io.EOF) {
 		readErr = nil
 	}
+	startsAtRecord := offset == 0
+	var boundaryErr error
+	if offset > 0 {
+		var previous [1]byte
+		_, boundaryErr = file.ReadAt(previous[:], offset-1)
+		startsAtRecord = boundaryErr == nil && previous[0] == '\n'
+	}
 	closeErr := file.Close()
 	rootCloseErr := unix.Close(rootFD)
-	if err := errors.Join(readErr, closeErr, rootCloseErr); err != nil {
+	if err := errors.Join(readErr, boundaryErr, closeErr, rootCloseErr); err != nil {
 		return "", fmt.Errorf("read task log summary: %w", err)
 	}
 
-	redacted := s.redact(strings.ToValidUTF8(string(data), "\uFFFD"))
+	if !startsAtRecord {
+		newline := bytes.IndexByte(data, '\n')
+		if newline < 0 {
+			data = nil
+		} else {
+			data = data[newline+1:]
+		}
+	}
+	if lastNewline := bytes.LastIndexByte(data, '\n'); lastNewline < 0 {
+		data = nil
+	} else {
+		data = data[:lastNewline+1]
+	}
+	redacted := string(s.sanitizeRecords(data))
 	if utf8.RuneCountInString(redacted) <= maxRunes {
 		return redacted, nil
 	}
 	runes := []rune(redacted)
 	return string(runes[len(runes)-maxRunes:]), nil
+}
+
+func (s *Store) sanitizeRecords(data []byte) []byte {
+	var output bytes.Buffer
+	for len(data) > 0 {
+		newline := bytes.IndexByte(data, '\n')
+		if newline < 0 {
+			break
+		}
+		line := data[:newline]
+		data = data[newline+1:]
+		if len(line) == 0 {
+			continue
+		}
+
+		decoder := json.NewDecoder(bytes.NewReader(line))
+		decoder.DisallowUnknownFields()
+		var entry record
+		// Tampered records are skipped; raw bytes are never returned to callers.
+		if err := decoder.Decode(&entry); err != nil {
+			continue
+		}
+		var extra any
+		if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+			continue
+		}
+		if _, err := time.Parse(time.RFC3339Nano, entry.Time); err != nil || !streamPattern.MatchString(entry.Stream) {
+			continue
+		}
+		entry.Data = s.redact(entry.Data)
+		encoded, err := json.Marshal(entry)
+		if err != nil {
+			continue
+		}
+		_, _ = output.Write(encoded)
+		_ = output.WriteByte('\n')
+	}
+	return output.Bytes()
 }
 
 func (s *Store) Remove(taskID string) error {
