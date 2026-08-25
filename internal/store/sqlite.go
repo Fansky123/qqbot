@@ -98,7 +98,27 @@ func (s *Store) GetTask(ctx context.Context, id string) (*model.Task, error) {
 }
 
 func (s *Store) SaveTask(ctx context.Context, task *model.Task, expectedVersion int64) error {
-	result, err := s.db.ExecContext(ctx, `
+	result, err := updateTask(ctx, s.db, task, expectedVersion)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("save task %q rows affected: %w", task.ID, err)
+	}
+	if rows == 0 {
+		return fmt.Errorf("save task %q at version %d: %w", task.ID, expectedVersion, ErrConflict)
+	}
+	task.Version = expectedVersion + 1
+	return nil
+}
+
+type taskMutationExecer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func updateTask(ctx context.Context, execer taskMutationExecer, task *model.Task, expectedVersion int64) (sql.Result, error) {
+	result, err := execer.ExecContext(ctx, `
 		UPDATE tasks
 		SET project_id = ?, group_id = ?, creator_id = ?, requirement = ?, plan = ?,
 			status = ?, branch = ?, worktree = ?, base_commit = ?, task_commit = ?,
@@ -111,7 +131,30 @@ func (s *Store) SaveTask(ctx context.Context, task *model.Task, expectedVersion 
 		task.UpdatedAt.UnixMilli(), task.ID, expectedVersion,
 	)
 	if err != nil {
-		return fmt.Errorf("save task %q: %w", task.ID, err)
+		return nil, fmt.Errorf("save task %q: %w", task.ID, err)
+	}
+	return result, nil
+}
+
+// CommitTaskMutation atomically saves a task and its command records.
+func (s *Store) CommitTaskMutation(ctx context.Context, task *model.Task, expectedVersion int64, input model.Input, auditKind, auditDetail, messageKey string, at time.Time) error {
+	return s.commitTaskMutation(ctx, task, expectedVersion, input, auditKind, auditDetail, messageKey, at, "", "")
+}
+
+// CommitTaskMutationInvalidatingApprovals also invalidates approvals in the transaction.
+func (s *Store) CommitTaskMutationInvalidatingApprovals(ctx context.Context, task *model.Task, expectedVersion int64, input model.Input, auditKind, auditDetail, messageKey string, at time.Time, approvalKind, approvalResult string) error {
+	return s.commitTaskMutation(ctx, task, expectedVersion, input, auditKind, auditDetail, messageKey, at, approvalKind, approvalResult)
+}
+
+func (s *Store) commitTaskMutation(ctx context.Context, task *model.Task, expectedVersion int64, input model.Input, auditKind, auditDetail, messageKey string, at time.Time, approvalKind, approvalResult string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin task mutation for %q: %w", task.ID, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	result, err := updateTask(ctx, tx, task, expectedVersion)
+	if err != nil {
+		return err
 	}
 	rows, err := result.RowsAffected()
 	if err != nil {
@@ -120,7 +163,56 @@ func (s *Store) SaveTask(ctx context.Context, task *model.Task, expectedVersion 
 	if rows == 0 {
 		return fmt.Errorf("save task %q at version %d: %w", task.ID, expectedVersion, ErrConflict)
 	}
+	if approvalKind != "" {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE approvals SET result = ?
+			WHERE task_id = ? AND kind = ? AND result = 'approved'`, approvalResult, task.ID, approvalKind); err != nil {
+			return fmt.Errorf("invalidate %q approvals for task %q: %w", approvalKind, task.ID, err)
+		}
+	}
+	if err := appendRecordsTx(ctx, tx, input, task.ID, auditKind, auditDetail, messageKey, at); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit task mutation for %q: %w", task.ID, err)
+	}
 	task.Version = expectedVersion + 1
+	return nil
+}
+
+// CommitRecords atomically appends command records and marks the message processed.
+func (s *Store) CommitRecords(ctx context.Context, input model.Input, auditKind, auditDetail, messageKey string, at time.Time) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin command records for %q: %w", input.TaskID, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := appendRecordsTx(ctx, tx, input, input.TaskID, auditKind, auditDetail, messageKey, at); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit command records for %q: %w", input.TaskID, err)
+	}
+	return nil
+}
+
+func appendRecordsTx(ctx context.Context, tx *sql.Tx, input model.Input, taskID, auditKind, auditDetail, messageKey string, at time.Time) error {
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO task_inputs (task_id, kind, user_id, group_id, message_id, body, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`, input.TaskID, input.Kind, input.UserID, input.GroupID, input.MessageID, input.Body, input.CreatedAt.UnixMilli()); err != nil {
+		return fmt.Errorf("append input for task %q: %w", taskID, err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO audit_events (task_id, kind, detail, created_at)
+		VALUES (?, ?, ?, ?)`, taskID, auditKind, auditDetail, at.UnixMilli()); err != nil {
+		return fmt.Errorf("append audit for task %q: %w", taskID, err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO processed_messages (message_key, processed_at)
+		VALUES (?, ?)
+		ON CONFLICT(message_key) DO NOTHING`, messageKey, at.UnixMilli()); err != nil {
+		return fmt.Errorf("mark message %q processed: %w", messageKey, err)
+	}
 	return nil
 }
 

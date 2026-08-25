@@ -3,6 +3,7 @@ package tasksvc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -66,13 +67,24 @@ func (s *fakeScheduler) Cancel(taskID string) {
 type fakeNotifier struct {
 	mu       sync.Mutex
 	messages []string
+	failNext int
 }
 
 func (n *fakeNotifier) Send(_ context.Context, _ string, message string) error {
 	n.mu.Lock()
+	defer n.mu.Unlock()
 	n.messages = append(n.messages, message)
-	n.mu.Unlock()
+	if n.failNext > 0 {
+		n.failNext--
+		return errors.New("send failed")
+	}
 	return nil
+}
+
+func (n *fakeNotifier) FailNext() {
+	n.mu.Lock()
+	n.failNext++
+	n.mu.Unlock()
 }
 
 func (n *fakeNotifier) Last() string {
@@ -187,6 +199,31 @@ func TestServiceCreateConfirmReplayAndConcurrentDedup(t *testing.T) {
 	}
 }
 
+func TestServiceCreateResumesMatchingDraft(t *testing.T) {
+	planner := &fakePlanner{result: planResult()}
+	svc, db, _, _ := testService(t, planner)
+	ctx := context.Background()
+	create := msg("draft-replay", "u1", "[orders] task")
+	now := time.Now().UTC()
+	draft := &model.Task{ID: TaskID("g1", "draft-replay"), ProjectID: "orders", GroupID: "g1", CreatorID: "u1", Requirement: "task", Status: model.StatusDraft, CreatedAt: now, UpdatedAt: now}
+	if err := db.CreateTask(ctx, draft); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Handle(ctx, create); err != nil {
+		t.Fatal(err)
+	}
+	got, err := db.GetTask(ctx, draft.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != model.StatusAwaitingConfirmation || planner.Calls() != 1 {
+		t.Fatalf("draft replay task=%#v planner calls=%d", got, planner.Calls())
+	}
+	if processed, err := db.MessageProcessed(ctx, "g1\x00draft-replay"); err != nil || !processed {
+		t.Fatalf("draft replay processed=%v err=%v", processed, err)
+	}
+}
+
 func TestServiceOwnershipSupplementCancelAndAdmin(t *testing.T) {
 	planner := &fakePlanner{result: planResult()}
 	svc, db, scheduler, _ := testService(t, planner)
@@ -202,17 +239,20 @@ func TestServiceOwnershipSupplementCancelAndAdmin(t *testing.T) {
 	if err := svc.Handle(ctx, msg("m3", "u2", "取消 #"+id)); err == nil {
 		t.Fatal("non-owner cancel succeeded")
 	}
-	if err := svc.Handle(ctx, msg("m4", "admin", "补充 #"+id+" admin context")); err != nil {
-		t.Fatal(err)
+	if err := svc.Handle(ctx, msg("m4", "admin", "补充 #"+id+" admin context")); err == nil {
+		t.Fatal("supplement awaiting confirmation succeeded")
 	}
 	task, err := db.GetTask(ctx, id)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if task.Status != model.StatusAwaitingConfirmation || !strings.Contains(task.Requirement, "admin context") {
+	if task.Status != model.StatusAwaitingConfirmation || strings.Contains(task.Requirement, "admin context") {
 		t.Fatalf("supplement task=%#v", task)
 	}
-	if err := svc.Handle(ctx, msg("m5", "admin", "确认 #"+id)); err != nil {
+	if err := svc.Handle(ctx, msg("m5", "admin", "确认 #"+id)); err == nil {
+		t.Fatal("admin confirmed another user's task")
+	}
+	if err := svc.Handle(ctx, msg("m5-owner", "u1", "确认 #"+id)); err != nil {
 		t.Fatal(err)
 	}
 	if err := svc.Handle(ctx, msg("m6", "admin", "取消 #"+id)); err != nil {
@@ -287,6 +327,163 @@ func TestServiceStatusAndLogAreBounded(t *testing.T) {
 	}
 	if _, err := db.GetTask(ctx, id); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestServiceRetriesNotificationsWithoutRepeatingEffects(t *testing.T) {
+	planner := &fakePlanner{result: planResult()}
+	svc, db, scheduler, notifier := testService(t, planner)
+	ctx := context.Background()
+	create := msg("retry-create", "u1", "[orders] task")
+	notifier.FailNext()
+	if err := svc.Handle(ctx, create); err == nil {
+		t.Fatal("create notification failure was not returned")
+	}
+	if err := svc.Handle(ctx, create); err != nil {
+		t.Fatal(err)
+	}
+	if planner.Calls() != 1 {
+		t.Fatalf("planner calls = %d", planner.Calls())
+	}
+	id := TaskID("g1", "retry-create")
+
+	confirm := msg("retry-confirm", "u1", "确认 #"+id)
+	notifier.FailNext()
+	if err := svc.Handle(ctx, confirm); err == nil {
+		t.Fatal("confirm notification failure was not returned")
+	}
+	if err := svc.Handle(ctx, confirm); err != nil {
+		t.Fatal(err)
+	}
+	if scheduler.wake != 1 {
+		t.Fatalf("confirm replay wakes = %d", scheduler.wake)
+	}
+
+	task, err := db.GetTask(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task.Status = model.StatusBlocked
+	if err := db.SaveTask(ctx, task, task.Version); err != nil {
+		t.Fatal(err)
+	}
+	supplement := msg("retry-supplement", "admin", "补充 #"+id+" more")
+	notifier.FailNext()
+	if err := svc.Handle(ctx, supplement); err == nil {
+		t.Fatal("supplement notification failure was not returned")
+	}
+	if err := svc.Handle(ctx, supplement); err != nil {
+		t.Fatal(err)
+	}
+	if scheduler.wake != 2 {
+		t.Fatalf("supplement replay wakes = %d", scheduler.wake)
+	}
+
+	task, err = db.GetTask(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task.Status = model.StatusRunning
+	if err := db.SaveTask(ctx, task, task.Version); err != nil {
+		t.Fatal(err)
+	}
+	cancel := msg("retry-cancel", "admin", "取消 #"+id)
+	notifier.FailNext()
+	if err := svc.Handle(ctx, cancel); err == nil {
+		t.Fatal("cancel notification failure was not returned")
+	}
+	if err := svc.Handle(ctx, cancel); err != nil {
+		t.Fatal(err)
+	}
+	if len(scheduler.cancels) != 1 {
+		t.Fatalf("cancel replay calls = %#v", scheduler.cancels)
+	}
+
+	for _, request := range []Message{
+		msg("retry-status", "u1", "状态 #"+id),
+		msg("retry-log", "u1", "日志 #"+id),
+	} {
+		notifier.FailNext()
+		if err := svc.Handle(ctx, request); err == nil {
+			t.Fatalf("%s notification failure was not returned", request.Text)
+		}
+		if err := svc.Handle(ctx, request); err != nil {
+			t.Fatalf("replay %s: %v", request.Text, err)
+		}
+	}
+}
+
+func TestServiceMutationRollsBackWithCommandRecords(t *testing.T) {
+	planner := &fakePlanner{result: planResult()}
+	_, db, _, _ := testService(t, planner)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	task := &model.Task{ID: "T-123456789ABC", ProjectID: "orders", GroupID: "g1", CreatorID: "u1", Requirement: "task", Status: model.StatusAwaitingConfirmation, CreatedAt: now, UpdatedAt: now}
+	if err := db.CreateTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	task.Status = model.StatusQueued
+	key := "g1\x00atomic"
+	badInput := model.Input{TaskID: "missing", Kind: "confirmation", UserID: "u1", GroupID: "g1", MessageID: "atomic", Body: "confirm", CreatedAt: now}
+	if err := db.CommitTaskMutation(ctx, task, task.Version, badInput, "confirmation", "queued", key, now); err == nil {
+		t.Fatal("mutation with invalid input succeeded")
+	}
+	got, err := db.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != model.StatusAwaitingConfirmation || got.Version != 1 {
+		t.Fatalf("rolled back task = %#v", got)
+	}
+	if processed, err := db.MessageProcessed(ctx, key); err != nil || processed {
+		t.Fatalf("processed after rollback = %v, %v", processed, err)
+	}
+	goodInput := badInput
+	goodInput.TaskID = task.ID
+	if err := db.CommitTaskMutation(ctx, task, task.Version, goodInput, "confirmation", "queued", key, now); err != nil {
+		t.Fatal(err)
+	}
+	if processed, err := db.MessageProcessed(ctx, key); err != nil || !processed {
+		t.Fatalf("processed after retry = %v, %v", processed, err)
+	}
+}
+
+func TestServiceRejectsOversizedInputsAndPlans(t *testing.T) {
+	ctx := context.Background()
+	planner := &fakePlanner{result: planResult()}
+	svc, db, _, _ := testService(t, planner)
+	message := msg("huge-message", "u1", "[orders] "+strings.Repeat("x", maxMessageBytes))
+	if err := svc.Handle(ctx, message); err == nil {
+		t.Fatal("oversized message succeeded")
+	}
+	if planner.Calls() != 0 {
+		t.Fatalf("oversized message planner calls = %d", planner.Calls())
+	}
+	if _, err := db.GetTask(ctx, TaskID("g1", "huge-message")); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("oversized message stored task: %v", err)
+	}
+
+	hugePlan := codex.Plan{Summary: strings.Repeat("x", maxPlanBytes), Scope: []string{}, Checks: []string{}, Risks: []string{}}
+	encoded, err := json.Marshal(hugePlan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hugePlanner := &fakePlanner{result: codex.Result{Final: string(encoded)}}
+	hugeSvc, hugeDB, _, _ := testService(t, hugePlanner)
+	create := msg("huge-plan", "u1", "[orders] task")
+	if err := hugeSvc.Handle(ctx, create); err == nil {
+		t.Fatal("oversized plan succeeded")
+	}
+	task, err := hugeDB.GetTask(ctx, TaskID("g1", "huge-plan"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Status != model.StatusFailed || task.Plan != "" {
+		t.Fatalf("oversized plan task = %#v", task)
+	}
+	var nilContext context.Context
+	if err := svc.Handle(nilContext, msg("nil-context", "u1", "[orders] task")); err == nil {
+		t.Fatal("nil context succeeded")
 	}
 }
 

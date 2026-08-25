@@ -19,7 +19,15 @@ import (
 	"qqcodex/internal/store"
 )
 
-const maxNotificationRunes = 1200
+const (
+	maxNotificationRunes = 1200
+	maxMessageBytes      = 16 << 10
+	maxMessageRunes      = 4000
+	maxPlanBytes         = 64 << 10
+	maxPlanFieldRunes    = 4000
+	maxSessionIDBytes    = 128
+	maxRequirementBytes  = 256 << 10
+)
 
 var notificationSecretAssignment = regexp.MustCompile(`(?i)\b[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)\s*=\s*[^\s,;]+`)
 var notificationBearer = regexp.MustCompile(`(?i)\bBearer\s+[^\s,;]+`)
@@ -60,6 +68,9 @@ func TaskID(groupID, messageID string) string {
 }
 
 func (s *Service) Handle(ctx context.Context, message Message) error {
+	if ctx == nil {
+		return errors.New("context is required")
+	}
 	if s == nil || s.registry == nil || s.db == nil || s.planner == nil || s.scheduler == nil || s.notifier == nil || s.logs == nil {
 		return errors.New("task service is not configured")
 	}
@@ -68,6 +79,9 @@ func (s *Service) Handle(ctx context.Context, message Message) error {
 	}
 	if !s.authorizer.AllowedGroup(message.GroupID) || s.authorizer.Role(message.UserID) == auth.RoleNone {
 		return errUnauthorized
+	}
+	if len(message.Text) > maxMessageBytes || len([]rune(message.Text)) > maxMessageRunes {
+		return errors.New("message is too large")
 	}
 	parsed, err := command.Parse(message.Text, message.Mentioned)
 	if err != nil {
@@ -88,10 +102,7 @@ func (s *Service) Handle(ctx context.Context, message Message) error {
 		return err
 	}
 	if processed {
-		if parsed.Kind == command.KindCreate {
-			return s.notifyExisting(ctx, message.GroupID, TaskID(message.GroupID, message.MessageID))
-		}
-		return nil
+		return s.replayNotification(ctx, message, parsed)
 	}
 
 	switch parsed.Kind {
@@ -135,12 +146,20 @@ func (s *Service) create(ctx context.Context, message Message, parsed command.Co
 			if existing.CreatorID != message.UserID {
 				return errTaskAccess
 			}
-			if recordErr := s.record(ctx, message, key, existing.ID, "create", "existing task"); recordErr != nil {
-				return recordErr
+			if existing.Status == model.StatusDraft {
+				if existing.ProjectID != project.ID || existing.Requirement != parsed.Body {
+					return errors.New("draft task does not match replayed create")
+				}
+				task = existing
+			} else {
+				if recordErr := s.commitRecords(ctx, message, key, existing.ID, "create", "existing task"); recordErr != nil {
+					return recordErr
+				}
+				return s.notifyExisting(ctx, message.GroupID, existing.ID)
 			}
-			return s.notifyExisting(ctx, message.GroupID, existing.ID)
+		} else {
+			return err
 		}
-		return err
 	}
 
 	result, planErr := s.planner.Plan(ctx, codex.Request{
@@ -149,31 +168,48 @@ func (s *Service) create(ctx context.Context, message Message, parsed command.Co
 		Timeout: time.Duration(project.CodexTimeoutSeconds) * time.Second,
 	})
 	if planErr != nil {
-		task.Status = model.StatusFailed
-		task.Failure = "planning failed"
-		task.UpdatedAt = time.Now().UTC()
-		if saveErr := s.db.SaveTask(ctx, task, task.Version); saveErr != nil {
-			return errors.Join(planErr, saveErr)
+		if err := s.transition(task, model.StatusFailed); err != nil {
+			return errors.Join(planErr, err)
 		}
-		if recordErr := s.record(ctx, message, key, task.ID, "create", "planning failed"); recordErr != nil {
+		task.Failure = "planning failed"
+		if recordErr := s.commitMutation(ctx, message, key, task, task.Version, "create", "planning failed"); recordErr != nil {
 			return errors.Join(planErr, recordErr)
 		}
 		_ = s.notifier.Send(ctx, message.GroupID, "任务 #"+id+" 规划失败，请查看本地日志")
 		return planErr
 	}
 
+	if len(result.Final) > maxPlanBytes || len(result.SessionID) > maxSessionIDBytes {
+		err := errors.New("planning result is too large")
+		if transitionErr := s.transition(task, model.StatusFailed); transitionErr != nil {
+			return errors.Join(err, transitionErr)
+		}
+		task.Failure = "invalid planning result"
+		if recordErr := s.commitMutation(ctx, message, key, task, task.Version, "create", "invalid planning result"); recordErr != nil {
+			return errors.Join(err, recordErr)
+		}
+		return err
+	}
 	plan, err := codex.ParsePlan(result.Final)
 	if err != nil {
-		task.Status = model.StatusFailed
-		task.Failure = "invalid planning result"
-		task.UpdatedAt = time.Now().UTC()
-		if saveErr := s.db.SaveTask(ctx, task, task.Version); saveErr != nil {
-			return errors.Join(err, saveErr)
+		if transitionErr := s.transition(task, model.StatusFailed); transitionErr != nil {
+			return errors.Join(err, transitionErr)
 		}
-		if recordErr := s.record(ctx, message, key, task.ID, "create", "invalid planning result"); recordErr != nil {
+		task.Failure = "invalid planning result"
+		if recordErr := s.commitMutation(ctx, message, key, task, task.Version, "create", "invalid planning result"); recordErr != nil {
 			return errors.Join(err, recordErr)
 		}
 		_ = s.notifier.Send(ctx, message.GroupID, "任务 #"+id+" 规划结果无效，请查看本地日志")
+		return err
+	}
+	if err := validatePlan(plan); err != nil {
+		if transitionErr := s.transition(task, model.StatusFailed); transitionErr != nil {
+			return errors.Join(err, transitionErr)
+		}
+		task.Failure = "invalid planning result"
+		if recordErr := s.commitMutation(ctx, message, key, task, task.Version, "create", "invalid planning result"); recordErr != nil {
+			return errors.Join(err, recordErr)
+		}
 		return err
 	}
 
@@ -183,12 +219,10 @@ func (s *Service) create(ctx context.Context, message Message, parsed command.Co
 	}
 	task.Plan = string(planJSON)
 	task.Summary = bound(plan.Summary)
-	task.Status = model.StatusAwaitingConfirmation
-	task.UpdatedAt = time.Now().UTC()
-	if err := s.db.SaveTask(ctx, task, task.Version); err != nil {
+	if err := s.transition(task, model.StatusAwaitingConfirmation); err != nil {
 		return err
 	}
-	if err := s.record(ctx, message, key, task.ID, "create", "awaiting confirmation"); err != nil {
+	if err := s.commitMutation(ctx, message, key, task, task.Version, "create", "awaiting confirmation"); err != nil {
 		return err
 	}
 	return s.notifier.Send(ctx, message.GroupID, confirmation(task, plan))
@@ -202,13 +236,14 @@ func (s *Service) confirm(ctx context.Context, message Message, parsed command.C
 	if task.Status != model.StatusAwaitingConfirmation {
 		return fmt.Errorf("task %s cannot be confirmed from %s", task.ID, task.Status)
 	}
+	if task.CreatorID != message.UserID {
+		return errors.New("only the task creator can confirm")
+	}
+	version := task.Version
 	if err := s.transition(task, model.StatusQueued); err != nil {
 		return err
 	}
-	if err := s.db.SaveTask(ctx, task, task.Version); err != nil {
-		return err
-	}
-	if err := s.record(ctx, message, key, task.ID, "confirmation", "queued"); err != nil {
+	if err := s.commitMutation(ctx, message, key, task, version, "confirmation", "queued"); err != nil {
 		return err
 	}
 	s.scheduler.Wake()
@@ -220,10 +255,13 @@ func (s *Service) supplement(ctx context.Context, message Message, parsed comman
 	if err != nil {
 		return err
 	}
-	if task.Status != model.StatusAwaitingConfirmation && task.Status != model.StatusBlocked && task.Status != model.StatusAwaitingMergeApproval {
+	if task.Status != model.StatusBlocked && task.Status != model.StatusAwaitingMergeApproval {
 		return fmt.Errorf("task %s cannot accept supplement from %s", task.ID, task.Status)
 	}
 	task.Requirement = strings.TrimSpace(task.Requirement + "\n\n补充：" + parsed.Body)
+	if len(task.Requirement) > maxRequirementBytes {
+		return errors.New("task requirement is too large")
+	}
 	wake := false
 	detail := "supplemented"
 	if task.Status == model.StatusBlocked || task.Status == model.StatusAwaitingMergeApproval {
@@ -231,18 +269,12 @@ func (s *Service) supplement(ctx context.Context, message Message, parsed comman
 			return err
 		}
 		task.TaskCommit, task.RCCommit = "", ""
-		if err := s.db.InvalidateApprovals(ctx, task.ID, "merge", "superseded_by_new_commit"); err != nil {
-			return err
-		}
 		wake = true
 		detail = "supplemented and queued"
 	}
 	task.UpdatedAt = time.Now().UTC()
 	version := task.Version
-	if err := s.db.SaveTask(ctx, task, version); err != nil {
-		return err
-	}
-	if err := s.record(ctx, message, key, task.ID, "supplement", detail); err != nil {
+	if err := s.commitSupplementMutation(ctx, message, key, task, version, detail); err != nil {
 		return err
 	}
 	if wake {
@@ -263,13 +295,11 @@ func (s *Service) cancel(ctx context.Context, message Message, parsed command.Co
 		return fmt.Errorf("task %s cannot be cancelled from %s", task.ID, task.Status)
 	}
 	running := task.Status == model.StatusRunning || task.Status == model.StatusChecking
+	version := task.Version
 	if err := s.transition(task, model.StatusCancelled); err != nil {
 		return err
 	}
-	if err := s.db.SaveTask(ctx, task, task.Version); err != nil {
-		return err
-	}
-	if err := s.record(ctx, message, key, task.ID, "cancel", "cancelled"); err != nil {
+	if err := s.commitMutation(ctx, message, key, task, version, "cancel", "cancelled"); err != nil {
 		return err
 	}
 	if running {
@@ -283,7 +313,7 @@ func (s *Service) status(ctx context.Context, message Message, parsed command.Co
 	if err != nil {
 		return err
 	}
-	if err := s.record(ctx, message, key, task.ID, "status", "status viewed"); err != nil {
+	if err := s.commitRecords(ctx, message, key, task.ID, "status", "status viewed"); err != nil {
 		return err
 	}
 	return s.notifier.Send(ctx, message.GroupID, statusText(task))
@@ -298,7 +328,7 @@ func (s *Service) log(ctx context.Context, message Message, parsed command.Comma
 	if err != nil {
 		return err
 	}
-	if err := s.record(ctx, message, key, task.ID, "log", "log viewed"); err != nil {
+	if err := s.commitRecords(ctx, message, key, task.ID, "log", "log viewed"); err != nil {
 		return err
 	}
 	return s.notifier.Send(ctx, message.GroupID, bound("任务 #"+task.ID+" 日志摘要：\n"+text))
@@ -335,15 +365,22 @@ func (s *Service) transition(task *model.Task, next model.Status) error {
 	return nil
 }
 
-func (s *Service) record(ctx context.Context, message Message, key, taskID, kind, detail string) error {
+func (s *Service) commitMutation(ctx context.Context, message Message, key string, task *model.Task, version int64, kind, detail string) error {
 	now := time.Now().UTC()
-	if err := s.db.AppendInput(ctx, model.Input{TaskID: taskID, Kind: kind, UserID: message.UserID, GroupID: message.GroupID, MessageID: message.MessageID, Body: message.Text, CreatedAt: now}); err != nil {
-		return err
-	}
-	if err := s.db.AppendAudit(ctx, taskID, kind, bound(detail), now); err != nil {
-		return err
-	}
-	return s.db.MarkMessageProcessed(ctx, key, now)
+	input := model.Input{TaskID: task.ID, Kind: kind, UserID: message.UserID, GroupID: message.GroupID, MessageID: message.MessageID, Body: message.Text, CreatedAt: now}
+	return s.db.CommitTaskMutation(ctx, task, version, input, kind, bound(detail), key, now)
+}
+
+func (s *Service) commitSupplementMutation(ctx context.Context, message Message, key string, task *model.Task, version int64, detail string) error {
+	now := time.Now().UTC()
+	input := model.Input{TaskID: task.ID, Kind: "supplement", UserID: message.UserID, GroupID: message.GroupID, MessageID: message.MessageID, Body: message.Text, CreatedAt: now}
+	return s.db.CommitTaskMutationInvalidatingApprovals(ctx, task, version, input, "supplement", bound(detail), key, now, "merge", "superseded_by_new_commit")
+}
+
+func (s *Service) commitRecords(ctx context.Context, message Message, key, taskID, kind, detail string) error {
+	now := time.Now().UTC()
+	input := model.Input{TaskID: taskID, Kind: kind, UserID: message.UserID, GroupID: message.GroupID, MessageID: message.MessageID, Body: message.Text, CreatedAt: now}
+	return s.db.CommitRecords(ctx, input, kind, bound(detail), key, now)
 }
 
 func (s *Service) notifyExisting(ctx context.Context, groupID, id string) error {
@@ -352,6 +389,59 @@ func (s *Service) notifyExisting(ctx context.Context, groupID, id string) error 
 		return err
 	}
 	return s.notifier.Send(ctx, groupID, bound("任务 #"+task.ID+" 已存在，当前状态："+string(task.Status)))
+}
+
+func (s *Service) replayNotification(ctx context.Context, message Message, parsed command.Command) error {
+	id := parsed.TaskID
+	if parsed.Kind == command.KindCreate {
+		id = TaskID(message.GroupID, message.MessageID)
+	}
+	task, err := s.loadOperable(ctx, message, id)
+	if err != nil {
+		return err
+	}
+	switch parsed.Kind {
+	case command.KindCreate:
+		if task.Status == model.StatusAwaitingConfirmation {
+			var plan codex.Plan
+			if err := json.Unmarshal([]byte(task.Plan), &plan); err != nil {
+				return fmt.Errorf("decode stored task plan: %w", err)
+			}
+			return s.notifier.Send(ctx, message.GroupID, confirmation(task, plan))
+		}
+		return s.notifyExisting(ctx, message.GroupID, task.ID)
+	case command.KindConfirm:
+		return s.notifier.Send(ctx, message.GroupID, "任务 #"+task.ID+" 已确认并排队")
+	case command.KindSupplement:
+		return s.notifier.Send(ctx, message.GroupID, "任务 #"+task.ID+" 已记录补充内容")
+	case command.KindCancel:
+		return s.notifier.Send(ctx, message.GroupID, "任务 #"+task.ID+" 已取消")
+	case command.KindStatus:
+		return s.notifier.Send(ctx, message.GroupID, statusText(task))
+	case command.KindLog:
+		text, err := s.logs.Summary(task.ID, maxNotificationRunes-80)
+		if err != nil {
+			return err
+		}
+		return s.notifier.Send(ctx, message.GroupID, bound("任务 #"+task.ID+" 日志摘要：\n"+text))
+	default:
+		return nil
+	}
+}
+
+func validatePlan(plan codex.Plan) error {
+	fields := append([]string{plan.Summary}, plan.Scope...)
+	fields = append(fields, plan.Checks...)
+	fields = append(fields, plan.Risks...)
+	if len(fields) > 257 {
+		return errors.New("planning result has too many fields")
+	}
+	for _, field := range fields {
+		if len(field) > maxPlanBytes || len([]rune(field)) > maxPlanFieldRunes {
+			return errors.New("planning result field is too large")
+		}
+	}
+	return nil
 }
 
 func confirmation(task *model.Task, plan codex.Plan) string {
