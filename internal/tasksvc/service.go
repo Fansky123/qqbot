@@ -547,9 +547,9 @@ func (s *Service) boundNotification(text string) string {
 }
 
 func (s *Service) sanitize(text string) string {
-	text = strings.ToValidUTF8(s.redactor.RedactText(text), "\uFFFD")
 	text = notificationSecretAssignment.ReplaceAllString(text, "[REDACTED]")
-	return notificationBearer.ReplaceAllString(text, "Bearer [REDACTED]")
+	text = notificationBearer.ReplaceAllString(text, "Bearer [REDACTED]")
+	return s.redactor.RedactText(text)
 }
 
 func (s *Service) sanitizePlan(plan codex.Plan) codex.Plan {

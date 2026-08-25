@@ -116,7 +116,7 @@ func (l fakeLogs) Summary(_ string, maxRunes int) (string, error) {
 	return string(runes), nil
 }
 
-func (l fakeLogs) RedactText(text string) string { return text }
+func (l fakeLogs) RedactText(text string) string { return strings.ToValidUTF8(text, "\uFFFD") }
 
 func testService(t *testing.T, planner Planner) (*Service, *store.Store, *fakeScheduler, *fakeNotifier) {
 	return testServiceWithLogs(t, planner, fakeLogs{"OPENAI_API_KEY=raw-secret NAPCAT_ACCESS_TOKEN=raw-token " + strings.Repeat("secret ", 1000)})
@@ -795,12 +795,86 @@ func TestServiceRedactsMarkerContainingSecretAcrossReplayAndStatus(t *testing.T)
 	}
 }
 
-func TestServiceRejectsPlanExpandedByRedaction(t *testing.T) {
-	logs, err := tasklog.Open(t.TempDir(), []string{"A"})
+func TestServiceGenericThenExactRedactionIsStableAcrossAllOutputs(t *testing.T) {
+	secrets := []string{"REDACTED", "generic-R-secret"}
+	logs, err := tasklog.Open(t.TempDir(), secrets)
 	if err != nil {
 		t.Fatal(err)
 	}
-	field := strings.Repeat("A", 4000)
+	input := "FOO_PASSWORD=value Bearer bearer-value REDACTED generic-R-secret"
+	plan := codex.Plan{Summary: input, Scope: []string{input}, Checks: []string{input}, Risks: []string{input}}
+	encodedPlan, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planner := &fakePlanner{result: codex.Result{Final: string(encodedPlan)}}
+	svc, db, _, notifier := testServiceWithLogs(t, planner, logs)
+	once := svc.sanitize(input)
+	twice := svc.sanitize(once)
+	if once != twice || !utf8.ValidString(once) {
+		t.Fatalf("sanitize not stable: once=%q twice=%q", once, twice)
+	}
+	for _, secret := range secrets {
+		if strings.Contains(once, secret) {
+			t.Fatalf("sanitize leaked %q: %q", secret, once)
+		}
+	}
+	ctx := context.Background()
+	create := msg("generic-exact-order", "u1", "[orders] task")
+	notifier.FailNext()
+	if err := svc.Handle(ctx, create); !errors.Is(err, ErrNotificationDelivery) {
+		t.Fatalf("initial notification error = %v", err)
+	}
+	if err := svc.Handle(ctx, create); err != nil {
+		t.Fatal(err)
+	}
+	id := TaskID("g1", "generic-exact-order")
+	if err := logs.Append(id, "test", []byte(input)); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Handle(ctx, msg("generic-exact-status", "u1", "状态 #"+id)); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Handle(ctx, msg("generic-exact-log", "u1", "日志 #"+id)); err != nil {
+		t.Fatal(err)
+	}
+	task, err := db.GetTask(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var storedPlan codex.Plan
+	if err := json.Unmarshal([]byte(task.Plan), &storedPlan); err != nil {
+		t.Fatal(err)
+	}
+	storedFields := append([]string{storedPlan.Summary}, storedPlan.Scope...)
+	storedFields = append(storedFields, storedPlan.Checks...)
+	storedFields = append(storedFields, storedPlan.Risks...)
+	storedFields = append(storedFields, task.Summary)
+	for fieldIndex, output := range storedFields {
+		for _, secret := range secrets {
+			if strings.Contains(output, secret) {
+				t.Fatalf("stored field %d leaked %q: %q", fieldIndex, secret, output)
+			}
+		}
+	}
+	for i, notification := range notifier.Messages() {
+		if !utf8.ValidString(notification) {
+			t.Fatalf("notification %d invalid UTF-8", i)
+		}
+		for _, secret := range secrets {
+			if strings.Contains(notification, secret) {
+				t.Fatalf("notification %d leaked %q: %q", i, secret, notification)
+			}
+		}
+	}
+}
+
+func TestServiceAcceptsPlanWithinBoundsAfterExactRedaction(t *testing.T) {
+	logs, err := tasklog.Open(t.TempDir(), []string{"AAAAAAAA"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	field := strings.Repeat("AAAAAAAA", 500)
 	plan := codex.Plan{Summary: field, Scope: []string{field, field, field, field, field}, Checks: []string{}, Risks: []string{}}
 	encodedPlan, err := json.Marshal(plan)
 	if err != nil {
@@ -813,15 +887,15 @@ func TestServiceRejectsPlanExpandedByRedaction(t *testing.T) {
 	svc, db, _, _ := testServiceWithLogs(t, planner, logs)
 	ctx := context.Background()
 	create := msg("expanded-plan", "u1", "[orders] task")
-	if err := svc.Handle(ctx, create); err == nil {
-		t.Fatal("redaction-expanded plan succeeded")
+	if err := svc.Handle(ctx, create); err != nil {
+		t.Fatal(err)
 	}
 	task, err := db.GetTask(ctx, TaskID("g1", "expanded-plan"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if task.Status != model.StatusFailed || task.Plan != "" || task.Summary != "" {
-		t.Fatalf("redaction-expanded task = %#v", task)
+	if task.Status != model.StatusAwaitingConfirmation || strings.Contains(task.Plan, "AAAAAAAA") || strings.Contains(task.Summary, "AAAAAAAA") {
+		t.Fatalf("redacted task = %#v", task)
 	}
 	if processed, err := db.MessageProcessed(ctx, "g1\x00expanded-plan"); err != nil || !processed {
 		t.Fatalf("expanded plan processed=%v err=%v", processed, err)

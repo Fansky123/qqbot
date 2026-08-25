@@ -22,6 +22,7 @@ const (
 	maxSummaryReadBytes = 1 << 20
 	// This is also the maximum configured secret length, measured in bytes.
 	maxRedactionOverlap = 64 << 10
+	minSecretBytes      = 8
 	maxSecretEntries    = 256
 	maxSecretBytes      = 512 << 10
 	maxRecordDataBytes  = 2 << 20
@@ -81,6 +82,9 @@ func Open(root string, secretValues []string) (*Store, error) {
 	for _, value := range secretValues {
 		if !utf8.ValidString(value) {
 			return nil, errors.New("task log secret is not valid UTF-8")
+		}
+		if value != "" && len(value) < minSecretBytes {
+			return nil, errors.New("task log secret is shorter than minimum length")
 		}
 		if len(value) > maxRedactionOverlap {
 			return nil, errors.New("task log secret exceeds maximum length")

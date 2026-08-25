@@ -124,9 +124,9 @@ func TestStoreConcurrentRecordsDoNotInterleave(t *testing.T) {
 
 func TestStoreRedactsSecretsAndFramesNewlines(t *testing.T) {
 	t.Parallel()
-	secrets := []string{"short", "short-long-secret"}
+	secrets := []string{"short-key", "short-key-long-secret"}
 	store := openStore(t, secrets)
-	input := "short-long-secret short Authorization: bEaReR bearer-value\n" +
+	input := "short-key-long-secret short-key Authorization: bEaReR bearer-value\n" +
 		"CODEX_API_KEY=codex-secret OPENAI_API_KEY=openai-secret NAPCAT_ACCESS_TOKEN=napcat-secret"
 	if err := store.Append(testTaskID, "codex.stderr", []byte(input)); err != nil {
 		t.Fatal(err)
@@ -137,7 +137,7 @@ func TestStoreRedactsSecretsAndFramesNewlines(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := string(data)
-	for _, secret := range []string{"short", "short-long-secret", "bearer-value", "codex-secret", "openai-secret", "napcat-secret"} {
+	for _, secret := range []string{"short-key", "short-key-long-secret", "bearer-value", "codex-secret", "openai-secret", "napcat-secret"} {
 		if strings.Contains(got, secret) {
 			t.Fatalf("log contains secret %q: %s", secret, got)
 		}
@@ -150,10 +150,10 @@ func TestStoreRedactsSecretsAndFramesNewlines(t *testing.T) {
 	}
 }
 
-func TestAppendRemovesSecretsThatOccurInReplacementMarker(t *testing.T) {
+func TestAppendRedactsSecretThatOccursInGenericMarker(t *testing.T) {
 	t.Parallel()
-	store := openStore(t, []string{"A", "C", "T", "]"})
-	if err := store.Append(testTaskID, "codex.events", []byte("A")); err != nil {
+	store := openStore(t, []string{"REDACTED"})
+	if err := store.Append(testTaskID, "codex.events", []byte("CODEX_API_KEY=value REDACTED")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -165,7 +165,7 @@ func TestAppendRemovesSecretsThatOccurInReplacementMarker(t *testing.T) {
 	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
 		t.Fatal(err)
 	}
-	for _, secret := range []string{"A", "C", "T", "]"} {
+	for _, secret := range []string{"REDACTED", "value"} {
 		if strings.Contains(entry.Data, secret) {
 			t.Fatalf("redacted data still contains %q: %q", secret, entry.Data)
 		}
@@ -174,7 +174,7 @@ func TestAppendRemovesSecretsThatOccurInReplacementMarker(t *testing.T) {
 
 func TestConfiguredSecretsCannotDisableCredentialRedaction(t *testing.T) {
 	t.Parallel()
-	store := openStore(t, []string{"Bearer", "CODEX"})
+	store := openStore(t, []string{"Authorization", "CODEX_API"})
 	input := "Authorization: Bearer bearer-value CODEX_API_KEY=codex-secret"
 	if err := store.Append(testTaskID, "codex.stderr", []byte(input)); err != nil {
 		t.Fatal(err)
@@ -226,14 +226,14 @@ func TestRedactTextCoversPlainAndJSONEscapedSecrets(t *testing.T) {
 	}
 }
 
-func TestRedactTextIsIdempotentForSingleCharacterSecret(t *testing.T) {
-	logs, err := Open(t.TempDir(), []string{"A"})
+func TestRedactTextIsIdempotentForRepeatedCharacterSecret(t *testing.T) {
+	logs, err := Open(t.TempDir(), []string{"AAAAAAAA"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	once := logs.RedactText("A")
+	once := logs.RedactText("AAAAAAAA")
 	twice := logs.RedactText(once)
-	if strings.Contains(once, "A") || twice != once || !utf8.ValidString(once) {
+	if strings.Contains(once, "AAAAAAAA") || twice != once || !utf8.ValidString(once) {
 		t.Fatalf("redaction is not idempotent: once=%q twice=%q", once, twice)
 	}
 }
@@ -261,7 +261,7 @@ func TestRedactTextMatchesSecretsContainingMarker(t *testing.T) {
 			}
 		}
 	}
-	overlapLogs, err := Open(t.TempDir(), append(secrets, "Bearer", "CODEX"))
+	overlapLogs, err := Open(t.TempDir(), append(secrets, "Authorization", "CODEX_API"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -274,14 +274,7 @@ func TestRedactTextMatchesSecretsContainingMarker(t *testing.T) {
 }
 
 func TestRedactTextNeverReturnsConfiguredSecret(t *testing.T) {
-	markerSecrets := make(map[rune]struct{})
-	for _, r := range redactionMarker {
-		markerSecrets[r] = struct{}{}
-	}
-	secrets := []string{redactionMarker, "ab", "prefix" + redactionMarker + "suffix"}
-	for r := range markerSecrets {
-		secrets = append(secrets, string(r))
-	}
+	secrets := []string{redactionMarker, "overlap-ab", "prefix" + redactionMarker + "suffix", "AAAAAAAA"}
 	for _, secret := range secrets {
 		logs, err := Open(t.TempDir(), []string{secret})
 		if err != nil {
@@ -308,6 +301,17 @@ func TestRedactTextNeverReturnsConfiguredSecret(t *testing.T) {
 	invalid := genericOnly.RedactText(string([]byte{'x', 0xff, 'y'}))
 	if !utf8.ValidString(invalid) {
 		t.Fatalf("RedactText returned invalid UTF-8: %q", invalid)
+	}
+}
+
+func TestOpenRejectsShortSecretBeforeFilesystemMutation(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "must-not-exist")
+	_, err := Open(root, []string{"abc123"})
+	if err == nil || strings.Contains(err.Error(), "abc123") {
+		t.Fatalf("Open short secret error = %v", err)
+	}
+	if _, statErr := os.Stat(root); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("root created for short secret: %v", statErr)
 	}
 }
 
