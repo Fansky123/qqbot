@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -67,7 +68,7 @@ func (o *Operator) Sync(ctx context.Context, projectID string) error {
 	return nil
 }
 
-func (o *Operator) PushTask(ctx context.Context, projectID, taskID, branch, commit string) (runErr error) {
+func (o *Operator) PushTaskBundle(ctx context.Context, projectID, taskID, branch, commit string, bundle io.Reader) (runErr error) {
 	project, err := o.project(projectID)
 	if err != nil {
 		return err
@@ -75,26 +76,71 @@ func (o *Operator) PushTask(ctx context.Context, projectID, taskID, branch, comm
 	if err := validateTask(taskID, branch, commit); err != nil {
 		return err
 	}
+	if bundle == nil {
+		return errors.New("task bundle is required")
+	}
 	if err := o.guardRepository(ctx, project); err != nil {
 		return err
 	}
-	local, err := o.resolveCommit(ctx, project.RepoPath, "refs/heads/"+branch)
-	if err != nil {
-		return errors.New("local task branch does not exist")
-	}
-	if local != commit {
-		return errors.New("local task branch does not match approved commit")
-	}
 
-	remoteCommit, cleanup, err := o.fetchRemoteBranch(ctx, project, branch)
-	if cleanup != nil {
-		defer func() {
-			runErr = errors.Join(runErr, cleanup())
-		}()
-	}
+	bundlePath, cleanupBundle, err := spoolTaskBundle(bundle, maxTaskBundleBytes)
 	if err != nil {
 		return err
 	}
+	defer func() {
+		if cleanupBundle != nil {
+			runErr = errors.Join(runErr, cleanupBundle())
+		}
+	}()
+	expectedRef := "refs/heads/" + branch
+	heads, err := o.runGit(ctx, project.RepoPath, "bundle", "list-heads", bundlePath)
+	if err != nil || !singleBundleHead(heads, expectedRef, commit) {
+		return errors.New("task bundle contains unexpected refs")
+	}
+	if _, err := o.runGit(ctx, project.RepoPath, "bundle", "verify", bundlePath); err != nil {
+		return errors.New("task bundle verification failed")
+	}
+
+	importedRef, err := temporaryRef("imported-task")
+	if err != nil {
+		return err
+	}
+	cleanupImported := o.refCleanup(project.RepoPath, importedRef)
+	defer func() {
+		if cleanupImported != nil {
+			runErr = errors.Join(runErr, cleanupImported())
+		}
+	}()
+	importArgs := []string{
+		"-c", "fetch.fsckObjects=true", "-c", "transfer.fsckObjects=true",
+		"fetch", "--no-tags", "--no-prune", "--recurse-submodules=no", "--no-write-fetch-head",
+		"--no-auto-maintenance", "--no-write-commit-graph", bundlePath, expectedRef + ":" + importedRef,
+	}
+	if _, err := o.runGit(ctx, project.RepoPath, importArgs...); err != nil {
+		return errors.New("task bundle import failed")
+	}
+	importedCommit, err := o.resolveCommit(ctx, project.RepoPath, importedRef)
+	if err != nil || importedCommit != commit {
+		return errors.New("imported task commit does not match claim")
+	}
+	baseCommit, err := o.resolveCommit(ctx, project.RepoPath, "refs/remotes/"+project.Remote+"/"+project.BaseBranch)
+	if err != nil {
+		return errors.New("trusted base commit is unavailable")
+	}
+	baseAncestor, err := o.isAncestor(ctx, project.RepoPath, baseCommit, commit)
+	if err != nil || !baseAncestor {
+		return errors.New("task commit is not based on the trusted base")
+	}
+
+	remoteCommit, cleanupRemote, err := o.fetchRemoteBranch(ctx, project, branch)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cleanupRemote != nil {
+			runErr = errors.Join(runErr, cleanupRemote())
+		}
+	}()
 	if remoteCommit != "" {
 		ancestor, err := o.isAncestor(ctx, project.RepoPath, remoteCommit, commit)
 		if err != nil {
@@ -104,14 +150,81 @@ func (o *Operator) PushTask(ctx context.Context, projectID, taskID, branch, comm
 			return errors.New("remote task branch is not an ancestor of approved commit")
 		}
 	}
+
+	var cleanupErr error
+	if cleanupRemote != nil {
+		cleanupErr = errors.Join(cleanupErr, cleanupRemote())
+		cleanupRemote = nil
+	}
+	cleanupErr = errors.Join(cleanupErr, cleanupImported())
+	cleanupImported = nil
+	cleanupErr = errors.Join(cleanupErr, cleanupBundle())
+	cleanupBundle = nil
+	if cleanupErr != nil {
+		return cleanupErr
+	}
+	if resolved, err := o.resolveCommit(ctx, project.RepoPath, commit); err != nil || resolved != commit {
+		return errors.New("imported task object became unavailable")
+	}
 	if err := o.guardRepository(ctx, project); err != nil {
 		return err
 	}
-	refspec := commit + ":refs/heads/" + branch
+	refspec := commit + ":" + expectedRef
 	if _, err := o.runGit(ctx, project.RepoPath, pushArgs(project.RemoteURL, refspec)...); err != nil {
 		return errors.New("task push failed")
 	}
 	return nil
+}
+
+func spoolTaskBundle(bundle io.Reader, limit int64) (string, func() error, error) {
+	if bundle == nil || limit < 1 || limit > maxTaskBundleBytes {
+		return "", nil, errors.New("invalid task bundle input")
+	}
+	root, err := os.MkdirTemp("", "qqcodex-ops-bundle-")
+	if err != nil {
+		return "", nil, errors.New("create task bundle spool failed")
+	}
+	if err := os.Chmod(root, 0o700); err != nil {
+		_ = os.RemoveAll(root)
+		return "", nil, errors.New("secure task bundle spool failed")
+	}
+	file, err := os.CreateTemp(root, "task-*.bundle")
+	if err != nil {
+		_ = os.Remove(root)
+		return "", nil, errors.New("create task bundle spool failed")
+	}
+	path := file.Name()
+	cleanup := func() error {
+		var cleanupErr error
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			cleanupErr = errors.Join(cleanupErr, errors.New("remove task bundle failed"))
+		}
+		if err := os.Remove(root); err != nil && !os.IsNotExist(err) {
+			cleanupErr = errors.Join(cleanupErr, errors.New("remove task bundle directory failed"))
+		}
+		return cleanupErr
+	}
+	fail := func(message string) (string, func() error, error) {
+		_ = file.Close()
+		return "", nil, errors.Join(errors.New(message), cleanup())
+	}
+	written, err := io.Copy(file, io.LimitReader(bundle, limit+1))
+	if err != nil {
+		return fail("read task bundle failed")
+	}
+	if written == 0 {
+		return fail("task bundle is empty")
+	}
+	if written > limit {
+		return fail("task bundle exceeded limit")
+	}
+	if err := file.Sync(); err != nil {
+		return fail("sync task bundle failed")
+	}
+	if err := file.Close(); err != nil {
+		return "", nil, errors.Join(errors.New("close task bundle failed"), cleanup())
+	}
+	return path, cleanup, nil
 }
 
 func (o *Operator) MergeRC(ctx context.Context, projectID, taskID, taskCommit string) (rcCommit string, runErr error) {

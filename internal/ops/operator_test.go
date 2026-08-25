@@ -1,9 +1,11 @@
 package ops
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -233,14 +235,217 @@ func TestOperatorSyncFetchesBaseAndRC(t *testing.T) {
 	}
 }
 
-func TestOperatorPushTaskAllowsOnlyExactFastForwardTaskRef(t *testing.T) {
+func TestOperatorPushTaskBundleFromIsolatedWorkerClone(t *testing.T) {
+	t.Parallel()
+
+	fixture := newOpsFixture(t)
+	worker := fixture.clone(t)
+	branch := "codex/" + testTaskID
+	git(t, worker, "switch", "-c", branch, "origin/main")
+	writeFile(t, filepath.Join(worker, "first.txt"), "first\n")
+	git(t, worker, "add", "first.txt")
+	git(t, worker, "commit", "-m", "first")
+	first := git(t, worker, "rev-parse", "HEAD")
+
+	if err := pushTaskBundle(t, fixture.operator, fixture.projectID, worker, testTaskID, branch, first, nil); err != nil {
+		t.Fatalf("first push: %v", err)
+	}
+	if got := fixture.remoteRef(t, branch); got != first {
+		t.Fatalf("remote task commit = %q, want %q", got, first)
+	}
+	if local := git(t, fixture.repo, "for-each-ref", "--format=%(refname)", "refs/heads/codex"); local != "" {
+		t.Fatalf("ops clone acquired worker task ref %q", local)
+	}
+	if workerGit, opsGit := git(t, worker, "rev-parse", "--path-format=absolute", "--git-common-dir"), git(t, fixture.repo, "rev-parse", "--path-format=absolute", "--git-common-dir"); workerGit == opsGit {
+		t.Fatalf("worker and ops clone share Git metadata %q", workerGit)
+	}
+
+	writeFile(t, filepath.Join(worker, "second.txt"), "second\n")
+	git(t, worker, "add", "second.txt")
+	git(t, worker, "commit", "-m", "second")
+	second := git(t, worker, "rev-parse", "HEAD")
+	if err := pushTaskBundle(t, fixture.operator, fixture.projectID, worker, testTaskID, branch, second, nil); err != nil {
+		t.Fatalf("supplement push: %v", err)
+	}
+	if got := fixture.remoteRef(t, branch); got != second {
+		t.Fatalf("remote supplement commit = %q, want %q", got, second)
+	}
+
+	other := fixture.clone(t)
+	git(t, other, "switch", "-c", branch, "origin/"+branch)
+	writeFile(t, filepath.Join(other, "remote.txt"), "remote\n")
+	git(t, other, "add", "remote.txt")
+	git(t, other, "commit", "-m", "remote")
+	remoteCommit := git(t, other, "rev-parse", "HEAD")
+	git(t, other, "push", "origin", "HEAD:"+branch)
+
+	writeFile(t, filepath.Join(worker, "local.txt"), "local\n")
+	git(t, worker, "add", "local.txt")
+	git(t, worker, "commit", "-m", "divergent local")
+	localCommit := git(t, worker, "rev-parse", "HEAD")
+	if err := pushTaskBundle(t, fixture.operator, fixture.projectID, worker, testTaskID, branch, localCommit, nil); err == nil {
+		t.Fatal("PushTaskBundle() accepted a non-fast-forward update")
+	}
+	if got := fixture.remoteRef(t, branch); got != remoteCommit {
+		t.Fatalf("rejected push changed remote to %q, want %q", got, remoteCommit)
+	}
+}
+
+func TestOperatorPushTaskBundleRejectsUnexpectedOrCorruptBundle(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		prepare func(*testing.T, string, string, string) io.Reader
+	}{
+		{
+			name: "extra advertised ref",
+			prepare: func(t *testing.T, worker, branch, _ string) io.Reader {
+				git(t, worker, "branch", "extra", branch)
+				return openBundle(t, worker, "refs/heads/"+branch, "refs/heads/extra")
+			},
+		},
+		{
+			name: "wrong advertised ref",
+			prepare: func(t *testing.T, worker, branch, _ string) io.Reader {
+				git(t, worker, "branch", "wrong", branch)
+				return openBundle(t, worker, "refs/heads/wrong")
+			},
+		},
+		{
+			name: "appended junk",
+			prepare: func(t *testing.T, worker, branch, _ string) io.Reader {
+				bundle := openBundle(t, worker, "refs/heads/"+branch)
+				data, err := io.ReadAll(bundle)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return bytes.NewReader(append(data, []byte("trailing-junk")...))
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			fixture := newOpsFixture(t)
+			worker := fixture.clone(t)
+			branch := "codex/" + testTaskID
+			git(t, worker, "switch", "-c", branch, "origin/main")
+			writeFile(t, filepath.Join(worker, "task.txt"), "task\n")
+			git(t, worker, "add", "task.txt")
+			git(t, worker, "commit", "-m", "task")
+			commit := git(t, worker, "rev-parse", "HEAD")
+
+			err := fixture.operator.PushTaskBundle(context.Background(), fixture.projectID, testTaskID, branch, commit, tt.prepare(t, worker, branch, commit))
+			if err == nil {
+				t.Fatal("PushTaskBundle() error = nil, want bundle rejection")
+			}
+			if got := remoteRefOrEmpty(t, fixture.remote, branch); got != "" {
+				t.Fatalf("rejected bundle pushed remote task %q", got)
+			}
+		})
+	}
+}
+
+func TestOperatorPushTaskBundleRequiresTrustedBaseAncestry(t *testing.T) {
+	t.Parallel()
+
+	fixture := newOpsFixture(t)
+	worker := fixture.clone(t)
+	branch := "codex/" + testTaskID
+	git(t, worker, "switch", "--orphan", branch)
+	git(t, worker, "rm", "-rf", "--ignore-unmatch", ".")
+	writeFile(t, filepath.Join(worker, "orphan.txt"), "orphan\n")
+	git(t, worker, "add", "orphan.txt")
+	git(t, worker, "commit", "-m", "orphan")
+	commit := git(t, worker, "rev-parse", "HEAD")
+
+	if err := pushTaskBundle(t, fixture.operator, fixture.projectID, worker, testTaskID, branch, commit, nil); err == nil {
+		t.Fatal("PushTaskBundle() accepted commit outside trusted base history")
+	}
+	if got := remoteRefOrEmpty(t, fixture.remote, branch); got != "" {
+		t.Fatalf("base ancestry rejection pushed remote task %q", got)
+	}
+}
+
+func TestOperatorPushTaskBundleCleanupFailurePreventsRemotePush(t *testing.T) {
+	fixture := newOpsFixture(t)
+	worker := fixture.clone(t)
+	branch := "codex/" + testTaskID
+	git(t, worker, "switch", "-c", branch, "origin/main")
+	writeFile(t, filepath.Join(worker, "task.txt"), "task\n")
+	git(t, worker, "add", "task.txt")
+	git(t, worker, "commit", "-m", "task")
+	commit := git(t, worker, "rev-parse", "HEAD")
+	real := realGit(t)
+	wrapper := writeExecutable(t, filepath.Join(privateTempDir(t), "cleanup-failing-git"), `#!/bin/sh
+case " $* " in
+  *" update-ref -d refs/qqcodex/"*) exit 88 ;;
+esac
+exec "`+real+`" "$@"
+`)
+	fixture.config.GitBinary = wrapper
+	fixture.operator = mustNewOperator(t, fixture.config)
+
+	if err := pushTaskBundle(t, fixture.operator, fixture.projectID, worker, testTaskID, branch, commit, nil); err == nil {
+		t.Fatal("PushTaskBundle() error = nil, want temporary ref cleanup failure")
+	}
+	if got := remoteRefOrEmpty(t, fixture.remote, branch); got != "" {
+		t.Fatalf("cleanup failure pushed remote task %q", got)
+	}
+}
+
+func TestSpoolTaskBundleRejectsEmptyAndOverflow(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name string
+		data []byte
+	}{
+		{name: "empty"},
+		{name: "overflow", data: bytes.Repeat([]byte("x"), 1025)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if _, _, err := spoolTaskBundle(bytes.NewReader(tt.data), 1024); err == nil {
+				t.Fatal("spoolTaskBundle() error = nil, want rejection")
+			}
+		})
+	}
+	path, cleanup, err := spoolTaskBundle(bytes.NewReader([]byte("bundle")), 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("spooled bundle mode = %o, want 600", info.Mode().Perm())
+	}
+	rootInfo, err := os.Stat(filepath.Dir(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rootInfo.Mode().Perm() != 0o700 {
+		t.Fatalf("spool directory mode = %o, want 700", rootInfo.Mode().Perm())
+	}
+	if err := cleanup(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("spooled bundle remains after cleanup, stat error = %v", err)
+	}
+}
+
+func TestOperatorPushTaskBundleAllowsOnlyExactFastForwardTaskRef(t *testing.T) {
 	t.Parallel()
 
 	fixture := newOpsFixture(t)
 	branch, first := fixture.createTaskCommit(t, testTaskID, "first.txt", "first\n")
-	ctx := context.Background()
-
-	if err := fixture.operator.PushTask(ctx, fixture.projectID, testTaskID, branch, first); err != nil {
+	if err := pushTaskBundle(t, fixture.operator, fixture.projectID, fixture.repo, testTaskID, branch, first, nil); err != nil {
 		t.Fatalf("first push: %v", err)
 	}
 	if got := fixture.remoteRef(t, branch); got != first {
@@ -252,18 +457,18 @@ func TestOperatorPushTaskAllowsOnlyExactFastForwardTaskRef(t *testing.T) {
 	git(t, fixture.repo, "add", "second.txt")
 	git(t, fixture.repo, "commit", "-m", "task supplement")
 	second := git(t, fixture.repo, "rev-parse", "HEAD")
-	if err := fixture.operator.PushTask(ctx, fixture.projectID, testTaskID, branch, second); err != nil {
+	if err := pushTaskBundle(t, fixture.operator, fixture.projectID, fixture.repo, testTaskID, branch, second, nil); err != nil {
 		t.Fatalf("supplement push: %v", err)
 	}
 	if got := fixture.remoteRef(t, branch); got != second {
 		t.Fatalf("remote supplement commit = %q, want %q", got, second)
 	}
 
-	if err := fixture.operator.PushTask(ctx, fixture.projectID, testTaskID, "main", second); err == nil {
-		t.Fatal("PushTask() accepted a non-task branch")
+	if err := pushTaskBundle(t, fixture.operator, fixture.projectID, fixture.repo, testTaskID, "main", second, nil); err == nil {
+		t.Fatal("PushTaskBundle() accepted a non-task branch")
 	}
-	if err := fixture.operator.PushTask(ctx, fixture.projectID, testTaskID, branch, first); err == nil {
-		t.Fatal("PushTask() accepted a commit that does not match the local branch")
+	if err := pushTaskBundle(t, fixture.operator, fixture.projectID, fixture.repo, testTaskID, branch, first, nil); err == nil {
+		t.Fatal("PushTaskBundle() accepted a bundle that does not match the claim")
 	}
 
 	other := fixture.clone(t)
@@ -278,8 +483,8 @@ func TestOperatorPushTaskAllowsOnlyExactFastForwardTaskRef(t *testing.T) {
 	git(t, fixture.repo, "add", "local.txt")
 	git(t, fixture.repo, "commit", "-m", "divergent local task change")
 	localCommit := git(t, fixture.repo, "rev-parse", "HEAD")
-	if err := fixture.operator.PushTask(ctx, fixture.projectID, testTaskID, branch, localCommit); err == nil {
-		t.Fatal("PushTask() accepted a non-fast-forward update")
+	if err := pushTaskBundle(t, fixture.operator, fixture.projectID, fixture.repo, testTaskID, branch, localCommit, nil); err == nil {
+		t.Fatal("PushTaskBundle() accepted a non-fast-forward update")
 	}
 	if got := fixture.remoteRef(t, branch); got != remoteCommit {
 		t.Fatalf("rejected push changed remote to %q, want %q", got, remoteCommit)
@@ -290,7 +495,7 @@ func TestOperatorPushTaskAllowsOnlyExactFastForwardTaskRef(t *testing.T) {
 func TestOperatorMergeRCVerifiesCommitRunsChecksAndSkipsHooks(t *testing.T) {
 	fixture := newOpsFixture(t)
 	branch, taskCommit := fixture.createTaskCommit(t, testTaskID, "feature.txt", "feature\n")
-	if err := fixture.operator.PushTask(context.Background(), fixture.projectID, testTaskID, branch, taskCommit); err != nil {
+	if err := pushTaskBundle(t, fixture.operator, fixture.projectID, fixture.repo, testTaskID, branch, taskCommit, nil); err != nil {
 		t.Fatal(err)
 	}
 	checkMarker := filepath.Join(t.TempDir(), "check-ran")
@@ -343,7 +548,7 @@ func TestOperatorMergeRCFailureLeavesRemoteUnchanged(t *testing.T) {
 			name: "approved commit differs from remote task",
 			prepare: func(t *testing.T, fixture *opsFixture) string {
 				branch, commit := fixture.createTaskCommit(t, testTaskID, "feature.txt", "feature\n")
-				if err := fixture.operator.PushTask(context.Background(), fixture.projectID, testTaskID, branch, commit); err != nil {
+				if err := pushTaskBundle(t, fixture.operator, fixture.projectID, fixture.repo, testTaskID, branch, commit, nil); err != nil {
 					t.Fatal(err)
 				}
 				return fixture.mainCommit
@@ -353,7 +558,7 @@ func TestOperatorMergeRCFailureLeavesRemoteUnchanged(t *testing.T) {
 			name: "check failure",
 			prepare: func(t *testing.T, fixture *opsFixture) string {
 				branch, commit := fixture.createTaskCommit(t, testTaskID, "feature.txt", "feature\n")
-				if err := fixture.operator.PushTask(context.Background(), fixture.projectID, testTaskID, branch, commit); err != nil {
+				if err := pushTaskBundle(t, fixture.operator, fixture.projectID, fixture.repo, testTaskID, branch, commit, nil); err != nil {
 					t.Fatal(err)
 				}
 				project := fixture.config.Projects[fixture.projectID]
@@ -371,7 +576,7 @@ func TestOperatorMergeRCFailureLeavesRemoteUnchanged(t *testing.T) {
 				git(t, fixture.repo, "add", "shared.txt")
 				git(t, fixture.repo, "commit", "-m", "task conflict")
 				commit := git(t, fixture.repo, "rev-parse", "HEAD")
-				if err := fixture.operator.PushTask(context.Background(), fixture.projectID, testTaskID, "codex/"+testTaskID, commit); err != nil {
+				if err := pushTaskBundle(t, fixture.operator, fixture.projectID, fixture.repo, testTaskID, "codex/"+testTaskID, commit, nil); err != nil {
 					t.Fatal(err)
 				}
 				other := fixture.clone(t)
@@ -441,7 +646,7 @@ func TestOperatorMergeRCRejectsCheckRepositoryChanges(t *testing.T) {
 
 			fixture := newOpsFixture(t)
 			branch, taskCommit := fixture.createTaskCommit(t, testTaskID, "feature.txt", "feature\n")
-			if err := fixture.operator.PushTask(context.Background(), fixture.projectID, testTaskID, branch, taskCommit); err != nil {
+			if err := pushTaskBundle(t, fixture.operator, fixture.projectID, fixture.repo, testTaskID, branch, taskCommit, nil); err != nil {
 				t.Fatal(err)
 			}
 			project := fixture.config.Projects[fixture.projectID]
@@ -513,8 +718,8 @@ func TestOperatorRejectsWorktreePushURLAndPinnedRemoteMismatch(t *testing.T) {
 			branch, commit := fixture.createTaskCommit(t, testTaskID, "redirect.txt", "redirect\n")
 			tt.mutate(t, fixture, alternate)
 
-			if err := fixture.operator.PushTask(context.Background(), fixture.projectID, testTaskID, branch, commit); err == nil {
-				t.Fatal("PushTask() accepted redirected repository configuration")
+			if err := pushTaskBundle(t, fixture.operator, fixture.projectID, fixture.repo, testTaskID, branch, commit, nil); err == nil {
+				t.Fatal("PushTaskBundle() accepted redirected repository configuration")
 			}
 			if got := remoteRefOrEmpty(t, alternate, branch); got != "" {
 				t.Fatalf("alternate remote received task commit %q", got)
@@ -532,8 +737,8 @@ func TestOperatorRejectsPushConfigAndNeverLeaksTags(t *testing.T) {
 	git(t, fixture.repo, "config", "push.followTags", "true")
 	git(t, fixture.repo, "config", "push.pushOption", "leak")
 
-	if err := fixture.operator.PushTask(context.Background(), fixture.projectID, testTaskID, branch, commit); err == nil || !strings.Contains(err.Error(), "unsafe local") {
-		t.Fatalf("PushTask() error = %v, want unsafe local configuration rejection", err)
+	if err := pushTaskBundle(t, fixture.operator, fixture.projectID, fixture.repo, testTaskID, branch, commit, nil); err == nil || !strings.Contains(err.Error(), "unsafe local") {
+		t.Fatalf("PushTaskBundle() error = %v, want unsafe local configuration rejection", err)
 	}
 	if got := remoteRefOrEmpty(t, fixture.remote, "release-leak"); got != "" {
 		t.Fatalf("remote received tag %q", got)
@@ -725,6 +930,27 @@ exec "`+real+`" "$@"
 	if _, err := os.Stat(marker); !os.IsNotExist(err) {
 		t.Fatalf("deploy action ran after cleanup failure, stat error = %v", err)
 	}
+}
+
+func pushTaskBundle(t *testing.T, operator *Operator, projectID, worker, taskID, branch, commit string, bundle io.Reader) error {
+	t.Helper()
+	if bundle == nil {
+		bundle = openBundle(t, worker, "refs/heads/"+branch)
+	}
+	return operator.PushTaskBundle(context.Background(), projectID, taskID, branch, commit, bundle)
+}
+
+func openBundle(t *testing.T, repo string, refs ...string) *os.File {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "task.bundle")
+	args := append([]string{"bundle", "create", path}, refs...)
+	git(t, repo, args...)
+	bundle, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = bundle.Close() })
+	return bundle
 }
 
 type opsFixture struct {

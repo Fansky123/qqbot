@@ -80,7 +80,7 @@ func normalizeConfig(cfg Config) (Config, error) {
 		repositories = append(repositories, repository)
 	}
 
-	gitBinary, err := trustedExecutable(normalized.GitBinary, repositories)
+	gitBinary, err := trustedExecutable(normalized.GitBinary, repositories, true)
 	if err != nil {
 		return Config{}, fmt.Errorf("git binary: %w", err)
 	}
@@ -117,7 +117,7 @@ func normalizeProject(gitBinary string, project Project, repositories []string) 
 	if err := validateArgv(project.CheckRunner); err != nil {
 		return Project{}, fmt.Errorf("check runner: %w", err)
 	}
-	checkRunner, err := trustedExecutable(project.CheckRunner[0], repositories)
+	checkRunner, err := trustedExecutable(project.CheckRunner[0], repositories, true)
 	if err != nil {
 		return Project{}, fmt.Errorf("check runner: %w", err)
 	}
@@ -133,7 +133,7 @@ func normalizeProject(gitBinary string, project Project, repositories []string) 
 	if err := validateArgv(project.DeployAction); err != nil {
 		return Project{}, fmt.Errorf("deploy action: %w", err)
 	}
-	deploy, err := trustedExecutable(project.DeployAction[0], repositories)
+	deploy, err := trustedExecutable(project.DeployAction[0], repositories, true)
 	if err != nil {
 		return Project{}, fmt.Errorf("deploy action: %w", err)
 	}
@@ -223,7 +223,7 @@ func canonicalDirectory(path string) (string, error) {
 	return resolved, nil
 }
 
-func trustedExecutable(path string, repositories []string) (string, error) {
+func trustedExecutable(path string, repositories []string, allowCurrentUID bool) (string, error) {
 	if !filepath.IsAbs(path) {
 		return "", errors.New("path must be absolute")
 	}
@@ -245,6 +245,10 @@ func trustedExecutable(path string, repositories []string) (string, error) {
 	}
 	if info.Mode().Perm()&0o022 != 0 {
 		return "", errors.New("executable is group or world writable")
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat.Uid != 0 && (!allowCurrentUID || stat.Uid != uint32(os.Geteuid())) {
+		return "", errors.New("executable has an untrusted owner")
 	}
 	if err := validateExecutableParents(resolved, info); err != nil {
 		return "", err

@@ -51,7 +51,7 @@ func run(ctx context.Context, args []string) (response, int) {
 	case "push":
 		project, task, branch, commit, err := parsePush(actionArgs)
 		if err == nil {
-			err = operator.PushTask(ctx, project, task, branch, commit)
+			err = operator.PushTaskBundle(ctx, project, task, branch, commit, os.Stdin)
 		}
 		if err != nil {
 			return failed(err), 1

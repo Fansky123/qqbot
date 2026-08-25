@@ -9,6 +9,8 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -16,8 +18,13 @@ import (
 
 const maxResponseBytes = 64 << 10
 
+const maxTaskBundleBytes int64 = 256 << 20
+
 type Client struct {
-	Command []string
+	command        []string
+	sourceRepos    map[string]string
+	sourceGit      string
+	maxBundleBytes int64
 }
 
 type helperResponse struct {
@@ -26,40 +33,250 @@ type helperResponse struct {
 	RCCommit string `json:"rc_commit,omitempty"`
 }
 
-func (c Client) Sync(ctx context.Context, projectID string) error {
-	_, err := c.call(ctx, "", "sync", "--project", projectID)
+func NewClient(command []string, sourceRepos map[string]string) (*Client, error) {
+	return newClient(command, sourceRepos, false)
+
+}
+
+func newClient(command []string, sourceRepos map[string]string, allowCurrentUID bool) (*Client, error) {
+	if err := validateArgv(command); err != nil {
+		return nil, errors.New("ops command is invalid")
+	}
+	executable, err := trustedExecutable(command[0], nil, allowCurrentUID)
+	if err != nil {
+		return nil, errors.New("ops command is invalid")
+	}
+	sourceGit, err := exec.LookPath("git")
+	if err != nil {
+		return nil, errors.New("source Git is unavailable")
+	}
+	sourceGit, err = trustedExecutable(sourceGit, nil, allowCurrentUID)
+	if err != nil {
+		return nil, errors.New("source Git is invalid")
+	}
+	repositories := make(map[string]string, len(sourceRepos))
+	for projectID, repo := range sourceRepos {
+		if err := validateProjectID(projectID); err != nil {
+			return nil, err
+		}
+		canonical, err := canonicalDirectory(repo)
+		if err != nil {
+			return nil, fmt.Errorf("source repository %q: %w", projectID, err)
+		}
+		repositories[projectID] = canonical
+	}
+	clonedCommand := append([]string(nil), command...)
+	clonedCommand[0] = executable
+	return &Client{
+		command:        clonedCommand,
+		sourceRepos:    repositories,
+		sourceGit:      sourceGit,
+		maxBundleBytes: maxTaskBundleBytes,
+	}, nil
+}
+
+func (c *Client) Sync(ctx context.Context, projectID string) error {
+	_, err := c.call(ctx, "", nil, "sync", "--project", projectID)
 	return err
 }
 
-func (c Client) PushTask(ctx context.Context, projectID, taskID, branch, commit string) error {
-	_, err := c.call(ctx, "", "push", "--project", projectID, "--task", taskID, "--branch", branch, "--commit", commit)
+func (c *Client) PushTask(ctx context.Context, projectID, taskID, branch, commit string) error {
+	if c == nil || c.sourceRepos == nil {
+		return errors.New("ops client is not initialized")
+	}
+	if err := validateTask(taskID, branch, commit); err != nil {
+		return err
+	}
+	repo, ok := c.sourceRepos[projectID]
+	if !ok {
+		return errors.New("unknown source project")
+	}
+	bundle, err := c.createTaskBundle(ctx, repo, branch, commit)
+	if err != nil {
+		return err
+	}
+	_, callErr := c.call(ctx, "", bundle, "push", "--project", projectID, "--task", taskID, "--branch", branch, "--commit", commit)
+	closeErr := bundle.Close()
+	if callErr != nil {
+		return callErr
+	}
+	if closeErr != nil {
+		// The helper may already have pushed; a close error must not trigger a retry.
+		return nil
+	}
+	return nil
+}
+
+func (c *Client) createTaskBundle(ctx context.Context, repo, branch, commit string) (*os.File, error) {
+	fullRef := "refs/heads/" + branch
+	root, err := os.MkdirTemp("", "qqcodex-task-bundle-")
+	if err != nil {
+		return nil, errors.New("create task bundle directory failed")
+	}
+	if err := os.Chmod(root, 0o700); err != nil {
+		_ = os.RemoveAll(root)
+		return nil, errors.New("secure task bundle directory failed")
+	}
+	path := filepath.Join(root, "task.bundle")
+	cleanup := func() {
+		_ = os.Remove(path)
+		_ = os.Remove(root)
+	}
+	env := sourceGitEnvironment(root)
+	resolved, err := runProcess(ctx, repo, []string{c.sourceGit, "rev-parse", "--verify", "--end-of-options", fullRef + "^{commit}"}, env)
+	if err != nil || resolved != commit {
+		cleanup()
+		return nil, errors.New("source task branch does not match claimed commit")
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		cleanup()
+		return nil, errors.New("create task bundle failed")
+	}
+	if err := runBundleProcess(ctx, repo, []string{c.sourceGit, "bundle", "create", "-", fullRef}, env, file, c.maxBundleBytes); err != nil {
+		_ = file.Close()
+		cleanup()
+		return nil, err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		cleanup()
+		return nil, errors.New("sync task bundle failed")
+	}
+	if err := file.Close(); err != nil {
+		cleanup()
+		return nil, errors.New("close task bundle failed")
+	}
+	heads, err := runProcess(ctx, repo, []string{c.sourceGit, "bundle", "list-heads", path}, env)
+	if err != nil || !singleBundleHead(heads, fullRef, commit) {
+		cleanup()
+		return nil, errors.New("task bundle contains unexpected refs")
+	}
+	reader, err := os.Open(path)
+	if err != nil {
+		cleanup()
+		return nil, errors.New("open task bundle failed")
+	}
+	if err := os.Remove(path); err != nil {
+		_ = reader.Close()
+		cleanup()
+		return nil, errors.New("unlink task bundle failed")
+	}
+	if err := os.Remove(root); err != nil {
+		_ = reader.Close()
+		return nil, errors.New("clean task bundle directory failed")
+	}
+	return reader, nil
+}
+
+func runBundleProcess(ctx context.Context, dir string, argv, env []string, output *os.File, limit int64) error {
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd.Dir = dir
+	cmd.Env = env
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.WaitDelay = time.Second
+	var canceled atomic.Bool
+	cmd.Cancel = processGroupCancel(cmd, &canceled)
+	var overflow atomic.Bool
+	cmd.Stdout = &bundleWriter{file: output, limit: limit, overflow: &overflow, kill: func() {
+		if cmd.Process != nil {
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+	}}
+	var stderr boundedBuffer
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if overflow.Load() {
+		return errors.New("task bundle exceeded limit")
+	}
+	if canceled.Load() {
+		cause := ctx.Err()
+		if cause == nil {
+			cause = context.Canceled
+		}
+		return fmt.Errorf("task bundle canceled: %w", cause)
+	}
+	if stderr.truncated {
+		return errors.New("task bundle output exceeded limit")
+	}
+	if err != nil {
+		return errors.New("create task bundle failed")
+	}
+	return nil
+}
+
+type bundleWriter struct {
+	file     *os.File
+	written  int64
+	limit    int64
+	overflow *atomic.Bool
+	kill     func()
+}
+
+func (w *bundleWriter) Write(p []byte) (int, error) {
+	remaining := w.limit - w.written
+	if remaining <= 0 {
+		w.overflow.Store(true)
+		w.kill()
+		return 0, errors.New("bundle limit exceeded")
+	}
+	if int64(len(p)) > remaining {
+		n, err := w.file.Write(p[:remaining])
+		w.written += int64(n)
+		w.overflow.Store(true)
+		w.kill()
+		if err != nil {
+			return n, err
+		}
+		return n, errors.New("bundle limit exceeded")
+	}
+	n, err := w.file.Write(p)
+	w.written += int64(n)
+	return n, err
+}
+
+func singleBundleHead(output, expectedRef, expectedCommit string) bool {
+	fields := strings.Fields(output)
+	return len(fields) == 2 && fields[0] == expectedCommit && fields[1] == expectedRef
+}
+
+func sourceGitEnvironment(temp string) []string {
+	return append(fixedEnvironment("/nonexistent", temp),
+		"GIT_NO_REPLACE_OBJECTS=1", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null")
+}
+
+func processGroupCancel(cmd *exec.Cmd, canceled *atomic.Bool) func() error {
+	return func() error {
+		canceled.Store(true)
+		if cmd.Process == nil {
+			return os.ErrProcessDone
+		}
+		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		if errors.Is(err, syscall.ESRCH) {
+			return os.ErrProcessDone
+		}
+		return err
+	}
+}
+
+func (c *Client) MergeRC(ctx context.Context, projectID, taskID, commit string) (string, error) {
+	return c.call(ctx, "merge", nil, "merge", "--project", projectID, "--task", taskID, "--commit", commit)
+}
+
+func (c *Client) DeployRC(ctx context.Context, projectID, taskID, rcCommit string) error {
+	_, err := c.call(ctx, "", nil, "deploy", "--project", projectID, "--task", taskID, "--rc-commit", rcCommit)
 	return err
 }
 
-func (c Client) MergeRC(ctx context.Context, projectID, taskID, commit string) (string, error) {
-	return c.call(ctx, "merge", "merge", "--project", projectID, "--task", taskID, "--commit", commit)
-}
-
-func (c Client) DeployRC(ctx context.Context, projectID, taskID, rcCommit string) error {
-	_, err := c.call(ctx, "", "deploy", "--project", projectID, "--task", taskID, "--rc-commit", rcCommit)
-	return err
-}
-
-func (c Client) call(ctx context.Context, wantCommit string, args ...string) (string, error) {
+func (c *Client) call(ctx context.Context, wantCommit string, stdin io.Reader, args ...string) (string, error) {
 	if err := validateClientInputs(args); err != nil {
 		return "", err
 	}
-	if err := validateArgv(c.Command); err != nil {
+	if c == nil || validateArgv(c.command) != nil {
 		return "", errors.New("ops command is invalid")
 	}
-	executable, err := trustedExecutable(c.Command[0], nil)
-	if err != nil {
-		return "", errors.New("ops command is invalid")
-	}
-	command := append([]string(nil), c.Command...)
-	command[0] = executable
-	argv := append(command, args...)
-	stdout, runErr := runClientProcess(ctx, argv)
+	argv := append(append([]string(nil), c.command...), args...)
+	stdout, runErr := runClientProcess(ctx, argv, stdin)
 	response, decodeErr := decodeHelperResponse(stdout)
 	if decodeErr != nil {
 		if runErr != nil {
@@ -143,9 +360,10 @@ func decodeHelperResponse(data []byte) (helperResponse, error) {
 	return response, nil
 }
 
-func runClientProcess(ctx context.Context, argv []string) ([]byte, error) {
+func runClientProcess(ctx context.Context, argv []string, stdin io.Reader) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Env = clientEnvironment()
+	cmd.Stdin = stdin
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.WaitDelay = time.Second
 	var stdout limitedBytes
@@ -154,17 +372,7 @@ func runClientProcess(ctx context.Context, argv []string) ([]byte, error) {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	var canceled atomic.Bool
-	cmd.Cancel = func() error {
-		canceled.Store(true)
-		if cmd.Process == nil {
-			return os.ErrProcessDone
-		}
-		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		if errors.Is(err, syscall.ESRCH) {
-			return os.ErrProcessDone
-		}
-		return err
-	}
+	cmd.Cancel = processGroupCancel(cmd, &canceled)
 	err := cmd.Run()
 	if canceled.Load() {
 		cause := ctx.Err()

@@ -692,7 +692,7 @@ git commit -m "feat: manage isolated git worktrees"
 
 - [ ] **Step 1: Write failing operator tests**
 
-Using local bare remotes, verify `Sync`, `PushTask`, and `MergeRC`. `PushTask` must reject a branch outside `codex/<valid-task-id>` and a commit mismatch. It accepts a missing remote task branch on first push or a remote task commit that is an ancestor of the new commit on supplement, and rejects every non-fast-forward update. `MergeRC` must verify the remote task ref equals the approved task commit, return the new RC commit, run checks, stop on conflict, and never force push. A deploy test must use a fixed helper argv that records environment values and prove a task requirement cannot alter the command.
+Using two physically separate worker/ops clones and local bare remotes, verify `Sync`, `PushTaskBundle`, and `MergeRC`. `Client.PushTask` must resolve the exact source ref, create one bounded bundle, and send it only through helper stdin; no source path or `.git` data may cross the boundary. `PushTaskBundle` must reject a branch outside `codex/<valid-task-id>`, a commit mismatch, extra/wrong refs, appended junk, empty/oversize/cancelled input, missing trusted base ancestry, and every non-fast-forward update. It accepts a missing remote task branch on first push or a remote task commit that is an ancestor of the new commit on supplement. The helper must spool into a 0700/0600 private path, verify/list-heads the single full ref, fsck-import to a random temporary ref, remove bundle and refs before any external push, and re-guard the ops clone. `MergeRC` must verify the remote task ref equals the approved task commit, return the new RC commit, run checks, stop on conflict, and never force push. A deploy test must use a fixed helper argv that records environment values and prove a task requirement cannot alter the command.
 
 - [ ] **Step 2: Run tests and verify they fail**
 
@@ -723,7 +723,7 @@ Define:
 
 ```go
 func (o *Operator) Sync(ctx context.Context, projectID string) error
-func (o *Operator) PushTask(ctx context.Context, projectID, taskID, branch, commit string) error
+func (o *Operator) PushTaskBundle(ctx context.Context, projectID, taskID, branch, commit string, bundle io.Reader) error
 func (o *Operator) MergeRC(ctx context.Context, projectID, taskID, taskCommit string) (string, error)
 func (o *Operator) DeployRC(ctx context.Context, projectID, taskID, rcCommit string) error
 ```
@@ -732,7 +732,7 @@ Required commands:
 
 ```text
 sync:   git -C <repo> fetch --prune <remote> <base> <rc>
-push:   git -C <repo> push <remote> <commit>:refs/heads/<task-branch>
+push:   git -C <ops-repo> fetch <bundle> <full-task-ref>:<temporary-ref>; verify/import/cleanup; push <remote-url> <commit>:refs/heads/<task-branch>
 merge:  temporary worktree at exact remote RC commit; git merge --no-ff --no-edit <task-commit>; checks; normal push HEAD:refs/heads/<rc>
 deploy: fixed deploy argv with QQCODEX_PROJECT_ID, QQCODEX_TASK_ID, QQCODEX_RC_COMMIT environment variables
 ```
@@ -750,7 +750,7 @@ qqcodex-ops -config <path> merge --project <id> --task <id> --commit <sha>
 qqcodex-ops -config <path> deploy --project <id> --task <id> --rc-commit <sha>
 ```
 
-It writes one JSON object to stdout, for example `{"ok":true,"rc_commit":"0123456789abcdef0123456789abcdef01234567"}` or `{"ok":false,"error":"remote RC changed"}`, and uses non-zero exit status for failure. `internal/ops/client.go` builds these argv from typed methods and parses only that JSON object.
+It writes one JSON object to stdout, for example `{"ok":true,"rc_commit":"0123456789abcdef0123456789abcdef01234567"}` or `{"ok":false,"error":"remote RC changed"}`, and uses non-zero exit status for failure. `internal/ops/client.go` builds these argv from typed methods, sends task bundles through stdin for `push`, and parses only that JSON object. The public client constructor accepts only root-owned helper/source Git executables; same-package tests use an unexported current-UID constructor.
 
 - [ ] **Step 6: Add the example config and run tests**
 
@@ -938,7 +938,7 @@ Expected: FAIL because `Scheduler` is undefined.
 
 - [ ] **Step 3: Extend ports for execution dependencies**
 
-Add typed interfaces for `Runner`, `Worktrees`, and `Operator` matching the methods from Tasks 5-7. Do not expose `exec.Cmd`, raw SQL, or unvalidated argv through these interfaces.
+Add typed interfaces for `Runner`, `Worktrees`, and `Operator` matching the methods from Tasks 5-7, including `PushTaskBundle` with an `io.Reader` bundle input. Do not expose `exec.Cmd`, raw SQL, source repository paths, or unvalidated argv through these interfaces.
 
 - [ ] **Step 4: Implement persistent polling and concurrency**
 
@@ -1040,6 +1040,8 @@ git commit -m "feat: gate rc merge and deployment"
 ## Milestone 3: NapCat Integration and End-to-End Verification
 
 ### Task 12: Decode and encode OneBot 11 group messages safely
+
+Before any external deploy call, persist `deploying` and the exact RC commit/`QQCODEX_DEPLOY_KEY`; after restart do not automatically replay the action. Reconciliation of the same key is manual and must rely on the durable deployment target's duplicate-key guarantee.
 
 **Files:**
 - Create: `internal/onebot/protocol.go`
@@ -1287,3 +1289,7 @@ Do not connect a real RC repository until every item below is true:
 - [ ] A merge conflict and a failed deploy were observed to stop safely in tests.
 - [ ] Approvals were observed to bind exact task/RC commit hashes.
 - [ ] RC operators understand how to stop the service and inspect SQLite/logs before retrying interrupted work.
+- [ ] Worker and ops use physically separate repositories; task commits cross only as bounded single-ref bundles over helper stdin, and worker cannot read ops `.git`, refs, config, credentials, or deployment files.
+- [ ] Real check-runner acceptance proves no ops HOME, parent `/proc`, credential-file, network, common-Git, UID/cgroup/PID, or filesystem escape; protected RC has ops as its sole writer.
+- [ ] Ops config, helper, wrapper, and executable ownership is root or the dedicated ops identity; public client/source Git construction rejects worker-owned binaries; startup hard-fails when any gate is absent.
+- [ ] Deployment target durably deduplicates `QQCODEX_DEPLOY_KEY`; `deploying` is persisted before the external action, restart never auto-replays it, and same-key reconciliation is manual.

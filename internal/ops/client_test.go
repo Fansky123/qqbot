@@ -3,18 +3,23 @@ package ops
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func TestClientBuildsTypedArgvAndParsesResponse(t *testing.T) {
 	ctx := context.Background()
 	record := filepath.Join(t.TempDir(), "argv.json")
-	client := Client{Command: helperCommand(t, record, "success")}
-	commit := strings.Repeat("a", 40)
+	source, commit := clientTaskSource(t)
+	client := mustNewClient(t, helperCommand(t, record, "success"), map[string]string{"order-api": source})
 
 	tests := []struct {
 		name string
@@ -82,7 +87,7 @@ func TestClientRejectsInvalidOrMultipleJSONResponses(t *testing.T) {
 	} {
 		mode := mode
 		t.Run(mode, func(t *testing.T) {
-			client := Client{Command: helperCommand(t, filepath.Join(t.TempDir(), "argv.json"), mode)}
+			client := mustNewClient(t, helperCommand(t, filepath.Join(t.TempDir(), "argv.json"), mode), nil)
 			err := client.Sync(context.Background(), "order-api")
 			if err == nil {
 				t.Fatal("Sync() error = nil, want strict response error")
@@ -95,27 +100,45 @@ func TestClientRejectsInvalidOrMultipleJSONResponses(t *testing.T) {
 }
 
 func TestClientDoesNotPassCodexCredential(t *testing.T) {
+	client := mustNewClient(t, helperCommand(t, filepath.Join(t.TempDir(), "argv.json"), "check-env"), nil)
 	t.Setenv("CODEX_API_KEY", "must-not-cross-boundary")
 	t.Setenv("OPENAI_API_KEY", "must-not-cross-boundary")
 	t.Setenv("NAPCAT_ACCESS_TOKEN", "must-not-cross-boundary")
 	t.Setenv("CUSTOM_TOKEN", "must-not-cross-boundary")
 	t.Setenv("HOME", "/attacker/home")
 	t.Setenv("PATH", "/attacker/bin")
-	client := Client{Command: helperCommand(t, filepath.Join(t.TempDir(), "argv.json"), "check-env")}
 	if err := client.Sync(context.Background(), "order-api"); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestClientRejectsUntrustedExecutable(t *testing.T) {
-	client := Client{Command: []string{"qqcodex-ops"}}
-	if err := client.Sync(context.Background(), "order-api"); err == nil {
-		t.Fatal("Sync() error = nil, want untrusted executable rejection")
+	repo := filepath.Join(privateTempDir(t), "source")
+	git(t, filepath.Dir(repo), "init", repo)
+	workerOwned := writeExecutable(t, filepath.Join(privateTempDir(t), "qqcodex-ops"), "#!/bin/sh\nexit 0\n")
+	if _, err := NewClient([]string{workerOwned}, map[string]string{"order-api": repo}); err == nil {
+		t.Fatal("NewClient() error = nil, want worker-owned executable rejection")
+	}
+}
+
+func TestNewClientAcceptsOnlyRootOwnedExecutables(t *testing.T) {
+	repo := filepath.Join(privateTempDir(t), "source")
+	git(t, filepath.Dir(repo), "init", repo)
+	rootCommand := realExecutable(t, "true")
+	if _, err := NewClient([]string{rootCommand}, map[string]string{"order-api": repo}); err != nil {
+		t.Fatalf("NewClient() rejected root-owned command and source Git: %v", err)
+	}
+
+	gitDir := privateTempDir(t)
+	writeExecutable(t, filepath.Join(gitDir, "git"), "#!/bin/sh\nexec /usr/bin/git \"$@\"\n")
+	t.Setenv("PATH", gitDir+":/usr/bin:/bin")
+	if _, err := NewClient([]string{rootCommand}, map[string]string{"order-api": repo}); err == nil {
+		t.Fatal("NewClient() error = nil, want worker-owned source Git rejection")
 	}
 }
 
 func TestClientDoesNotExposeHelperStderr(t *testing.T) {
-	client := Client{Command: helperCommand(t, filepath.Join(t.TempDir(), "argv.json"), "secret-stderr")}
+	client := mustNewClient(t, helperCommand(t, filepath.Join(t.TempDir(), "argv.json"), "secret-stderr"), nil)
 	err := client.Sync(context.Background(), "order-api")
 	if err == nil || err.Error() != "public failure" {
 		t.Fatalf("Sync() error = %v, want only public JSON error", err)
@@ -140,7 +163,16 @@ func TestOpsClientHelper(t *testing.T) {
 	args := os.Args[separator+3:]
 	data, _ := json.Marshal(args)
 	_ = os.WriteFile(record, data, 0o600)
+	if len(args) > 0 && args[0] == "push" {
+		bundle, _ := io.ReadAll(os.Stdin)
+		_ = os.WriteFile(record+".bundle", bundle, 0o600)
+	}
 	commit := strings.Repeat("a", 40)
+	for i, arg := range args {
+		if arg == "--commit" && i+1 < len(args) {
+			commit = args[i+1]
+		}
+	}
 	switch mode {
 	case "success":
 		if len(args) > 0 && args[0] == "merge" {
@@ -180,13 +212,64 @@ func TestOpsClientHelper(t *testing.T) {
 	os.Exit(0)
 }
 
+func TestOpsBundleOperatorHelper(t *testing.T) {
+	separator := -1
+	for i, arg := range os.Args {
+		if arg == "qqcodex-bundle-operator-helper" {
+			separator = i
+			break
+		}
+	}
+	if separator < 0 {
+		return
+	}
+	if len(os.Args) < separator+12 {
+		os.Exit(122)
+	}
+	configPath, record := os.Args[separator+1], os.Args[separator+2]
+	args := os.Args[separator+3:]
+	data, _ := json.Marshal(args)
+	_ = os.WriteFile(record, data, 0o600)
+	if err := validateClientInputs(args); err != nil || args[0] != "push" {
+		_, _ = os.Stdout.WriteString(`{"ok":false,"error":"invalid push"}`)
+		os.Exit(1)
+	}
+	cfg, err := LoadConfig(configPath)
+	if err != nil {
+		_, _ = os.Stdout.WriteString(`{"ok":false,"error":"load failed"}`)
+		os.Exit(1)
+	}
+	operator, err := NewOperator(cfg)
+	if err == nil {
+		err = operator.PushTaskBundle(context.Background(), args[2], args[4], args[6], args[8], os.Stdin)
+	}
+	if err != nil {
+		_, _ = os.Stdout.WriteString(`{"ok":false,"error":"push failed"}`)
+		os.Exit(1)
+	}
+	_, _ = os.Stdout.WriteString(`{"ok":true}`)
+	os.Exit(0)
+}
+
 func helperCommand(t *testing.T, record, mode string) []string {
+	t.Helper()
+	trusted := copiedTestExecutable(t, "qqcodex-ops-test")
+	return []string{trusted, "-test.run=^TestOpsClientHelper$", "--", "qqcodex-client-helper", record, mode}
+}
+
+func operatorHelperCommand(t *testing.T, configPath, record string) []string {
+	t.Helper()
+	trusted := copiedTestExecutable(t, "qqcodex-bundle-ops-test")
+	return []string{trusted, "-test.run=^TestOpsBundleOperatorHelper$", "--", "qqcodex-bundle-operator-helper", configPath, record}
+}
+
+func copiedTestExecutable(t *testing.T, name string) string {
 	t.Helper()
 	executable, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
-	trusted := filepath.Join(privateTempDir(t), "qqcodex-ops-test")
+	trusted := filepath.Join(privateTempDir(t), name)
 	data, err := os.ReadFile(executable)
 	if err != nil {
 		t.Fatal(err)
@@ -194,8 +277,188 @@ func helperCommand(t *testing.T, record, mode string) []string {
 	if err := os.WriteFile(trusted, data, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := trustedExecutable(trusted, nil); err != nil {
-		t.Fatalf("test helper is not trusted: %v", err)
+	return trusted
+}
+
+func mustNewClient(t *testing.T, command []string, sourceRepos map[string]string) *Client {
+	t.Helper()
+	client, err := newClient(command, sourceRepos, true)
+	if err != nil {
+		t.Fatal(err)
 	}
-	return []string{trusted, "-test.run=^TestOpsClientHelper$", "--", "qqcodex-client-helper", record, mode}
+	return client
+}
+
+func clientTaskSource(t *testing.T) (string, string) {
+	t.Helper()
+	repo := filepath.Join(privateTempDir(t), "source")
+	git(t, filepath.Dir(repo), "init", "-b", "main", repo)
+	configureGitUser(t, repo)
+	writeFile(t, filepath.Join(repo, "base.txt"), "base\n")
+	git(t, repo, "add", "base.txt")
+	git(t, repo, "commit", "-m", "base")
+	git(t, repo, "switch", "-c", "codex/"+testTaskID)
+	writeFile(t, filepath.Join(repo, "task.txt"), "task\n")
+	git(t, repo, "add", "task.txt")
+	git(t, repo, "commit", "-m", "task")
+	return repo, git(t, repo, "rev-parse", "HEAD")
+}
+
+func TestClientPushTaskSendsSingleRefBundleOnStdin(t *testing.T) {
+	record := filepath.Join(t.TempDir(), "argv.json")
+	source, commit := clientTaskSource(t)
+	client := mustNewClient(t, helperCommand(t, record, "success"), map[string]string{"order-api": source})
+
+	if err := client.PushTask(context.Background(), "order-api", testTaskID, "codex/"+testTaskID, commit); err != nil {
+		t.Fatal(err)
+	}
+	heads := git(t, source, "bundle", "list-heads", record+".bundle")
+	want := commit + " refs/heads/codex/" + testTaskID
+	if heads != want {
+		t.Fatalf("bundle heads = %q, want %q", heads, want)
+	}
+	data, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), source) {
+		t.Fatalf("helper argv exposed source repository %q", source)
+	}
+}
+
+func TestClientPushTaskRejectsClaimedCommitMismatch(t *testing.T) {
+	record := filepath.Join(t.TempDir(), "argv.json")
+	source, _ := clientTaskSource(t)
+	client := mustNewClient(t, helperCommand(t, record, "success"), map[string]string{"order-api": source})
+
+	err := client.PushTask(context.Background(), "order-api", testTaskID, "codex/"+testTaskID, strings.Repeat("a", 40))
+	if err == nil {
+		t.Fatal("PushTask() error = nil, want source commit mismatch")
+	}
+	if _, statErr := os.Stat(record); !os.IsNotExist(statErr) {
+		t.Fatalf("helper started for mismatched commit, stat error = %v", statErr)
+	}
+}
+
+func TestClientConstructionDeepCopiesSourceRepositories(t *testing.T) {
+	source, commit := clientTaskSource(t)
+	record := filepath.Join(t.TempDir(), "argv.json")
+	repos := map[string]string{"order-api": source}
+	client := mustNewClient(t, helperCommand(t, record, "success"), repos)
+	repos["order-api"] = t.TempDir()
+
+	if err := client.PushTask(context.Background(), "order-api", testTaskID, "codex/"+testTaskID, commit); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestClientPushTaskTransfersBundleToIsolatedOperator(t *testing.T) {
+	fixture := newOpsFixture(t)
+	worker := fixture.clone(t)
+	branch := "codex/" + testTaskID
+	git(t, worker, "switch", "-c", branch, "origin/main")
+	writeFile(t, filepath.Join(worker, "client-task.txt"), "client task\n")
+	git(t, worker, "add", "client-task.txt")
+	git(t, worker, "commit", "-m", "client task")
+	commit := git(t, worker, "rev-parse", "HEAD")
+	configPath := filepath.Join(privateTempDir(t), "ops.json")
+	writeJSON(t, configPath, fixture.config)
+	record := filepath.Join(t.TempDir(), "operator-argv.json")
+	client := mustNewClient(t, operatorHelperCommand(t, configPath, record), map[string]string{fixture.projectID: worker})
+
+	if err := client.PushTask(context.Background(), fixture.projectID, testTaskID, branch, commit); err != nil {
+		t.Fatal(err)
+	}
+	if got := fixture.remoteRef(t, branch); got != commit {
+		t.Fatalf("remote task commit = %q, want %q", got, commit)
+	}
+	if local := git(t, fixture.repo, "for-each-ref", "--format=%(refname)", "refs/heads/codex"); local != "" {
+		t.Fatalf("ops clone acquired worker task ref %q", local)
+	}
+	data, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), worker) {
+		t.Fatalf("helper argv exposed worker repository %q", worker)
+	}
+}
+
+func TestClientPushTaskKillsBundleProducerOnOverflow(t *testing.T) {
+	source, commit := clientTaskSource(t)
+	record := filepath.Join(t.TempDir(), "argv.json")
+	marker := filepath.Join(t.TempDir(), "producer-pid")
+	gitDir := privateTempDir(t)
+	writeExecutable(t, filepath.Join(gitDir, "git"), `#!/bin/sh
+if [ "$1" = bundle ] && [ "$2" = create ]; then
+  echo $$ > "`+marker+`"
+  while :; do /usr/bin/head -c 4096 /dev/zero; done
+fi
+exec /usr/bin/git "$@"
+`)
+	t.Setenv("PATH", gitDir+":/usr/bin:/bin")
+	client := mustNewClient(t, helperCommand(t, record, "success"), map[string]string{"order-api": source})
+	client.maxBundleBytes = 1024
+
+	err := client.PushTask(context.Background(), "order-api", testTaskID, "codex/"+testTaskID, commit)
+	if err == nil || !strings.Contains(err.Error(), "exceeded limit") {
+		t.Fatalf("PushTask() error = %v, want bundle limit error", err)
+	}
+	assertProcessGone(t, marker)
+	if _, statErr := os.Stat(record); !os.IsNotExist(statErr) {
+		t.Fatalf("helper started after bundle overflow, stat error = %v", statErr)
+	}
+}
+
+func TestClientPushTaskCancellationKillsBundleProducer(t *testing.T) {
+	source, commit := clientTaskSource(t)
+	record := filepath.Join(t.TempDir(), "argv.json")
+	marker := filepath.Join(t.TempDir(), "producer-pid")
+	gitDir := privateTempDir(t)
+	writeExecutable(t, filepath.Join(gitDir, "git"), `#!/bin/sh
+if [ "$1" = bundle ] && [ "$2" = create ]; then
+  echo $$ > "`+marker+`"
+  exec /usr/bin/sleep 600
+fi
+exec /usr/bin/git "$@"
+`)
+	t.Setenv("PATH", gitDir+":/usr/bin:/bin")
+	client := mustNewClient(t, helperCommand(t, record, "success"), map[string]string{"order-api": source})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- client.PushTask(ctx, "order-api", testTaskID, "codex/"+testTaskID, commit)
+	}()
+	waitForFile(t, marker)
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("PushTask() error = %v, want cancellation", err)
+	}
+	assertProcessGone(t, marker)
+	if _, statErr := os.Stat(record); !os.IsNotExist(statErr) {
+		t.Fatalf("helper started after bundle cancellation, stat error = %v", statErr)
+	}
+}
+
+func assertProcessGone(t *testing.T, marker string) {
+	t.Helper()
+	data, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		err := syscall.Kill(pid, 0)
+		if errors.Is(err, syscall.ESRCH) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("bundle producer %d remains after failure: %v", pid, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
