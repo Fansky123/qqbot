@@ -3,7 +3,9 @@ package tasklog
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -145,6 +147,43 @@ func TestStoreRedactsSecretsAndFramesNewlines(t *testing.T) {
 	}
 	if !strings.Contains(got, `[REDACTED]`) || !strings.Contains(got, `\n`) {
 		t.Fatalf("log lacks redaction or escaped newline: %q", got)
+	}
+}
+
+func TestAppendDoesNotRedactInsideReplacementMarker(t *testing.T) {
+	t.Parallel()
+	store := openStore(t, []string{"A", "C", "T", "]"})
+	if err := store.Append(testTaskID, "codex.events", []byte("A")); err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(store.Root, testTaskID+".log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entry record
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatal(err)
+	}
+	if entry.Data != "[REDACTED]" {
+		t.Fatalf("redacted data = %q, want one replacement marker", entry.Data)
+	}
+}
+
+func TestConfiguredSecretsCannotDisableCredentialRedaction(t *testing.T) {
+	t.Parallel()
+	store := openStore(t, []string{"Bearer", "CODEX"})
+	input := "Authorization: Bearer bearer-value CODEX_API_KEY=codex-secret"
+	if err := store.Append(testTaskID, "codex.stderr", []byte(input)); err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(store.Root, testTaskID+".log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "bearer-value") || strings.Contains(string(data), "codex-secret") {
+		t.Fatalf("overlapping configured secret disabled credential redaction: %s", data)
 	}
 }
 
@@ -437,6 +476,149 @@ func TestRemoveDeletesOnlyRegularTaskLog(t *testing.T) {
 		t.Fatalf("idempotent Remove() error = %v", err)
 	}
 }
+
+func TestAppendRejectsOversizedRecordWithoutLimitingTask(t *testing.T) {
+	t.Parallel()
+	store := openStore(t, nil)
+	err := store.Append(testTaskID, "codex.events", bytes.Repeat([]byte{'x'}, maxRecordDataBytes+1))
+	if !errors.Is(err, ErrLimitExceeded) {
+		t.Fatalf("Append() error = %v, want record limit", err)
+	}
+	if err := store.Append(testTaskID, "codex.events", []byte("small")); err != nil {
+		t.Fatalf("small Append() after oversized record error = %v", err)
+	}
+}
+
+func TestAppendEnforcesTaskLimitAndWritesOneMarker(t *testing.T) {
+	t.Parallel()
+	store := openStore(t, nil)
+	store.maxTaskBytes = 8 << 10
+	payload := bytes.Repeat([]byte{'x'}, 200)
+	var limitErr error
+	for range 1000 {
+		if err := store.Append(testTaskID, "codex.events", payload); err != nil {
+			limitErr = err
+			break
+		}
+	}
+	if !errors.Is(limitErr, ErrLimitExceeded) {
+		t.Fatalf("Append() limit error = %v", limitErr)
+	}
+	path := filepath.Join(store.Root, testTaskID+".log")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if int64(len(data)) > store.maxTaskBytes {
+		t.Fatalf("task log size = %d, limit = %d", len(data), store.maxTaskBytes)
+	}
+	if got := bytes.Count(data, taskLimitRecord); got != 1 {
+		t.Fatalf("task limit marker count = %d, want 1", got)
+	}
+
+	size := len(data)
+	for range 3 {
+		if err := store.Append(testTaskID, "checks", []byte("later")); !errors.Is(err, ErrLimitExceeded) {
+			t.Fatalf("Append() after limit error = %v", err)
+		}
+	}
+	data, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) != size || bytes.Count(data, taskLimitRecord) != 1 {
+		t.Fatalf("limited task log changed: size=%d marker count=%d", len(data), bytes.Count(data, taskLimitRecord))
+	}
+
+	reopened, err := Open(store.Root, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopened.maxTaskBytes = store.maxTaskBytes
+	if err := reopened.Append(testTaskID, "checks", []byte("after restart")); !errors.Is(err, ErrLimitExceeded) {
+		t.Fatalf("reopened Append() error = %v, want persistent task limit", err)
+	}
+}
+
+func TestAppendCountsEncodedRecordBytesAndNeverExceedsHardLimit(t *testing.T) {
+	t.Parallel()
+	t.Run("encoded overhead", func(t *testing.T) {
+		store := openStore(t, nil)
+		store.maxTaskBytes = 4 << 10
+		data := bytes.Repeat([]byte{1}, 700)
+		err := store.Append(testTaskID, "codex.events", data)
+		if !errors.Is(err, ErrLimitExceeded) {
+			t.Fatalf("Append() error = %v, want encoded-size limit", err)
+		}
+		info, err := os.Stat(filepath.Join(store.Root, testTaskID+".log"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Size() > store.maxTaskBytes {
+			t.Fatalf("encoded task log size = %d, limit = %d", info.Size(), store.maxTaskBytes)
+		}
+	})
+
+	t.Run("hard limit", func(t *testing.T) {
+		store := openStore(t, nil)
+		if err := store.Append(testTaskID, "checks", []byte("seed")); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(store.Root, testTaskID+".log")
+		if err := os.Truncate(path, maxTaskLogBytes); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Append(testTaskID, "checks", []byte("must-not-grow")); !errors.Is(err, ErrLimitExceeded) {
+			t.Fatalf("Append() error = %v, want hard task limit", err)
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Size() != maxTaskLogBytes {
+			t.Fatalf("task log size = %d, want hard limit %d", info.Size(), maxTaskLogBytes)
+		}
+	})
+}
+
+func TestWriteAllHandlesPartialAndZeroWrites(t *testing.T) {
+	t.Parallel()
+	var output bytes.Buffer
+	writer := partialWriter{writer: &output, max: 3}
+	if err := writeAll(writer, []byte("complete")); err != nil {
+		t.Fatal(err)
+	}
+	if output.String() != "complete" {
+		t.Fatalf("writeAll() output = %q", output.String())
+	}
+	if err := writeAll(zeroWriter{}, []byte("data")); !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("writeAll() zero-write error = %v, want io.ErrShortWrite", err)
+	}
+	wantErr := errors.New("write failed")
+	if err := writeAll(partialErrorWriter{err: wantErr}, []byte("data")); !errors.Is(err, wantErr) {
+		t.Fatalf("writeAll() partial-write error = %v, want %v", err, wantErr)
+	}
+}
+
+type partialWriter struct {
+	writer io.Writer
+	max    int
+}
+
+func (w partialWriter) Write(p []byte) (int, error) {
+	if len(p) > w.max {
+		p = p[:w.max]
+	}
+	return w.writer.Write(p)
+}
+
+type zeroWriter struct{}
+
+func (zeroWriter) Write([]byte) (int, error) { return 0, nil }
+
+type partialErrorWriter struct{ err error }
+
+func (w partialErrorWriter) Write(p []byte) (int, error) { return len(p) / 2, w.err }
 
 func openStore(t *testing.T, secrets []string) *Store {
 	t.Helper()

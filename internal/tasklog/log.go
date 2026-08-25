@@ -22,7 +22,16 @@ const (
 	maxSummaryReadBytes = 1 << 20
 	// This is also the maximum configured secret length, measured in bytes.
 	maxRedactionOverlap = 64 << 10
+	maxRecordDataBytes  = 1 << 20
+	maxTaskLogBytes     = 64 << 20
+	redactionMarker     = "[REDACTED]"
+	redactionSentinel   = "\x00"
 )
+
+// ErrLimitExceeded reports that a record or task log reached its hard limit.
+var ErrLimitExceeded = errors.New("task log limit exceeded")
+
+var taskLimitRecord = []byte(`{"time":"1970-01-01T00:00:00Z","stream":"tasklog.limit","data":"task log output limit reached"}` + "\n")
 
 var (
 	taskIDPattern = regexp.MustCompile(`^T-[A-F0-9]{12}$`)
@@ -35,11 +44,15 @@ var (
 type Store struct {
 	Root string
 
-	secrets []string
-	rootDev uint64
-	rootIno uint64
-	locksMu sync.Mutex
-	locks   map[string]*sync.Mutex
+	secrets        []string
+	secretRedactor *strings.Replacer
+	rootDev        uint64
+	rootIno        uint64
+	locksMu        sync.Mutex
+	locks          map[string]*sync.Mutex
+	limited        map[string]bool
+
+	maxTaskBytes int64
 }
 
 type record struct {
@@ -53,21 +66,40 @@ func Open(root string, secretValues []string) (*Store, error) {
 		return nil, errors.New("task log root is required")
 	}
 	secrets := make([]string, 0, len(secretValues))
-	seenSecrets := make(map[string]struct{}, len(secretValues))
-	for _, value := range secretValues {
-		if len(value) > maxRedactionOverlap {
-			return nil, errors.New("task log secret exceeds maximum length")
-		}
+	seenSecrets := make(map[string]struct{}, len(secretValues)*2)
+	addSecret := func(value string) {
 		if value == "" {
-			continue
+			return
 		}
 		if _, exists := seenSecrets[value]; exists {
-			continue
+			return
 		}
 		seenSecrets[value] = struct{}{}
 		secrets = append(secrets, value)
 	}
+	for _, value := range secretValues {
+		if len(value) > maxRedactionOverlap {
+			return nil, errors.New("task log secret exceeds maximum length")
+		}
+		addSecret(value)
+		if value == "" {
+			continue
+		}
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return nil, errors.New("encode task log secret failed")
+		}
+		addSecret(string(encoded[1 : len(encoded)-1]))
+	}
 	sort.SliceStable(secrets, func(i, j int) bool { return len(secrets[i]) > len(secrets[j]) })
+	var secretRedactor *strings.Replacer
+	if len(secrets) > 0 {
+		replacements := make([]string, 0, len(secrets)*2)
+		for _, secret := range secrets {
+			replacements = append(replacements, secret, redactionSentinel)
+		}
+		secretRedactor = strings.NewReplacer(replacements...)
+	}
 
 	abs, err := filepath.Abs(root)
 	if err != nil {
@@ -95,11 +127,15 @@ func Open(root string, secretValues []string) (*Store, error) {
 	}
 
 	return &Store{
-		Root:    canonical,
-		secrets: secrets,
-		rootDev: uint64(stat.Dev),
-		rootIno: stat.Ino,
-		locks:   make(map[string]*sync.Mutex),
+		Root:           canonical,
+		secrets:        secrets,
+		secretRedactor: secretRedactor,
+		rootDev:        uint64(stat.Dev),
+		rootIno:        stat.Ino,
+		locks:          make(map[string]*sync.Mutex),
+		limited:        make(map[string]bool),
+
+		maxTaskBytes: maxTaskLogBytes,
 	}, nil
 }
 
@@ -112,6 +148,9 @@ func (s *Store) Append(taskID, stream string, data []byte) error {
 	}
 	if s == nil {
 		return errors.New("task log store is not initialized")
+	}
+	if len(data) > maxRecordDataBytes {
+		return fmt.Errorf("task log record data exceeded limit: %w", ErrLimitExceeded)
 	}
 
 	entry, err := json.Marshal(record{
@@ -127,23 +166,30 @@ func (s *Store) Append(taskID, stream string, data []byte) error {
 	lock := s.taskLock(taskID)
 	lock.Lock()
 	defer lock.Unlock()
+	if s.taskLimited(taskID) {
+		return ErrLimitExceeded
+	}
 	rootFD, err := s.openRoot()
 	if err != nil {
 		return err
 	}
-	file, err := openTaskFile(rootFD, taskID, unix.O_WRONLY|unix.O_APPEND|unix.O_CREAT, 0o600)
+	file, err := openTaskFile(rootFD, taskID, unix.O_RDWR|unix.O_APPEND|unix.O_CREAT, 0o600)
 	if err != nil {
 		return errors.Join(err, closeRoot(rootFD))
 	}
-	_, writeErr := file.Write(entry)
-	syncErr := file.Sync()
+	lockErr := unix.Flock(int(file.Fd()), unix.LOCK_EX)
+	var writeErr error
+	if lockErr == nil {
+		writeErr = s.appendBounded(taskID, file, entry)
+	}
+	unlockErr := unix.Flock(int(file.Fd()), unix.LOCK_UN)
 	closeErr := file.Close()
 	rootCloseErr := unix.Close(rootFD)
-	if writeErr != nil {
-		writeErr = fmt.Errorf("append task log: %w", writeErr)
+	if lockErr != nil {
+		lockErr = fmt.Errorf("lock task log: %w", lockErr)
 	}
-	if syncErr != nil {
-		syncErr = fmt.Errorf("sync task log: %w", syncErr)
+	if unlockErr != nil {
+		unlockErr = fmt.Errorf("unlock task log: %w", unlockErr)
 	}
 	if closeErr != nil {
 		closeErr = fmt.Errorf("close task log: %w", closeErr)
@@ -151,7 +197,87 @@ func (s *Store) Append(taskID, stream string, data []byte) error {
 	if rootCloseErr != nil {
 		rootCloseErr = fmt.Errorf("close task log root: %w", rootCloseErr)
 	}
-	return errors.Join(writeErr, syncErr, closeErr, rootCloseErr)
+	return errors.Join(lockErr, writeErr, unlockErr, closeErr, rootCloseErr)
+}
+
+func (s *Store) appendBounded(taskID string, file *os.File, entry []byte) error {
+	info, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("stat task log before append: %w", err)
+	}
+	size := info.Size()
+	if size < 0 || s.maxTaskBytes <= int64(len(taskLimitRecord)) {
+		s.setTaskLimited(taskID, true)
+		return ErrLimitExceeded
+	}
+	limited, err := hasTaskLimitRecord(file, size)
+	if err != nil {
+		return err
+	}
+	if limited {
+		s.setTaskLimited(taskID, true)
+		return ErrLimitExceeded
+	}
+	usable := s.maxTaskBytes - int64(len(taskLimitRecord))
+	if size > usable || int64(len(entry)) > usable-size {
+		s.setTaskLimited(taskID, true)
+		var markerErr error
+		if size <= s.maxTaskBytes-int64(len(taskLimitRecord)) {
+			markerErr = appendAndSync(file, size, taskLimitRecord)
+		}
+		return errors.Join(ErrLimitExceeded, markerErr)
+	}
+	return appendAndSync(file, size, entry)
+}
+
+func hasTaskLimitRecord(file *os.File, size int64) (bool, error) {
+	if size < int64(len(taskLimitRecord)) {
+		return false, nil
+	}
+	data := make([]byte, len(taskLimitRecord))
+	if _, err := file.ReadAt(data, size-int64(len(data))); err != nil {
+		return false, fmt.Errorf("inspect task log limit marker: %w", err)
+	}
+	return bytes.Equal(data, taskLimitRecord), nil
+}
+
+func appendAndSync(file *os.File, originalSize int64, data []byte) error {
+	if err := writeAll(file, data); err != nil {
+		return errors.Join(fmt.Errorf("append task log: %w", err), rollbackAppend(file, originalSize))
+	}
+	if err := file.Sync(); err != nil {
+		return errors.Join(fmt.Errorf("sync task log: %w", err), rollbackAppend(file, originalSize))
+	}
+	return nil
+}
+
+func rollbackAppend(file *os.File, size int64) error {
+	if err := file.Truncate(size); err != nil {
+		return fmt.Errorf("roll back partial task log append: %w", err)
+	}
+	if err := file.Sync(); err != nil {
+		return fmt.Errorf("sync rolled back task log: %w", err)
+	}
+	return nil
+}
+
+func writeAll(writer io.Writer, data []byte) error {
+	for len(data) > 0 {
+		written, err := writer.Write(data)
+		if written < 0 || written > len(data) {
+			return errors.New("task log writer returned invalid byte count")
+		}
+		if written > 0 {
+			data = data[written:]
+		}
+		if err != nil {
+			return err
+		}
+		if written == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
 }
 
 func (s *Store) Writer(taskID, stream string) io.Writer {
@@ -284,6 +410,7 @@ func (s *Store) Remove(taskID string) error {
 	var stat unix.Stat_t
 	if err := unix.Fstatat(rootFD, name, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
 		if errors.Is(err, unix.ENOENT) {
+			s.setTaskLimited(taskID, false)
 			return closeRoot(rootFD)
 		}
 		return errors.Join(fmt.Errorf("inspect task log: %w", err), closeRoot(rootFD))
@@ -297,16 +424,17 @@ func (s *Store) Remove(taskID string) error {
 	if err := unix.Unlinkat(rootFD, name, 0); err != nil {
 		return errors.Join(fmt.Errorf("remove task log: %w", err), closeRoot(rootFD))
 	}
+	s.setTaskLimited(taskID, false)
 	return closeRoot(rootFD)
 }
 
 func (s *Store) redact(value string) string {
-	for _, secret := range s.secrets {
-		value = strings.ReplaceAll(value, secret, "[REDACTED]")
+	value = bearerPattern.ReplaceAllString(value, `${1}`+redactionSentinel)
+	value = keyPattern.ReplaceAllString(value, `${1}=`+redactionSentinel)
+	if s.secretRedactor != nil {
+		value = s.secretRedactor.Replace(value)
 	}
-	value = bearerPattern.ReplaceAllString(value, `${1}[REDACTED]`)
-	value = keyPattern.ReplaceAllString(value, `${1}=[REDACTED]`)
-	return value
+	return strings.ReplaceAll(value, redactionSentinel, redactionMarker)
 }
 
 func (s *Store) taskLock(taskID string) *sync.Mutex {
@@ -318,6 +446,22 @@ func (s *Store) taskLock(taskID string) *sync.Mutex {
 		s.locks[taskID] = lock
 	}
 	return lock
+}
+
+func (s *Store) taskLimited(taskID string) bool {
+	s.locksMu.Lock()
+	defer s.locksMu.Unlock()
+	return s.limited[taskID]
+}
+
+func (s *Store) setTaskLimited(taskID string, limited bool) {
+	s.locksMu.Lock()
+	defer s.locksMu.Unlock()
+	if limited {
+		s.limited[taskID] = true
+	} else {
+		delete(s.limited, taskID)
+	}
 }
 
 func (s *Store) openRoot() (int, error) {

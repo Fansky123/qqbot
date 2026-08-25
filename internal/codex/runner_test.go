@@ -23,19 +23,20 @@ import (
 )
 
 const (
-	helperEnabled = "GO_WANT_CODEX_HELPER"
-	helperRecord  = "QQ_CODEX_HELPER_RECORD"
-	helperFinal   = "QQ_CODEX_HELPER_FINAL"
-	helperStderr  = "QQ_CODEX_HELPER_STDERR"
-	helperExit    = "QQ_CODEX_HELPER_EXIT"
-	helperSleep   = "QQ_CODEX_HELPER_SLEEP"
-	helperLarge   = "QQ_CODEX_HELPER_LARGE"
-	helperSpawn   = "QQ_CODEX_HELPER_SPAWN"
-	helperPID     = "QQ_CODEX_HELPER_PID"
-	helperChild   = "QQ_CODEX_HELPER_CHILD"
-	helperStdout  = "QQ_CODEX_HELPER_STDOUT"
-	helperDirty   = "QQ_CODEX_HELPER_DIRTY_TEMP"
-	helperMany    = "QQ_CODEX_HELPER_MANY_EVENTS"
+	helperEnabled   = "GO_WANT_CODEX_HELPER"
+	helperRecord    = "QQ_CODEX_HELPER_RECORD"
+	helperFinal     = "QQ_CODEX_HELPER_FINAL"
+	helperFinalSize = "QQ_CODEX_HELPER_FINAL_SIZE"
+	helperStderr    = "QQ_CODEX_HELPER_STDERR"
+	helperExit      = "QQ_CODEX_HELPER_EXIT"
+	helperSleep     = "QQ_CODEX_HELPER_SLEEP"
+	helperLarge     = "QQ_CODEX_HELPER_LARGE"
+	helperSpawn     = "QQ_CODEX_HELPER_SPAWN"
+	helperPID       = "QQ_CODEX_HELPER_PID"
+	helperChild     = "QQ_CODEX_HELPER_CHILD"
+	helperStdout    = "QQ_CODEX_HELPER_STDOUT"
+	helperDirty     = "QQ_CODEX_HELPER_DIRTY_TEMP"
+	helperMany      = "QQ_CODEX_HELPER_MANY_EVENTS"
 )
 
 type helperRecordData struct {
@@ -87,7 +88,11 @@ func runCodexHelper() {
 		if info, err := os.Stat(record.LastPath); err == nil {
 			record.LastMode = uint32(info.Mode().Perm())
 		}
-		_ = os.WriteFile(record.LastPath, []byte(envOr(helperFinal, "final answer")), 0o600)
+		final := envOr(helperFinal, "final answer")
+		if size, _ := strconv.Atoi(os.Getenv(helperFinalSize)); size > 0 {
+			final = strings.Repeat("h", size/2) + strings.Repeat("t", size-size/2)
+		}
+		_ = os.WriteFile(record.LastPath, []byte(final), 0o600)
 	}
 	data, err := json.Marshal(record)
 	helperMust(err)
@@ -615,6 +620,83 @@ func TestRunnerTaskLogIntegrationRedactsEveryStream(t *testing.T) {
 	}
 }
 
+func TestRunnerTaskLogRedactsJSONEscapedSecretForms(t *testing.T) {
+	runner, req, _ := helperRunner(t)
+	req.TaskID = "T-ABCDEF012345"
+	secrets := []string{`quote"secret`, `back\slash-secret`, "control\tsecret"}
+	event, err := json.Marshal(map[string]any{
+		"type":      "thread.started",
+		"thread_id": "thread-123",
+		"values":    secrets,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	setEnv(t, helperStdout, string(event)+"\n")
+	setEnv(t, helperStderr, strings.Join(secrets, "|"))
+	setEnv(t, helperFinal, strings.Join(secrets, "|"))
+	runner.KeepEnv = append(runner.KeepEnv, helperStdout, helperStderr, helperFinal)
+	store, err := tasklog.Open(filepath.Join(t.TempDir(), "task-logs"), secrets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner.Log = store
+
+	if _, err := runner.Plan(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(store.Root, req.TaskID+".log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	summary, err := store.Summary(req.TaskID, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNoSecretForms(t, string(raw), secrets)
+	assertNoSecretForms(t, summary, secrets)
+	assertDecodedTaskLogHasNoSecrets(t, raw, secrets)
+}
+
+func TestRunnerOversizedEventFailsThroughTaskLogSink(t *testing.T) {
+	runner, req, _ := helperRunner(t)
+	req.TaskID = "T-ABCDEF012345"
+	setEnv(t, helperLarge, strconv.Itoa((1<<20)+1024))
+	runner.KeepEnv = append(runner.KeepEnv, helperLarge)
+	store, err := tasklog.Open(filepath.Join(t.TempDir(), "task-logs"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner.Log = store
+
+	_, err = runner.Plan(context.Background(), req)
+	if !errors.Is(err, tasklog.ErrLimitExceeded) {
+		t.Fatalf("Plan() error = %v, want task log record limit", err)
+	}
+}
+
+func TestRunnerBoundsOversizedFinalAndReturnsHeadAndTail(t *testing.T) {
+	runner, req, _ := helperRunner(t)
+	setEnv(t, helperFinalSize, strconv.Itoa(maxFinalBytes+4096))
+	runner.KeepEnv = append(runner.KeepEnv, helperFinalSize)
+	sink := &recordingLogSink{}
+	runner.Log = sink
+
+	result, err := runner.Plan(context.Background(), req)
+	if !errors.Is(err, ErrFinalTooLarge) {
+		t.Fatalf("Plan() error = %v, want final output limit", err)
+	}
+	if len(result.Final) != maxFinalBytes || !strings.Contains(result.Final, finalTruncationMarker) {
+		t.Fatalf("bounded final length = %d, marker present = %t", len(result.Final), strings.Contains(result.Final, finalTruncationMarker))
+	}
+	if !strings.HasPrefix(result.Final, strings.Repeat("h", 32)) || !strings.HasSuffix(result.Final, strings.Repeat("t", 32)) {
+		t.Fatal("bounded final did not preserve head and tail")
+	}
+	if got := sink.joined("codex.final"); got != result.Final {
+		t.Fatalf("logged final differs from bounded Result: length=%d", len(got))
+	}
+}
+
 func TestRunnerAcceptsLargeJSONLLine(t *testing.T) {
 	runner, req, _ := helperRunner(t)
 	setEnv(t, helperLarge, strconv.Itoa(128<<10))
@@ -1072,7 +1154,7 @@ func helperRunner(t *testing.T) (Runner, Request, string) {
 	setEnv(t, helperEnabled, "1")
 	setEnv(t, helperRecord, recordPath)
 	for _, name := range []string{
-		helperFinal, helperStderr, helperExit, helperSleep, helperLarge, helperSpawn,
+		helperFinal, helperFinalSize, helperStderr, helperExit, helperSleep, helperLarge, helperSpawn,
 		helperPID, helperChild, helperStdout, helperDirty, helperMany,
 	} {
 		unsetEnv(t, name)
@@ -1089,6 +1171,53 @@ func helperRunner(t *testing.T) (Runner, Request, string) {
 			Prompt:     "test prompt",
 			Timeout:    5 * time.Second,
 		}, recordPath
+}
+
+func assertNoSecretForms(t *testing.T, value string, secrets []string) {
+	t.Helper()
+	for _, secret := range secrets {
+		form := secret
+		for range 3 {
+			if strings.Contains(value, form) {
+				t.Fatalf("task log contains recoverable secret form %q", form)
+			}
+			encoded, err := json.Marshal(form)
+			if err != nil {
+				t.Fatal(err)
+			}
+			form = string(encoded[1 : len(encoded)-1])
+		}
+	}
+}
+
+func assertDecodedTaskLogHasNoSecrets(t *testing.T, data []byte, secrets []string) {
+	t.Helper()
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		var entry struct {
+			Stream string `json:"stream"`
+			Data   string `json:"data"`
+		}
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatal(err)
+		}
+		assertNoSecretForms(t, entry.Data, secrets)
+		if entry.Stream != "codex.events" {
+			continue
+		}
+		var event struct {
+			Values []string `json:"values"`
+		}
+		if err := json.Unmarshal([]byte(entry.Data), &event); err != nil {
+			t.Fatal(err)
+		}
+		for _, value := range event.Values {
+			for _, secret := range secrets {
+				if value == secret {
+					t.Fatalf("decoded event restored secret %q", secret)
+				}
+			}
+		}
+	}
 }
 
 type logEntry struct {

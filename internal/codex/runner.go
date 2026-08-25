@@ -23,10 +23,15 @@ import (
 )
 
 const (
-	maxEventBytes        = 1 << 20
-	maxEventsResultBytes = 1 << 20
-	maxStderrBytes       = 1 << 20
+	maxEventBytes         = 2 << 20
+	maxEventsResultBytes  = 1 << 20
+	maxStderrBytes        = 1 << 20
+	maxFinalBytes         = 1 << 20
+	finalTruncationMarker = "\n[codex final output truncated]\n"
 )
+
+// ErrFinalTooLarge reports that Result.Final contains a bounded head/tail view.
+var ErrFinalTooLarge = errors.New("codex final output exceeded limit")
 
 var (
 	//go:embed schema.json
@@ -576,12 +581,68 @@ func scanEvents(reader io.Reader, log LogSink, taskID string) (Result, error) {
 }
 
 func readFinal(path string, result Result) (Result, error) {
-	data, err := os.ReadFile(path)
+	file, err := os.Open(path)
 	if err != nil {
-		return result, fmt.Errorf("read codex final message: %w", err)
+		return result, fmt.Errorf("open codex final message: %w", err)
 	}
+	info, statErr := file.Stat()
+	if statErr != nil {
+		return result, errors.Join(fmt.Errorf("stat codex final message: %w", statErr), file.Close())
+	}
+	if !info.Mode().IsRegular() {
+		return result, errors.Join(errors.New("codex final message is not a regular file"), file.Close())
+	}
+	if info.Size() <= maxFinalBytes {
+		data := make([]byte, int(info.Size()))
+		readErr := readFinalAt(file, data, 0)
+		closeErr := file.Close()
+		result.Final = string(data)
+		if err := errors.Join(readErr, closeErr); err != nil {
+			return result, fmt.Errorf("read codex final message: %w", err)
+		}
+		return result, nil
+	}
+
+	payloadBytes := maxFinalBytes - len(finalTruncationMarker)
+	headBytes := payloadBytes / 2
+	tailBytes := payloadBytes - headBytes
+	head := make([]byte, headBytes)
+	tail := make([]byte, tailBytes)
+	headErr := readFinalAt(file, head, 0)
+	tailErr := readFinalAt(file, tail, info.Size()-int64(tailBytes))
+	closeErr := file.Close()
+	data := make([]byte, 0, maxFinalBytes)
+	data = append(data, head...)
+	data = append(data, finalTruncationMarker...)
+	data = append(data, tail...)
 	result.Final = string(data)
-	return result, nil
+	return result, errors.Join(
+		ErrFinalTooLarge,
+		wrapReadFinalError(headErr),
+		wrapReadFinalError(tailErr),
+		closeErr,
+	)
+}
+
+func readFinalAt(file *os.File, data []byte, offset int64) error {
+	if len(data) == 0 {
+		return nil
+	}
+	read, err := file.ReadAt(data, offset)
+	if err != nil {
+		return err
+	}
+	if read != len(data) {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+
+func wrapReadFinalError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("read codex final message: %w", err)
 }
 
 func appendLog(log LogSink, taskID, stream string, data []byte) error {
