@@ -1,0 +1,12 @@
+{
+  "projects": {
+    "order-api": {
+      "repo_path": "/srv/repos/order-api",
+      "remote": "origin",
+      "base_branch": "main",
+      "rc_branch": "rc",
+      "checks": [["go", "test", "./..."]],
+      "deploy_action": ["/usr/local/libexec/deploy-order-rc"]
+    }
+  }
+}
