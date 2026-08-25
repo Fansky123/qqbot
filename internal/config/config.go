@@ -77,6 +77,9 @@ func Validate(cfg Config) error {
 	if cfg.MessageWorkers <= 0 {
 		return fmt.Errorf("message workers must be positive")
 	}
+	if cfg.OneBot.MessageRunes <= 0 {
+		return fmt.Errorf("onebot message runes must be positive")
+	}
 	if err := requireAbsolutePath("database path", cfg.DatabasePath); err != nil {
 		return err
 	}

@@ -182,11 +182,71 @@ func TestLoadAppliesDefaultsOnlyDuringLoad(t *testing.T) {
 	if loaded.MessageWorkers != 4 {
 		t.Errorf("MessageWorkers = %d, want 4", loaded.MessageWorkers)
 	}
-	if err := Validate(cfg); err == nil {
-		t.Fatal("Validate() error = nil for zero MessageWorkers, want error")
+}
+
+func TestValidateMessageRunes(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name         string
+		messageRunes int
+	}{
+		{name: "zero", messageRunes: 0},
+		{name: "negative", messageRunes: -1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validConfig(t)
+			cfg.OneBot.MessageRunes = tt.messageRunes
+
+			if err := Validate(cfg); err == nil {
+				t.Fatal("Validate() error = nil, want error")
+			}
+			if _, err := NewRegistry(cfg); err == nil {
+				t.Fatal("NewRegistry() error = nil, want error")
+			}
+		})
 	}
-	if _, err := NewRegistry(cfg); err == nil {
-		t.Fatal("NewRegistry() error = nil for zero MessageWorkers, want error")
+}
+
+func TestLoadErrors(t *testing.T) {
+	t.Parallel()
+
+	t.Run("missing file", func(t *testing.T) {
+		if _, err := Load(filepath.Join(t.TempDir(), "missing.json")); err == nil {
+			t.Fatal("Load() error = nil, want error")
+		}
+	})
+	t.Run("malformed JSON", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "malformed.json")
+		if err := os.WriteFile(path, []byte(`{"onebot":`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(path); err == nil {
+			t.Fatal("Load() error = nil, want error")
+		}
+	})
+	t.Run("semantically invalid JSON", func(t *testing.T) {
+		cfg := validConfig(t)
+		cfg.OneBot.MessageRunes = -1
+		data, err := json.Marshal(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(t.TempDir(), "invalid.json")
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(path); err == nil {
+			t.Fatal("Load() error = nil, want error")
+		}
+	})
+}
+
+func TestExampleConfigLoads(t *testing.T) {
+	t.Parallel()
+
+	if _, err := Load(filepath.Join("..", "..", "configs", "qqcodex.example.json")); err != nil {
+		t.Fatal(err)
 	}
 }
 
