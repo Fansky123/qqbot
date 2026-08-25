@@ -64,3 +64,29 @@ func TestNewCopiesInputSlices(t *testing.T) {
 		t.Error("admin role changed after caller mutation")
 	}
 }
+
+func TestNewRejectsEmptyIDs(t *testing.T) {
+	t.Parallel()
+
+	a := New(
+		[]string{"", "group-1"},
+		[]string{"", "employee"},
+		[]string{"", "admin"},
+	)
+
+	if a.AllowedGroup("") {
+		t.Error("AllowedGroup(empty) = true, want false")
+	}
+	if got := a.Role(""); got != RoleNone {
+		t.Errorf("Role(empty) = %q, want %q", got, RoleNone)
+	}
+	if a.CanOperate("", "") {
+		t.Error("CanOperate(empty, empty) = true, want false")
+	}
+	if a.CanApprove("") {
+		t.Error("CanApprove(empty) = true, want false")
+	}
+	if !a.AllowedGroup("group-1") || a.Role("employee") != RoleEmployee || !a.CanApprove("admin") {
+		t.Error("New() did not preserve valid authorization IDs")
+	}
+}

@@ -58,6 +58,9 @@ func (a Authorizer) CanApprove(userID string) bool {
 func idSet(ids []string) map[string]struct{} {
 	set := make(map[string]struct{}, len(ids))
 	for _, id := range ids {
+		if id == "" {
+			continue
+		}
 		set[id] = struct{}{}
 	}
 	return set
