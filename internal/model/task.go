@@ -25,24 +25,25 @@ const (
 )
 
 type Task struct {
-	ID          string
-	ProjectID   string
-	GroupID     string
-	CreatorID   string
-	Requirement string
-	Plan        string
-	Status      Status
-	Branch      string
-	Worktree    string
-	BaseCommit  string
-	TaskCommit  string
-	RCCommit    string
-	SessionID   string
-	Summary     string
-	Failure     string
-	Version     int64
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	ID           string
+	ProjectID    string
+	GroupID      string
+	CreatorID    string
+	Requirement  string
+	Plan         string
+	Status       Status
+	Branch       string
+	Worktree     string
+	BaseCommit   string
+	GitCommonDir string
+	TaskCommit   string
+	RCCommit     string
+	SessionID    string
+	Summary      string
+	Failure      string
+	Version      int64
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
 }
 
 type Input struct {

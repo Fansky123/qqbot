@@ -913,6 +913,13 @@ git commit -m "feat: handle employee task commands"
 **Files:**
 - Create: `internal/tasksvc/scheduler.go`
 - Test: `internal/tasksvc/scheduler_test.go`
+- Modify: `internal/tasksvc/ports.go`
+- Modify: `internal/model/task.go`
+- Modify: `internal/store/schema.sql`
+- Modify: `internal/store/sqlite.go`
+- Modify: `internal/store/sqlite_test.go`
+- Modify: `internal/config/config.go`
+- Modify: `internal/config/config_test.go`
 
 - [ ] **Step 1: Write scheduler tests with fakes**
 
@@ -938,7 +945,7 @@ Expected: FAIL because `Scheduler` is undefined.
 
 - [ ] **Step 3: Extend ports for execution dependencies**
 
-Add typed interfaces for `Runner`, `Worktrees`, and `Operator` matching the methods from Tasks 5-7. The worker/task service `Operator` interface exposes `PushTask(ctx context.Context, projectID, taskID, branch, commit string) error`, implemented by `*ops.Client`. `tasksvc` never sees an `io.Reader`, bundle, or source repository path: `ops.Client` encapsulates source-ref verification, bundle creation, and helper stdin transfer. `PushTaskBundle(..., io.Reader)` remains an internal boundary between the ops helper CLI and `ops.Operator`. Do not expose `exec.Cmd`, raw SQL, source repository paths, or unvalidated argv through task-service interfaces.
+Add typed interfaces for `Runner`, `Worktrees`, and `Operator` matching the methods from Tasks 5-7. Add a narrow `TaskLogs` interface exposing only `Writer(taskID, stream) io.Writer` and `RedactText(string) string`; the application passes the same `tasklog.Store` used by the runner and command service. The worker/task service `Operator` interface exposes `PushTask(ctx context.Context, projectID, taskID, branch, commit string) error`, implemented by `*ops.Client`. `tasksvc` never sees an `io.Reader`, bundle, or source repository path: `ops.Client` encapsulates source-ref verification, bundle creation, and helper stdin transfer. `PushTaskBundle(..., io.Reader)` remains an internal boundary between the ops helper CLI and `ops.Operator`. Do not expose `exec.Cmd`, raw SQL, source repository paths, or unvalidated argv through task-service interfaces.
 
 - [ ] **Step 4: Implement persistent polling and concurrency**
 
@@ -952,6 +959,7 @@ func NewScheduler(
 	worktrees Worktrees,
 	operator Operator,
 	notifier Notifier,
+	logs TaskLogs,
 	logger *slog.Logger,
 	pollInterval time.Duration,
 ) *Scheduler
@@ -964,18 +972,20 @@ Poll `queued`, `merging`, and `deploying` tasks after wakeups and every two seco
 
 Hold the Git metadata mutex around `Operator.Sync` plus `Worktrees.Prepare`, around `Operator.PushTask`, and around merge/deploy operator calls. Release it before Codex execution and checks so independent worktrees still run concurrently.
 
-On first execution create a worktree and call `Runner.Execute`; when `SessionID` and worktree already exist, append the latest supplement to `Runner.Resume`. Store session ID and summary before checks. After checks and commit validation, call `PushTask`, save the exact commit, invalidate obsolete approvals, transition to `pushed`, and then transition to `awaiting_merge_approval` in a second persisted update.
+Persist `GitCommonDir` with the prepared worktree and validate all persisted worktree, branch, base, common-directory, session, and task-ID fields before reconstructing `gitwork.Prepared` for resume. On first execution create a worktree and call `Runner.Execute`; when `SessionID` and complete worktree metadata already exist, pass the cumulative requirement (including the latest supplement) to `Runner.Resume`. Store session ID and a redacted summary before checks, and write check output through `TaskLogs.Writer` rather than discarding it.
+
+After checks and commit validation, acquire a durable SQLite push lease with an unpredictable scheduler owner, bounded expiry, owner-conditional heartbeat renewal, and owner-conditional release. While holding that lease, checkpoint the exact validated `TaskCommit` in `checking` before calling the idempotent exact-ref `PushTask`. A restarted scheduler may claim an expired lease for `checking` plus non-empty `TaskCommit` and retry only that exact push without rerunning Codex/checks; `pushed` reconciles to `awaiting_merge_approval`. Invalidate obsolete approvals atomically with `checking -> pushed`, then persist `pushed -> awaiting_merge_approval` separately. The normal worker and reconciliation scanners must acquire the lease before any reconciliation version write so an active push cannot lose its optimistic version.
 
 - [ ] **Step 5: Add low-noise notifications and run tests**
 
-Only notify task start, blocked, failure, and pushed completion. Completion includes branch, commit, checks, summary, and `批准合并 #<id>`. Bound each logical message before it reaches OneBot.
+Only notify task start, blocked, failure, and pushed completion. Completion includes branch, commit, checks, summary, and exact `批准合并 #<id>`. Reserve a fixed suffix budget so truncation can never remove the approval command. Apply generic credential redaction once and the task log's exact-value redactor last, then bound every logical message before it reaches OneBot. Notification failure is retried a bounded number of times and logged without rolling back state or repeating external work.
 
 Run: `go test ./internal/tasksvc -run TestScheduler -v && go test ./...`
 
 Expected: PASS.
 
 ```bash
-git add internal/tasksvc/scheduler.go internal/tasksvc/scheduler_test.go internal/tasksvc/ports.go
+git add docs/superpowers/plans/2026-08-25-qq-codex-worker-implementation.md internal/config internal/model/task.go internal/store internal/tasksvc/ports.go internal/tasksvc/scheduler.go internal/tasksvc/scheduler_test.go
 git commit -m "feat: schedule concurrent codex tasks"
 ```
 
@@ -1187,7 +1197,7 @@ Define `App.Run(ctx)` to:
 
 - [ ] **Step 4: Implement the main command**
 
-`cmd/qqcodex/main.go` accepts `-config` only, loads config, reads the NapCat token from the configured environment variable, opens SQLite, creates structured `slog` JSON logging, constructs all dependencies, and handles SIGINT/SIGTERM with `signal.NotifyContext`.
+`cmd/qqcodex/main.go` accepts `-config` only, loads config, reads the NapCat token from the configured environment variable, opens SQLite, creates one `tasklog.Store`, passes that same store to the Codex runner, ops client, task service, and `NewScheduler(..., logs TaskLogs, ...)`, creates structured `slog` JSON logging, constructs all dependencies, and handles SIGINT/SIGTERM with `signal.NotifyContext`.
 
 At startup, fail with concise errors when the Codex binary, ops command, database directory, log directory, or repository registry is invalid. Never print token values or the value of `CODEX_API_KEY`.
 

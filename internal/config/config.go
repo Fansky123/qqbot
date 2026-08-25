@@ -156,7 +156,8 @@ func Validate(cfg Config) error {
 }
 
 type Registry struct {
-	projects map[string]Project
+	projects     map[string]Project
+	projectsByID map[string]Project
 }
 
 func NewRegistry(cfg Config) (*Registry, error) {
@@ -165,13 +166,24 @@ func NewRegistry(cfg Config) (*Registry, error) {
 	}
 
 	projects := make(map[string]Project, len(cfg.Projects))
+	projectsByID := make(map[string]Project, len(cfg.Projects))
 	for _, project := range cfg.Projects {
 		project = cloneProject(project)
+		projectsByID[project.ID] = project
 		for _, alias := range project.Aliases {
 			projects[alias] = project
 		}
 	}
-	return &Registry{projects: projects}, nil
+	return &Registry{projects: projects, projectsByID: projectsByID}, nil
+}
+
+// ProjectByID looks up a canonical project ID and returns an independent copy.
+func (r *Registry) ProjectByID(id string) (Project, bool) {
+	project, ok := r.projectsByID[id]
+	if !ok {
+		return Project{}, false
+	}
+	return cloneProject(project), true
 }
 
 // Project looks up an alias and returns an independent copy of its configuration.

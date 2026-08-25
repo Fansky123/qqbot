@@ -27,7 +27,7 @@ var schema string
 
 const taskColumns = `
 	id, project_id, group_id, creator_id, requirement, plan, status, branch,
-	worktree, base_commit, task_commit, rc_commit, session_id, summary, failure,
+	worktree, base_commit, git_common_dir, task_commit, rc_commit, session_id, summary, failure,
 	version, created_at, updated_at`
 
 type Store struct {
@@ -59,7 +59,44 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("initialize sqlite store: %w", err)
 	}
+	if err := ensureGitCommonDirColumn(db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	return &Store{db: db}, nil
+}
+
+func ensureGitCommonDirColumn(db *sql.DB) error {
+	rows, err := db.Query("PRAGMA table_info(tasks)")
+	if err != nil {
+		return fmt.Errorf("inspect task schema: %w", err)
+	}
+	found := false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("inspect task schema column: %w", err)
+		}
+		if name == "git_common_dir" {
+			found = true
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close task schema inspection: %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("inspect task schema rows: %w", err)
+	}
+	if found {
+		return nil
+	}
+	if _, err := db.Exec("ALTER TABLE tasks ADD COLUMN git_common_dir TEXT NOT NULL DEFAULT ''"); err != nil {
+		return fmt.Errorf("migrate task Git common directory: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) Close() error {
@@ -73,12 +110,12 @@ func (s *Store) CreateTask(ctx context.Context, task *model.Task) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO tasks (
 			id, project_id, group_id, creator_id, requirement, plan, status, branch,
-			worktree, base_commit, task_commit, rc_commit, session_id, summary, failure,
+			worktree, base_commit, git_common_dir, task_commit, rc_commit, session_id, summary, failure,
 			version, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
 		task.ID, task.ProjectID, task.GroupID, task.CreatorID, task.Requirement,
 		task.Plan, task.Status, task.Branch, task.Worktree, task.BaseCommit,
-		task.TaskCommit, task.RCCommit, task.SessionID, task.Summary, task.Failure,
+		task.GitCommonDir, task.TaskCommit, task.RCCommit, task.SessionID, task.Summary, task.Failure,
 		task.CreatedAt.UnixMilli(), task.UpdatedAt.UnixMilli(),
 	)
 	if err != nil {
@@ -115,6 +152,58 @@ func (s *Store) SaveTask(ctx context.Context, task *model.Task, expectedVersion 
 	return nil
 }
 
+// SaveTaskWithAudit atomically saves scheduler state and its audit record.
+func (s *Store) SaveTaskWithAudit(ctx context.Context, task *model.Task, expectedVersion int64, auditKind, auditDetail string, at time.Time) error {
+	return s.saveTaskWithAudit(ctx, task, expectedVersion, auditKind, auditDetail, at, "", "")
+}
+
+// SaveTaskWithAuditInvalidatingApprovals also invalidates approvals in the same transaction.
+func (s *Store) SaveTaskWithAuditInvalidatingApprovals(ctx context.Context, task *model.Task, expectedVersion int64, auditKind, auditDetail string, at time.Time, approvalKind, approvalResult string) error {
+	if approvalKind == "" || approvalResult == "" {
+		return errors.New("approval kind and result are required")
+	}
+	return s.saveTaskWithAudit(ctx, task, expectedVersion, auditKind, auditDetail, at, approvalKind, approvalResult)
+}
+
+func (s *Store) saveTaskWithAudit(ctx context.Context, task *model.Task, expectedVersion int64, auditKind, auditDetail string, at time.Time, approvalKind, approvalResult string) error {
+	if auditKind == "" || auditDetail == "" {
+		return errors.New("audit kind and detail are required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin audited task save for %q: %w", task.ID, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	result, err := updateTask(ctx, tx, task, expectedVersion)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("save task %q rows affected: %w", task.ID, err)
+	}
+	if rows == 0 {
+		return fmt.Errorf("save task %q at version %d: %w", task.ID, expectedVersion, ErrConflict)
+	}
+	if approvalKind != "" {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE approvals SET result = ?
+			WHERE task_id = ? AND kind = ? AND result = 'approved'`, approvalResult, task.ID, approvalKind); err != nil {
+			return fmt.Errorf("invalidate %q approvals for task %q: %w", approvalKind, task.ID, err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO audit_events (task_id, kind, detail, created_at)
+		VALUES (?, ?, ?, ?)`, task.ID, auditKind, auditDetail, at.UnixMilli()); err != nil {
+		return fmt.Errorf("append audit for task %q: %w", task.ID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit audited task save for %q: %w", task.ID, err)
+	}
+	task.Version = expectedVersion + 1
+	return nil
+}
+
 type taskMutationExecer interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
 }
@@ -124,12 +213,12 @@ func updateTask(ctx context.Context, execer taskMutationExecer, task *model.Task
 		UPDATE tasks
 		SET project_id = ?, group_id = ?, creator_id = ?, requirement = ?, plan = ?,
 			status = ?, branch = ?, worktree = ?, base_commit = ?, task_commit = ?,
-			rc_commit = ?, session_id = ?, summary = ?, failure = ?, updated_at = ?,
+			git_common_dir = ?, rc_commit = ?, session_id = ?, summary = ?, failure = ?, updated_at = ?,
 			version = version + 1
 		WHERE id = ? AND version = ?`,
 		task.ProjectID, task.GroupID, task.CreatorID, task.Requirement, task.Plan,
 		task.Status, task.Branch, task.Worktree, task.BaseCommit, task.TaskCommit,
-		task.RCCommit, task.SessionID, task.Summary, task.Failure,
+		task.GitCommonDir, task.RCCommit, task.SessionID, task.Summary, task.Failure,
 		task.UpdatedAt.UnixMilli(), task.ID, expectedVersion,
 	)
 	if err != nil {
@@ -349,6 +438,60 @@ func (s *Store) AppendAudit(ctx context.Context, taskID, kind, detail string, at
 	return nil
 }
 
+// TryAcquireSchedulerLease atomically acquires an absent or expired task lease.
+func (s *Store) TryAcquireSchedulerLease(ctx context.Context, taskID, owner string, now, expiresAt time.Time) (bool, error) {
+	if taskID == "" || owner == "" || !expiresAt.After(now) {
+		return false, errors.New("scheduler lease task, owner, and future expiry are required")
+	}
+	result, err := s.db.ExecContext(ctx, `
+		INSERT INTO scheduler_leases (task_id, owner, expires_at)
+		VALUES (?, ?, ?)
+		ON CONFLICT(task_id) DO UPDATE SET
+			owner = excluded.owner,
+			expires_at = excluded.expires_at
+		WHERE scheduler_leases.expires_at <= ?`,
+		taskID, owner, expiresAt.UTC().UnixMilli(), now.UTC().UnixMilli(),
+	)
+	if err != nil {
+		return false, fmt.Errorf("acquire scheduler lease for %q: %w", taskID, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("acquire scheduler lease for %q rows affected: %w", taskID, err)
+	}
+	return rows == 1, nil
+}
+
+// RenewSchedulerLease extends only the matching owner's live claim.
+func (s *Store) RenewSchedulerLease(ctx context.Context, taskID, owner string, expiresAt time.Time) (bool, error) {
+	if taskID == "" || owner == "" || expiresAt.IsZero() {
+		return false, errors.New("scheduler lease task, owner, and expiry are required")
+	}
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE scheduler_leases SET expires_at = ?
+		WHERE task_id = ? AND owner = ?`, expiresAt.UTC().UnixMilli(), taskID, owner)
+	if err != nil {
+		return false, fmt.Errorf("renew scheduler lease for %q: %w", taskID, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("renew scheduler lease for %q rows affected: %w", taskID, err)
+	}
+	return rows == 1, nil
+}
+
+// ReleaseSchedulerLease removes only the matching owner's claim.
+func (s *Store) ReleaseSchedulerLease(ctx context.Context, taskID, owner string) error {
+	if taskID == "" || owner == "" {
+		return errors.New("scheduler lease task and owner are required")
+	}
+	if _, err := s.db.ExecContext(ctx, `
+		DELETE FROM scheduler_leases WHERE task_id = ? AND owner = ?`, taskID, owner); err != nil {
+		return fmt.Errorf("release scheduler lease for %q: %w", taskID, err)
+	}
+	return nil
+}
+
 func (s *Store) RecoverInterrupted(ctx context.Context) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -375,7 +518,8 @@ func (s *Store) RecoverInterrupted(ctx context.Context) error {
 			END,
 			updated_at = ?,
 			version = version + 1
-		WHERE status IN (?, ?, ?, ?, ?, ?)`,
+		WHERE status IN (?, ?, ?, ?, ?)
+		   OR (status = ? AND task_commit = '')`,
 		model.StatusRunning, model.StatusFailed,
 		model.StatusChecking, model.StatusFailed,
 		model.StatusPushed, model.StatusAwaitingMergeApproval,
@@ -386,8 +530,10 @@ func (s *Store) RecoverInterrupted(ctx context.Context) error {
 		model.StatusMerging, "service restarted during merge; inspect remote RC before retrying",
 		model.StatusDeploying, "service restarted during deploy; inspect RC before retrying",
 		recoveredAt,
-		model.StatusRunning, model.StatusChecking, model.StatusPushed,
-		model.StatusMerging, model.StatusMerged, model.StatusDeploying,
+		model.StatusRunning, model.StatusPushed, model.StatusMerging,
+		model.StatusMerged, model.StatusDeploying,
+		model.StatusChecking,
+		model.StatusChecking,
 	)
 	if err != nil {
 		return fmt.Errorf("recover interrupted tasks: %w", err)
@@ -408,7 +554,7 @@ func scanTask(scanner taskScanner) (*model.Task, error) {
 	err := scanner.Scan(
 		&task.ID, &task.ProjectID, &task.GroupID, &task.CreatorID,
 		&task.Requirement, &task.Plan, &task.Status, &task.Branch, &task.Worktree,
-		&task.BaseCommit, &task.TaskCommit, &task.RCCommit, &task.SessionID,
+		&task.BaseCommit, &task.GitCommonDir, &task.TaskCommit, &task.RCCommit, &task.SessionID,
 		&task.Summary, &task.Failure, &task.Version, &createdAt, &updatedAt,
 	)
 	if err != nil {

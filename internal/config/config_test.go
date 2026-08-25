@@ -277,6 +277,19 @@ func TestRegistryResolvesAliasesAndReturnsCopies(t *testing.T) {
 	if !ok || again.Aliases[0] != "orders" || again.Checks[0][0] != "go" {
 		t.Fatalf("registry project was mutable: %#v, %v", again, ok)
 	}
+	byID, ok := registry.ProjectByID("order-api")
+	if !ok || byID.ID != "order-api" || byID.Aliases[0] != "orders" || byID.Checks[0][0] != "go" {
+		t.Fatalf("project by ID = %#v, %v", byID, ok)
+	}
+	byID.Aliases[0] = "changed"
+	byID.Checks[0][0] = "changed"
+	byIDAgain, ok := registry.ProjectByID("order-api")
+	if !ok || byIDAgain.Aliases[0] != "orders" || byIDAgain.Checks[0][0] != "go" {
+		t.Fatalf("project-by-ID result was mutable: %#v, %v", byIDAgain, ok)
+	}
+	if _, ok := registry.ProjectByID("missing"); ok {
+		t.Fatal("missing project ID resolved")
+	}
 }
 
 func validConfig(t *testing.T) Config {

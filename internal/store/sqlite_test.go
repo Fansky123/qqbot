@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"database/sql/driver"
 	"errors"
 	"os"
@@ -143,6 +144,7 @@ func TestTaskPersistenceAndOptimisticSave(t *testing.T) {
 	saved.Branch = "task/task-1-updated"
 	saved.Worktree = "/tmp/worktree-updated"
 	saved.BaseCommit = "base-2"
+	saved.GitCommonDir = "/tmp/repo-updated/.git"
 	saved.TaskCommit = "task-commit-2"
 	saved.RCCommit = "rc-2"
 	saved.SessionID = "session-2"
@@ -438,10 +440,19 @@ func TestRecoverInterrupted(t *testing.T) {
 	}
 	for _, status := range statuses {
 		task := testTask(string(status), status, originalTime)
+		if status == model.StatusChecking {
+			// A checking task without a validated commit cannot be reconciled safely.
+			task.TaskCommit = ""
+		}
 		task.Failure = "existing failure"
 		if err := db.CreateTask(ctx, task); err != nil {
 			t.Fatal(err)
 		}
+	}
+	validated := testTask("checking-validated", model.StatusChecking, originalTime)
+	validated.Failure = "existing failure"
+	if err := db.CreateTask(ctx, validated); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := db.db.ExecContext(ctx, "UPDATE tasks SET version = 7"); err != nil {
 		t.Fatal(err)
@@ -489,6 +500,13 @@ func TestRecoverInterrupted(t *testing.T) {
 		} else if !got.UpdatedAt.Equal(recoveredAt) {
 			t.Errorf("recovered %s at %v, want shared timestamp %v", originalStatus, got.UpdatedAt, recoveredAt)
 		}
+	}
+	got, err := db.GetTask(ctx, validated.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != model.StatusChecking || got.Failure != "existing failure" || got.Version != 7 || !got.UpdatedAt.Equal(originalTime) {
+		t.Fatalf("validated checking task changed: status=%s failure=%q version=%d updated=%v", got.Status, got.Failure, got.Version, got.UpdatedAt)
 	}
 }
 
@@ -627,6 +645,145 @@ func assertOneClaimWinner(t *testing.T, errs []error) {
 	}
 }
 
+func TestOpenMigratesLegacyTasksWithGitCommonDir(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := legacy.Exec(`
+		CREATE TABLE tasks (
+			id TEXT PRIMARY KEY, project_id TEXT NOT NULL, group_id TEXT NOT NULL,
+			creator_id TEXT NOT NULL, requirement TEXT NOT NULL, plan TEXT NOT NULL,
+			status TEXT NOT NULL, branch TEXT NOT NULL, worktree TEXT NOT NULL,
+			base_commit TEXT NOT NULL, task_commit TEXT NOT NULL, rc_commit TEXT NOT NULL,
+			session_id TEXT NOT NULL, summary TEXT NOT NULL, failure TEXT NOT NULL,
+			version INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+		);
+		INSERT INTO tasks VALUES ('legacy', 'p1', 'g1', 'u1', 'req', '{}', 'queued', '', '', '', '', '', '', '', '', 1, 1, 1);`); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	task, err := db.GetTask(context.Background(), "legacy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.GitCommonDir != "" {
+		t.Fatalf("legacy GitCommonDir = %q, want empty", task.GitCommonDir)
+	}
+}
+
+func TestSaveTaskWithAuditIsAtomicAndCanInvalidateApprovals(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	db := openTestStore(t)
+	now := time.UnixMilli(1_787_600_123_000).UTC()
+	task := testTask("task-scheduler", model.StatusQueued, now)
+	if err := db.CreateTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AddApproval(ctx, model.Approval{TaskID: task.ID, Kind: "merge", UserID: "admin", GroupID: "group", MessageID: "approval", BoundCommit: "old", Result: "approved", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	task.Status = model.StatusRunning
+	task.UpdatedAt = now.Add(time.Second)
+	if err := db.SaveTaskWithAudit(ctx, task, task.Version, "scheduler_transition", "queued -> running", task.UpdatedAt); err != nil {
+		t.Fatal(err)
+	}
+	task.Status = model.StatusChecking
+	task.UpdatedAt = now.Add(2 * time.Second)
+	if err := db.SaveTaskWithAuditInvalidatingApprovals(ctx, task, task.Version, "scheduler_transition", "running -> checking", task.UpdatedAt, "merge", "superseded_by_new_commit"); err != nil {
+		t.Fatal(err)
+	}
+
+	var auditCount int
+	if err := db.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM audit_events WHERE task_id = ?", task.ID).Scan(&auditCount); err != nil {
+		t.Fatal(err)
+	}
+	if auditCount != 2 {
+		t.Fatalf("audit count = %d, want 2", auditCount)
+	}
+	var approvalResult string
+	if err := db.db.QueryRowContext(ctx, "SELECT result FROM approvals WHERE message_id = 'approval'").Scan(&approvalResult); err != nil {
+		t.Fatal(err)
+	}
+	if approvalResult != "superseded_by_new_commit" {
+		t.Fatalf("approval result = %q", approvalResult)
+	}
+
+	stale := *task
+	stale.Status = model.StatusFailed
+	stale.Version--
+	if err := db.SaveTaskWithAudit(ctx, &stale, stale.Version, "scheduler_transition", "checking -> failed", now.Add(3*time.Second)); !errors.Is(err, ErrConflict) {
+		t.Fatalf("stale transition error = %v, want ErrConflict", err)
+	}
+	if err := db.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM audit_events WHERE task_id = ?", task.ID).Scan(&auditCount); err != nil {
+		t.Fatal(err)
+	}
+	if auditCount != 2 {
+		t.Fatalf("conflicting save appended audit; count = %d", auditCount)
+	}
+}
+
+func TestSchedulerLeaseIsExclusiveRenewableAndExpires(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	db := openTestStore(t)
+	now := time.UnixMilli(1_787_600_123_000).UTC()
+	task := testTask("task-lease", model.StatusQueued, now)
+	if err := db.CreateTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	acquired, err := db.TryAcquireSchedulerLease(ctx, task.ID, "owner-1", now, now.Add(time.Minute))
+	if err != nil || !acquired {
+		t.Fatalf("first acquire = %v, %v", acquired, err)
+	}
+	for _, owner := range []string{"owner-1", "owner-2"} {
+		acquired, err = db.TryAcquireSchedulerLease(ctx, task.ID, owner, now.Add(time.Second), now.Add(time.Minute))
+		if err != nil || acquired {
+			t.Fatalf("live lease acquire by %q = %v, %v", owner, acquired, err)
+		}
+	}
+	acquired, err = db.TryAcquireSchedulerLease(ctx, task.ID, "owner-2", now.Add(time.Minute), now.Add(2*time.Minute))
+	if err != nil || !acquired {
+		t.Fatalf("expired lease acquire = %v, %v", acquired, err)
+	}
+	renewed, err := db.RenewSchedulerLease(ctx, task.ID, "owner-1", now.Add(3*time.Minute))
+	if err != nil || renewed {
+		t.Fatalf("stale owner renew = %v, %v", renewed, err)
+	}
+	renewed, err = db.RenewSchedulerLease(ctx, task.ID, "owner-2", now.Add(3*time.Minute))
+	if err != nil || !renewed {
+		t.Fatalf("current owner renew = %v, %v", renewed, err)
+	}
+	if err := db.ReleaseSchedulerLease(ctx, task.ID, "owner-1"); err != nil {
+		t.Fatal(err)
+	}
+	acquired, err = db.TryAcquireSchedulerLease(ctx, task.ID, "owner-3", now.Add(2*time.Minute), now.Add(3*time.Minute))
+	if err != nil || acquired {
+		t.Fatalf("stale release freed lease = %v, %v", acquired, err)
+	}
+	if err := db.ReleaseSchedulerLease(ctx, task.ID, "owner-2"); err != nil {
+		t.Fatal(err)
+	}
+	acquired, err = db.TryAcquireSchedulerLease(ctx, task.ID, "owner-3", now.Add(2*time.Minute), now.Add(3*time.Minute))
+	if err != nil || !acquired {
+		t.Fatalf("acquire after release = %v, %v", acquired, err)
+	}
+}
+
 func openTestStore(t *testing.T) *Store {
 	t.Helper()
 
@@ -644,22 +801,23 @@ func openTestStore(t *testing.T) *Store {
 
 func testTask(id string, status model.Status, at time.Time) *model.Task {
 	return &model.Task{
-		ID:          id,
-		ProjectID:   "project-1",
-		GroupID:     "group-1",
-		CreatorID:   "creator-1",
-		Requirement: "implement the requested behavior",
-		Plan:        "write tests, then code",
-		Status:      status,
-		Branch:      "task/" + id,
-		Worktree:    "/tmp/worktrees/" + id,
-		BaseCommit:  "base-commit",
-		TaskCommit:  "task-commit",
-		RCCommit:    "rc-commit",
-		SessionID:   "session-1",
-		Summary:     "task summary",
-		Failure:     "failure detail",
-		CreatedAt:   at,
-		UpdatedAt:   at,
+		ID:           id,
+		ProjectID:    "project-1",
+		GroupID:      "group-1",
+		CreatorID:    "creator-1",
+		Requirement:  "implement the requested behavior",
+		Plan:         "write tests, then code",
+		Status:       status,
+		Branch:       "task/" + id,
+		Worktree:     "/tmp/worktrees/" + id,
+		BaseCommit:   "base-commit",
+		GitCommonDir: "/tmp/repositories/project-1/.git",
+		TaskCommit:   "task-commit",
+		RCCommit:     "rc-commit",
+		SessionID:    "session-1",
+		Summary:      "task summary",
+		Failure:      "failure detail",
+		CreatedAt:    at,
+		UpdatedAt:    at,
 	}
 }

@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     branch TEXT NOT NULL,
     worktree TEXT NOT NULL,
     base_commit TEXT NOT NULL,
+    git_common_dir TEXT NOT NULL,
     task_commit TEXT NOT NULL,
     rc_commit TEXT NOT NULL,
     session_id TEXT NOT NULL,
@@ -67,4 +68,10 @@ CREATE TABLE IF NOT EXISTS audit_events (
     kind TEXT NOT NULL,
     detail TEXT NOT NULL,
     created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS scheduler_leases (
+    task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+    owner TEXT NOT NULL,
+    expires_at INTEGER NOT NULL
 );
