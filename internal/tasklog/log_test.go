@@ -208,6 +208,55 @@ func TestSummaryRedactsSecretCrossingTailReadBoundary(t *testing.T) {
 	}
 }
 
+func TestOpenBoundsConfiguredSecretsByBytes(t *testing.T) {
+	t.Parallel()
+	root := filepath.Join(t.TempDir(), "logs")
+	tooLongASCII := strings.Repeat("s", maxRedactionOverlap+1)
+	tooLongUTF8 := strings.Repeat("密", maxRedactionOverlap/len("密")+1)
+	for _, secret := range []string{tooLongASCII, tooLongUTF8} {
+		if len(secret) <= maxRedactionOverlap {
+			t.Fatalf("test secret byte length = %d, want over limit", len(secret))
+		}
+		_, err := Open(root, []string{secret})
+		if err == nil {
+			t.Fatal("Open() error = nil, want oversized secret rejection")
+		}
+		if err.Error() != "task log secret exceeds maximum length" || strings.Contains(err.Error(), secret) {
+			t.Fatalf("Open() error = %q, want generic error without secret", err)
+		}
+	}
+
+	exactUTF8 := strings.Repeat("密", maxRedactionOverlap/len("密")) + "a"
+	if len(exactUTF8) != maxRedactionOverlap {
+		t.Fatalf("exact UTF-8 secret byte length = %d, want %d", len(exactUTF8), maxRedactionOverlap)
+	}
+	store, err := Open(root, []string{exactUTF8, exactUTF8})
+	if err != nil {
+		t.Fatalf("Open() rejected exact-limit secret: %v", err)
+	}
+	if len(store.secrets) != 1 {
+		t.Fatalf("configured secrets = %d, want duplicate removed", len(store.secrets))
+	}
+}
+
+func TestSummaryRedactsMaximumSecretAcrossTailBoundary(t *testing.T) {
+	t.Parallel()
+	secret := strings.Repeat("s", maxRedactionOverlap)
+	store := openStore(t, []string{secret})
+	data := []byte("outside-tail" + secret + strings.Repeat("y", maxSummaryReadBytes))
+	if err := os.WriteFile(filepath.Join(store.Root, testTaskID+".log"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := store.Summary(testTaskID, maxSummaryReadBytes+100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(got, secret) || !strings.Contains(got, "[REDACTED]") {
+		t.Fatal("Summary() leaked exact-limit secret across tail boundary")
+	}
+}
+
 func TestStoreRejectsSymlinkTaskFileAndSafeRemove(t *testing.T) {
 	t.Parallel()
 	store := openStore(t, nil)

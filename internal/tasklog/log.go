@@ -19,6 +19,7 @@ import (
 
 const (
 	maxSummaryReadBytes = 1 << 20
+	// This is also the maximum configured secret length, measured in bytes.
 	maxRedactionOverlap = 64 << 10
 )
 
@@ -50,6 +51,23 @@ func Open(root string, secretValues []string) (*Store, error) {
 	if root == "" {
 		return nil, errors.New("task log root is required")
 	}
+	secrets := make([]string, 0, len(secretValues))
+	seenSecrets := make(map[string]struct{}, len(secretValues))
+	for _, value := range secretValues {
+		if len(value) > maxRedactionOverlap {
+			return nil, errors.New("task log secret exceeds maximum length")
+		}
+		if value == "" {
+			continue
+		}
+		if _, exists := seenSecrets[value]; exists {
+			continue
+		}
+		seenSecrets[value] = struct{}{}
+		secrets = append(secrets, value)
+	}
+	sort.SliceStable(secrets, func(i, j int) bool { return len(secrets[i]) > len(secrets[j]) })
+
 	abs, err := filepath.Abs(root)
 	if err != nil {
 		return nil, fmt.Errorf("make task log root absolute: %w", err)
@@ -75,13 +93,6 @@ func Open(root string, secretValues []string) (*Store, error) {
 		return nil, fmt.Errorf("close task log root: %w", closeErr)
 	}
 
-	secrets := make([]string, 0, len(secretValues))
-	for _, value := range secretValues {
-		if value != "" {
-			secrets = append(secrets, value)
-		}
-	}
-	sort.SliceStable(secrets, func(i, j int) bool { return len(secrets[i]) > len(secrets[j]) })
 	return &Store{
 		Root:    canonical,
 		secrets: secrets,
