@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -523,6 +524,106 @@ func TestRecoverInterruptedRollsBackOnFailure(t *testing.T) {
 		if got.Status != status || got.Version != 1 || !got.UpdatedAt.Equal(originalTime) {
 			t.Errorf("task %s changed after rollback: %#v", status, got)
 		}
+	}
+}
+
+func TestCommandTransactionsClaimMessageAcrossStoreConnections(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "shared.db")
+	first, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = first.Close() })
+	second, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = second.Close() })
+	now := time.Now().UTC()
+	task := testTask("claim-task", model.StatusAwaitingConfirmation, now)
+	if err := first.CreateTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+
+	tasks := make([]*model.Task, 2)
+	for i, db := range []*Store{first, second} {
+		tasks[i], err = db.GetTask(ctx, task.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tasks[i].Status = model.StatusQueued
+	}
+	input := model.Input{TaskID: task.ID, Kind: "confirmation", UserID: "creator-1", GroupID: "group-1", MessageID: "shared-message", Body: "confirm", CreatedAt: now}
+	errs := make([]error, 2)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i, db := range []*Store{first, second} {
+		wg.Add(1)
+		go func(i int, db *Store) {
+			defer wg.Done()
+			<-start
+			errs[i] = db.CommitTaskMutation(ctx, tasks[i], tasks[i].Version, input, "confirmation", "queued", "group-1\x00shared-message", now)
+		}(i, db)
+	}
+	close(start)
+	wg.Wait()
+	assertOneClaimWinner(t, errs)
+
+	statusInput := input
+	statusInput.Kind = "status"
+	statusInput.MessageID = "shared-status"
+	startStatus := make(chan struct{})
+	for i, db := range []*Store{first, second} {
+		wg.Add(1)
+		go func(i int, db *Store) {
+			defer wg.Done()
+			<-startStatus
+			errs[i] = db.CommitRecords(ctx, statusInput, "status", "viewed", "group-1\x00shared-status", now)
+		}(i, db)
+	}
+	close(startStatus)
+	wg.Wait()
+	assertOneClaimWinner(t, errs)
+
+	queries := map[string]string{
+		"processed_messages": "SELECT COUNT(*) FROM processed_messages",
+		"task_inputs":        "SELECT COUNT(*) FROM task_inputs",
+		"audit_events":       "SELECT COUNT(*) FROM audit_events",
+	}
+	for table, query := range queries {
+		var got int
+		if err := first.db.QueryRowContext(ctx, query).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got != 2 {
+			t.Errorf("%s rows = %d, want 2", table, got)
+		}
+	}
+	got, err := first.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != model.StatusQueued || got.Version != 2 {
+		t.Fatalf("claimed task = %#v", got)
+	}
+}
+
+func assertOneClaimWinner(t *testing.T, errs []error) {
+	t.Helper()
+	var succeeded, already int
+	for _, err := range errs {
+		switch {
+		case err == nil:
+			succeeded++
+		case errors.Is(err, ErrAlreadyProcessed):
+			already++
+		default:
+			t.Fatalf("unexpected claim error: %v", err)
+		}
+	}
+	if succeeded != 1 || already != 1 {
+		t.Fatalf("claim results = %#v", errs)
 	}
 }
 

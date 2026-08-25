@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"qqcodex/internal/config"
 	"qqcodex/internal/tasklog"
@@ -463,7 +464,7 @@ func TestManagerRunChecksFramesCompleteRecordsForTaskLogRedaction(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(got, secret) || !strings.Contains(got, "[REDACTED]") {
+	if strings.Contains(got, secret) || !strings.Contains(got, "PASS") || !utf8.ValidString(got) {
 		t.Fatalf("check task log was not redacted: %s", got)
 	}
 }

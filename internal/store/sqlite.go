@@ -18,6 +18,8 @@ import (
 var (
 	ErrNotFound = errors.New("not found")
 	ErrConflict = errors.New("optimistic update conflict")
+	// ErrAlreadyProcessed reports that another transaction already claimed the message key.
+	ErrAlreadyProcessed = errors.New("message already processed")
 )
 
 //go:embed schema.sql
@@ -152,6 +154,9 @@ func (s *Store) commitTaskMutation(ctx context.Context, task *model.Task, expect
 		return fmt.Errorf("begin task mutation for %q: %w", task.ID, err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := claimMessageTx(ctx, tx, messageKey, at); err != nil {
+		return err
+	}
 	result, err := updateTask(ctx, tx, task, expectedVersion)
 	if err != nil {
 		return err
@@ -170,7 +175,7 @@ func (s *Store) commitTaskMutation(ctx context.Context, task *model.Task, expect
 			return fmt.Errorf("invalidate %q approvals for task %q: %w", approvalKind, task.ID, err)
 		}
 	}
-	if err := appendRecordsTx(ctx, tx, input, task.ID, auditKind, auditDetail, messageKey, at); err != nil {
+	if err := appendRecordsTx(ctx, tx, input, task.ID, auditKind, auditDetail, at); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -187,7 +192,10 @@ func (s *Store) CommitRecords(ctx context.Context, input model.Input, auditKind,
 		return fmt.Errorf("begin command records for %q: %w", input.TaskID, err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	if err := appendRecordsTx(ctx, tx, input, input.TaskID, auditKind, auditDetail, messageKey, at); err != nil {
+	if err := claimMessageTx(ctx, tx, messageKey, at); err != nil {
+		return err
+	}
+	if err := appendRecordsTx(ctx, tx, input, input.TaskID, auditKind, auditDetail, at); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -196,7 +204,25 @@ func (s *Store) CommitRecords(ctx context.Context, input model.Input, auditKind,
 	return nil
 }
 
-func appendRecordsTx(ctx context.Context, tx *sql.Tx, input model.Input, taskID, auditKind, auditDetail, messageKey string, at time.Time) error {
+func claimMessageTx(ctx context.Context, tx *sql.Tx, messageKey string, at time.Time) error {
+	result, err := tx.ExecContext(ctx, `
+		INSERT INTO processed_messages (message_key, processed_at)
+		VALUES (?, ?)
+		ON CONFLICT(message_key) DO NOTHING`, messageKey, at.UnixMilli())
+	if err != nil {
+		return fmt.Errorf("claim message %q: %w", messageKey, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("claim message %q rows affected: %w", messageKey, err)
+	}
+	if rows != 1 {
+		return fmt.Errorf("claim message %q: %w", messageKey, ErrAlreadyProcessed)
+	}
+	return nil
+}
+
+func appendRecordsTx(ctx context.Context, tx *sql.Tx, input model.Input, taskID, auditKind, auditDetail string, at time.Time) error {
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO task_inputs (task_id, kind, user_id, group_id, message_id, body, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)`, input.TaskID, input.Kind, input.UserID, input.GroupID, input.MessageID, input.Body, input.CreatedAt.UnixMilli()); err != nil {
@@ -206,12 +232,6 @@ func appendRecordsTx(ctx context.Context, tx *sql.Tx, input model.Input, taskID,
 		INSERT INTO audit_events (task_id, kind, detail, created_at)
 		VALUES (?, ?, ?, ?)`, taskID, auditKind, auditDetail, at.UnixMilli()); err != nil {
 		return fmt.Errorf("append audit for task %q: %w", taskID, err)
-	}
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO processed_messages (message_key, processed_at)
-		VALUES (?, ?)
-		ON CONFLICT(message_key) DO NOTHING`, messageKey, at.UnixMilli()); err != nil {
-		return fmt.Errorf("mark message %q processed: %w", messageKey, err)
 	}
 	return nil
 }

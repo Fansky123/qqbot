@@ -145,12 +145,12 @@ func TestStoreRedactsSecretsAndFramesNewlines(t *testing.T) {
 	if strings.Count(got, "\n") != 1 {
 		t.Fatalf("record framing contains injected newline: %q", got)
 	}
-	if !strings.Contains(got, `[REDACTED]`) || !strings.Contains(got, `\n`) {
+	if !strings.Contains(got, store.exactMarker) || !strings.Contains(got, `\n`) {
 		t.Fatalf("log lacks redaction or escaped newline: %q", got)
 	}
 }
 
-func TestAppendDoesNotRedactInsideReplacementMarker(t *testing.T) {
+func TestAppendRemovesSecretsThatOccurInReplacementMarker(t *testing.T) {
 	t.Parallel()
 	store := openStore(t, []string{"A", "C", "T", "]"})
 	if err := store.Append(testTaskID, "codex.events", []byte("A")); err != nil {
@@ -165,8 +165,10 @@ func TestAppendDoesNotRedactInsideReplacementMarker(t *testing.T) {
 	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
 		t.Fatal(err)
 	}
-	if entry.Data != "[REDACTED]" {
-		t.Fatalf("redacted data = %q, want one replacement marker", entry.Data)
+	for _, secret := range []string{"A", "C", "T", "]"} {
+		if strings.Contains(entry.Data, secret) {
+			t.Fatalf("redacted data still contains %q: %q", secret, entry.Data)
+		}
 	}
 }
 
@@ -199,7 +201,7 @@ func TestWriterImmediatelyAppendsCompleteRecordWithoutNewline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(data), "split-secret") || !strings.Contains(string(data), "[REDACTED]") {
+	if strings.Contains(string(data), "split-secret") {
 		t.Fatalf("split secret was not redacted: %s", data)
 	}
 }
@@ -219,7 +221,7 @@ func TestRedactTextCoversPlainAndJSONEscapedSecrets(t *testing.T) {
 	if strings.Contains(got, secret) || strings.Contains(got, escaped) {
 		t.Fatalf("RedactText leaked configured secret: %q", got)
 	}
-	if strings.Count(got, redactionMarker) != 2 {
+	if got != "plain="+logs.exactMarker+" escaped="+logs.exactMarker || logs.RedactText(got) != got || !utf8.ValidString(got) {
 		t.Fatalf("RedactText() = %q", got)
 	}
 }
@@ -231,7 +233,7 @@ func TestRedactTextIsIdempotentForSingleCharacterSecret(t *testing.T) {
 	}
 	once := logs.RedactText("A")
 	twice := logs.RedactText(once)
-	if once != redactionMarker || twice != once {
+	if strings.Contains(once, "A") || twice != once || !utf8.ValidString(once) {
 		t.Fatalf("redaction is not idempotent: once=%q twice=%q", once, twice)
 	}
 }
@@ -254,7 +256,7 @@ func TestRedactTextMatchesSecretsContainingMarker(t *testing.T) {
 		escaped := string(encoded[1 : len(encoded)-1])
 		for _, value := range []string{secret, escaped} {
 			got := logs.RedactText("before " + value + " after")
-			if got != "before "+redactionMarker+" after" {
+			if strings.Contains(got, secret) || strings.Contains(got, escaped) || logs.RedactText(got) != got {
 				t.Errorf("RedactText(%q) = %q", value, got)
 			}
 		}
@@ -268,6 +270,55 @@ func TestRedactTextMatchesSecretsContainingMarker(t *testing.T) {
 		if strings.Contains(got, leaked) {
 			t.Errorf("overlapping exact/generic redaction leaked %q: %q", leaked, got)
 		}
+	}
+}
+
+func TestRedactTextNeverReturnsConfiguredSecret(t *testing.T) {
+	markerSecrets := make(map[rune]struct{})
+	for _, r := range redactionMarker {
+		markerSecrets[r] = struct{}{}
+	}
+	secrets := []string{redactionMarker, "ab", "prefix" + redactionMarker + "suffix"}
+	for r := range markerSecrets {
+		secrets = append(secrets, string(r))
+	}
+	for _, secret := range secrets {
+		logs, err := Open(t.TempDir(), []string{secret})
+		if err != nil {
+			t.Fatal(err)
+		}
+		input := secret + " aabb Bearer bearer-value CODEX_API_KEY=codex-secret " + redactionMarker
+		once := logs.RedactText(input)
+		twice := logs.RedactText(once)
+		if strings.Contains(once, secret) || twice != once || !utf8.ValidString(once) {
+			t.Errorf("secret=%q once=%q twice=%q", secret, once, twice)
+		}
+		if strings.Contains(once, "bearer-value") || strings.Contains(once, "codex-secret") {
+			t.Errorf("generic credential leaked for secret %q: %q", secret, once)
+		}
+	}
+	genericOnly, err := Open(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := genericOnly.RedactText("Bearer token")
+	if got != "Bearer "+redactionMarker || !utf8.ValidString(got) {
+		t.Fatalf("generic-only redaction = %q", got)
+	}
+	invalid := genericOnly.RedactText(string([]byte{'x', 0xff, 'y'}))
+	if !utf8.ValidString(invalid) {
+		t.Fatalf("RedactText returned invalid UTF-8: %q", invalid)
+	}
+}
+
+func TestOpenRejectsInvalidUTF8SecretBeforeFilesystemMutation(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "must-not-exist")
+	_, err := Open(root, []string{string([]byte{0xff, 0xfe})})
+	if err == nil || strings.Contains(err.Error(), "\xff") {
+		t.Fatalf("Open invalid UTF-8 error = %v", err)
+	}
+	if _, statErr := os.Stat(root); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("root created for invalid secret: %v", statErr)
 	}
 }
 
@@ -310,7 +361,7 @@ func TestSummaryReredactsCompleteRecord(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(got, secret) || !strings.Contains(got, "[REDACTED]") {
+	if strings.Contains(got, secret) || !strings.Contains(got, store.exactMarker) {
 		t.Fatalf("Summary() did not re-redact complete record")
 	}
 }

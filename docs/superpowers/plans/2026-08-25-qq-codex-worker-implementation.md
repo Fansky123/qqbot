@@ -1181,8 +1181,9 @@ Define `App.Run(ctx)` to:
 3. Run OneBot client and pass only messages from configured groups.
 4. Process each accepted message in a worker pool bounded by `Config.MessageWorkers` so Codex planning cannot block the WebSocket reader.
 5. Convert OneBot `GroupMessage` to `tasksvc.Message` and call `Service.Handle`.
-6. Return fatal store/config errors; keep OneBot reconnect errors inside the client.
-7. Cancel scheduler and wait for goroutines on shutdown.
+6. When `Service.Handle` returns `tasksvc.ErrNotificationDelivery`, retry the same immutable `tasksvc.Message` with bounded attempts/backoff; service replay must resend the deterministic response without repeating planner, state mutation, audit records, scheduler wakeup, or cancellation. Do not retry authorization, parser, configuration, planner, or store errors.
+7. Return fatal store/config errors; keep OneBot reconnect errors inside the client.
+8. Cancel scheduler and wait for goroutines on shutdown.
 
 - [ ] **Step 4: Implement the main command**
 

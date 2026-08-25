@@ -2,6 +2,7 @@ package tasksvc
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,6 +27,7 @@ type fakePlanner struct {
 	calls  int
 	block  <-chan struct{}
 	result codex.Result
+	err    error
 }
 
 func (p *fakePlanner) Plan(ctx context.Context, req codex.Request) (codex.Result, error) {
@@ -39,7 +41,7 @@ func (p *fakePlanner) Plan(ctx context.Context, req codex.Request) (codex.Result
 			return codex.Result{}, ctx.Err()
 		}
 	}
-	return p.result, nil
+	return p.result, p.err
 }
 
 func (p *fakePlanner) Calls() int {
@@ -213,12 +215,130 @@ func TestServiceCreateConfirmReplayAndConcurrentDedup(t *testing.T) {
 	}
 }
 
+func TestServiceDeduplicatesAcrossStoreConnections(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "shared.db")
+	firstDB, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = firstDB.Close() })
+	secondDB, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = secondDB.Close() })
+	projectRoot := t.TempDir()
+	cfg := config.Config{
+		MessageWorkers: 1,
+		OneBot:         config.OneBotConfig{URL: "ws://127.0.0.1", AccessTokenEnv: "NAPCAT_ACCESS_TOKEN", SelfID: "bot", MessageRunes: 1200},
+		DatabasePath:   path, LogDir: t.TempDir(), WorktreeRoot: t.TempDir(),
+		AllowedGroupIDs: []string{"g1"}, EmployeeIDs: []string{"u1"},
+		Codex: config.CodexConfig{Binary: "/bin/true"}, OpsCommand: []string{"/bin/true"},
+		Projects: []config.Project{{ID: "orders", Aliases: []string{"orders"}, RepoPath: projectRoot, BaseBranch: "main", RCBranch: "rc", Remote: "origin", Checks: [][]string{{"go", "test", "./..."}}, MaxConcurrent: 1, CodexTimeoutSeconds: 30, LogRetentionDays: 1}},
+	}
+	registry, err := config.NewRegistry(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planningGate := make(chan struct{})
+	planner := &fakePlanner{result: planResult(), block: planningGate}
+	scheduler := &fakeScheduler{}
+	logs := fakeLogs{}
+	services := []*Service{
+		NewService(registry, firstDB, auth.New(cfg.AllowedGroupIDs, cfg.EmployeeIDs, nil), planner, scheduler, &fakeNotifier{}, logs),
+		NewService(registry, secondDB, auth.New(cfg.AllowedGroupIDs, cfg.EmployeeIDs, nil), planner, scheduler, &fakeNotifier{}, logs),
+	}
+	create := msg("multi-create", "u1", "[orders] task")
+	errs := make([]error, 2)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		errs[0] = services[0].Handle(ctx, create)
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for planner.Calls() != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if planner.Calls() != 1 {
+		t.Fatal("first service did not enter planner")
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		errs[1] = services[1].Handle(ctx, create)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	if planner.Calls() != 1 {
+		t.Fatalf("second service duplicated planner call: %d", planner.Calls())
+	}
+	close(planningGate)
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			t.Fatalf("multi-service create: %v", err)
+		}
+	}
+	if planner.Calls() != 1 {
+		t.Fatalf("multi-service planner calls = %d", planner.Calls())
+	}
+
+	id := TaskID("g1", "multi-create")
+	confirm := msg("multi-confirm", "u1", "确认 #"+id)
+	start := make(chan struct{})
+	for i := range services {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			errs[i] = services[i].Handle(ctx, confirm)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			t.Fatalf("multi-service confirm: %v", err)
+		}
+	}
+	if scheduler.wake != 1 {
+		t.Fatalf("multi-service scheduler wake = %d", scheduler.wake)
+	}
+	task, err := firstDB.GetTask(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Status != model.StatusQueued {
+		t.Fatalf("multi-service task = %#v", task)
+	}
+	inspection, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = inspection.Close() })
+	queries := map[string]string{
+		"processed_messages": "SELECT COUNT(*) FROM processed_messages",
+		"task_inputs":        "SELECT COUNT(*) FROM task_inputs",
+		"audit_events":       "SELECT COUNT(*) FROM audit_events",
+	}
+	for table, query := range queries {
+		var got int
+		if err := inspection.QueryRowContext(ctx, query).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got != 2 {
+			t.Errorf("multi-service %s rows = %d, want 2", table, got)
+		}
+	}
+}
+
 func TestServiceCreateResumesMatchingDraft(t *testing.T) {
 	planner := &fakePlanner{result: planResult()}
 	svc, db, _, _ := testService(t, planner)
 	ctx := context.Background()
 	create := msg("draft-replay", "u1", "[orders] task")
-	now := time.Now().UTC()
+	now := time.Now().UTC().Add(-time.Minute)
 	draft := &model.Task{ID: TaskID("g1", "draft-replay"), ProjectID: "orders", GroupID: "g1", CreatorID: "u1", Requirement: "task", Status: model.StatusDraft, CreatedAt: now, UpdatedAt: now}
 	if err := db.CreateTask(ctx, draft); err != nil {
 		t.Fatal(err)
@@ -327,10 +447,18 @@ func TestServiceStatusAndLogAreBounded(t *testing.T) {
 		t.Fatal(err)
 	}
 	id := TaskID("g1", "m1")
+	task, err := db.GetTask(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task.Summary = string([]byte{'x', 0xff, 'y'})
+	if err := db.SaveTask(ctx, task, task.Version); err != nil {
+		t.Fatal(err)
+	}
 	if err := svc.Handle(ctx, msg("m2", "u1", "状态 #"+id)); err != nil {
 		t.Fatal(err)
 	}
-	if len([]rune(notifier.Last())) > maxNotificationRunes {
+	if len([]rune(notifier.Last())) > maxNotificationRunes || !utf8.ValidString(notifier.Last()) {
 		t.Fatalf("status length = %d", len([]rune(notifier.Last())))
 	}
 	if err := svc.Handle(ctx, msg("m3", "u1", "日志 #"+id)); err != nil {
@@ -350,8 +478,8 @@ func TestServiceRetriesNotificationsWithoutRepeatingEffects(t *testing.T) {
 	ctx := context.Background()
 	create := msg("retry-create", "u1", "[orders] task")
 	notifier.FailNext()
-	if err := svc.Handle(ctx, create); err == nil {
-		t.Fatal("create notification failure was not returned")
+	if err := svc.Handle(ctx, create); !errors.Is(err, ErrNotificationDelivery) {
+		t.Fatalf("create notification error = %v", err)
 	}
 	if err := svc.Handle(ctx, create); err != nil {
 		t.Fatal(err)
@@ -424,6 +552,32 @@ func TestServiceRetriesNotificationsWithoutRepeatingEffects(t *testing.T) {
 		if err := svc.Handle(ctx, request); err != nil {
 			t.Fatalf("replay %s: %v", request.Text, err)
 		}
+	}
+}
+
+func TestServiceRetriesFailedPlanningNotification(t *testing.T) {
+	planningErr := errors.New("planner unavailable")
+	planner := &fakePlanner{err: planningErr}
+	svc, db, _, notifier := testService(t, planner)
+	ctx := context.Background()
+	create := msg("failed-plan-notify", "u1", "[orders] task")
+	notifier.FailNext()
+	err := svc.Handle(ctx, create)
+	if !errors.Is(err, planningErr) || !errors.Is(err, ErrNotificationDelivery) {
+		t.Fatalf("planning notification error = %v", err)
+	}
+	if err := svc.Handle(ctx, create); err != nil {
+		t.Fatal(err)
+	}
+	if planner.Calls() != 1 {
+		t.Fatalf("planning failure replay calls = %d", planner.Calls())
+	}
+	task, err := db.GetTask(ctx, TaskID("g1", "failed-plan-notify"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Status != model.StatusFailed || !strings.Contains(notifier.Last(), "failed") {
+		t.Fatalf("failed planning replay task=%#v notification=%q", task, notifier.Last())
 	}
 }
 
@@ -635,7 +789,7 @@ func TestServiceRedactsMarkerContainingSecretAcrossReplayAndStatus(t *testing.T)
 		}
 	}
 	for i, notification := range notifier.Messages() {
-		if strings.Contains(notification, secret) || strings.Contains(notification, escapedSecret) {
+		if strings.Contains(notification, secret) || strings.Contains(notification, escapedSecret) || !utf8.ValidString(notification) {
 			t.Fatalf("notification %d leaked marker-containing secret: %q", i, notification)
 		}
 	}
@@ -646,7 +800,8 @@ func TestServiceRejectsPlanExpandedByRedaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan := codex.Plan{Summary: strings.Repeat("A", 4000), Scope: []string{strings.Repeat("A", 4000)}, Checks: []string{}, Risks: []string{}}
+	field := strings.Repeat("A", 4000)
+	plan := codex.Plan{Summary: field, Scope: []string{field, field, field, field, field}, Checks: []string{}, Risks: []string{}}
 	encodedPlan, err := json.Marshal(plan)
 	if err != nil {
 		t.Fatal(err)

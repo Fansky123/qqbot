@@ -22,6 +22,8 @@ const (
 	maxSummaryReadBytes = 1 << 20
 	// This is also the maximum configured secret length, measured in bytes.
 	maxRedactionOverlap = 64 << 10
+	maxSecretEntries    = 256
+	maxSecretBytes      = 512 << 10
 	maxRecordDataBytes  = 2 << 20
 	maxTaskLogBytes     = 64 << 20
 	redactionMarker     = "[REDACTED]"
@@ -43,12 +45,13 @@ var (
 type Store struct {
 	Root string
 
-	secrets []string
-	rootDev uint64
-	rootIno uint64
-	locksMu sync.Mutex
-	locks   map[string]*sync.Mutex
-	limited map[string]bool
+	secrets     []string
+	exactMarker string
+	rootDev     uint64
+	rootIno     uint64
+	locksMu     sync.Mutex
+	locks       map[string]*sync.Mutex
+	limited     map[string]bool
 
 	maxTaskBytes int64
 }
@@ -76,6 +79,9 @@ func Open(root string, secretValues []string) (*Store, error) {
 		secrets = append(secrets, value)
 	}
 	for _, value := range secretValues {
+		if !utf8.ValidString(value) {
+			return nil, errors.New("task log secret is not valid UTF-8")
+		}
 		if len(value) > maxRedactionOverlap {
 			return nil, errors.New("task log secret exceeds maximum length")
 		}
@@ -89,7 +95,18 @@ func Open(root string, secretValues []string) (*Store, error) {
 		}
 		addSecret(string(encoded[1 : len(encoded)-1]))
 	}
+	totalSecretBytes := 0
+	for _, secret := range secrets {
+		totalSecretBytes += len(secret)
+	}
+	if len(secrets) > maxSecretEntries || totalSecretBytes > maxSecretBytes {
+		return nil, errors.New("task log secret configuration exceeds limit")
+	}
 	sort.SliceStable(secrets, func(i, j int) bool { return len(secrets[i]) > len(secrets[j]) })
+	exactMarker := redactionMarker
+	if len(secrets) > 0 {
+		exactMarker = chooseExactMarker(secrets)
+	}
 	abs, err := filepath.Abs(root)
 	if err != nil {
 		return nil, fmt.Errorf("make task log root absolute: %w", err)
@@ -116,12 +133,13 @@ func Open(root string, secretValues []string) (*Store, error) {
 	}
 
 	return &Store{
-		Root:    canonical,
-		secrets: secrets,
-		rootDev: uint64(stat.Dev),
-		rootIno: stat.Ino,
-		locks:   make(map[string]*sync.Mutex),
-		limited: make(map[string]bool),
+		Root:        canonical,
+		secrets:     secrets,
+		exactMarker: exactMarker,
+		rootDev:     uint64(stat.Dev),
+		rootIno:     stat.Ino,
+		locks:       make(map[string]*sync.Mutex),
+		limited:     make(map[string]bool),
 
 		maxTaskBytes: maxTaskLogBytes,
 	}, nil
@@ -417,8 +435,9 @@ func (s *Store) Remove(taskID string) error {
 }
 
 func (s *Store) redact(value string) string {
-	value = bearerPattern.ReplaceAllString(value, `${1}`+redactionMarker)
-	value = keyPattern.ReplaceAllString(value, `${1}=`+redactionMarker)
+	value = strings.ToValidUTF8(value, "\uFFFD")
+	value = bearerPattern.ReplaceAllString(value, `${1}`+s.exactMarker)
+	value = keyPattern.ReplaceAllString(value, `${1}=`+s.exactMarker)
 	return s.redactExact(value)
 }
 
@@ -432,7 +451,7 @@ func (s *Store) redactExact(value string) string {
 		matched := false
 		for _, secret := range s.secrets {
 			if strings.HasPrefix(value[offset:], secret) {
-				redacted.WriteString(redactionMarker)
+				redacted.WriteString(s.exactMarker)
 				offset += len(secret)
 				matched = true
 				break
@@ -441,15 +460,35 @@ func (s *Store) redactExact(value string) string {
 		if matched {
 			continue
 		}
-		if strings.HasPrefix(value[offset:], redactionMarker) {
-			redacted.WriteString(redactionMarker)
-			offset += len(redactionMarker)
+		if strings.HasPrefix(value[offset:], s.exactMarker) {
+			redacted.WriteString(s.exactMarker)
+			offset += len(s.exactMarker)
 			continue
 		}
 		redacted.WriteByte(value[offset])
 		offset++
 	}
 	return redacted.String()
+}
+
+func chooseExactMarker(secrets []string) string {
+	for candidate := rune(0x2588); candidate <= utf8.MaxRune; candidate++ {
+		if candidate >= 0xD800 && candidate <= 0xDFFF {
+			continue
+		}
+		marker := string(candidate)
+		available := true
+		for _, secret := range secrets {
+			if strings.Contains(secret, marker) {
+				available = false
+				break
+			}
+		}
+		if available {
+			return marker
+		}
+	}
+	panic("task log secret marker space exhausted")
 }
 
 // RedactText removes configured exact secrets and recognized credentials from text.
