@@ -116,7 +116,7 @@ func TestClientRejectsUntrustedExecutable(t *testing.T) {
 	repo := filepath.Join(privateTempDir(t), "source")
 	git(t, filepath.Dir(repo), "init", repo)
 	workerOwned := writeExecutable(t, filepath.Join(privateTempDir(t), "qqcodex-ops"), "#!/bin/sh\nexit 0\n")
-	if _, err := NewClient([]string{workerOwned}, map[string]string{"order-api": repo}); err == nil {
+	if _, err := NewClient([]string{workerOwned, "-config", "/etc/hosts"}, map[string]string{"order-api": repo}); err == nil {
 		t.Fatal("NewClient() error = nil, want worker-owned executable rejection")
 	}
 }
@@ -125,15 +125,53 @@ func TestNewClientAcceptsOnlyRootOwnedExecutables(t *testing.T) {
 	repo := filepath.Join(privateTempDir(t), "source")
 	git(t, filepath.Dir(repo), "init", repo)
 	rootCommand := realExecutable(t, "true")
-	if _, err := NewClient([]string{rootCommand}, map[string]string{"order-api": repo}); err != nil {
+	validCommand := []string{rootCommand, "-config", "/etc/hosts"}
+	client, err := NewClient(validCommand, map[string]string{"order-api": repo})
+	if err != nil {
 		t.Fatalf("NewClient() rejected root-owned command and source Git: %v", err)
+	}
+	validCommand[1] = "--changed"
+	if client.command[1] != "-config" {
+		t.Fatal("NewClient() did not deep-copy command")
 	}
 
 	gitDir := privateTempDir(t)
 	writeExecutable(t, filepath.Join(gitDir, "git"), "#!/bin/sh\nexec /usr/bin/git \"$@\"\n")
 	t.Setenv("PATH", gitDir+":/usr/bin:/bin")
-	if _, err := NewClient([]string{rootCommand}, map[string]string{"order-api": repo}); err == nil {
+	if _, err := NewClient([]string{rootCommand, "-config", "/etc/hosts"}, map[string]string{"order-api": repo}); err == nil {
 		t.Fatal("NewClient() error = nil, want worker-owned source Git rejection")
+	}
+}
+
+func TestNewClientRejectsCommandsOutsideFixedContract(t *testing.T) {
+	repo := filepath.Join(privateTempDir(t), "source")
+	git(t, filepath.Dir(repo), "init", repo)
+	helper := realExecutable(t, "true")
+	workerConfig := filepath.Join(privateTempDir(t), "ops.json")
+	writeFile(t, workerConfig, "{}")
+	writableConfig := filepath.Join(privateTempDir(t), "writable-ops.json")
+	writeFile(t, writableConfig, "{}")
+	if err := os.Chmod(writableConfig, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name    string
+		command []string
+	}{
+		{name: "shell worker script", command: []string{realExecutable(t, "sh"), workerConfig}},
+		{name: "missing config flag", command: []string{helper, "/etc/hosts"}},
+		{name: "duplicate config flag", command: []string{helper, "-config", "/etc/hosts", "-config", "/etc/hosts"}},
+		{name: "extra argument", command: []string{helper, "-config", "/etc/hosts", "sync"}},
+		{name: "worker-owned config", command: []string{helper, "-config", workerConfig}},
+		{name: "writable config", command: []string{helper, "-config", writableConfig}},
+		{name: "relative config", command: []string{helper, "-config", "ops.json"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := NewClient(tt.command, map[string]string{"order-api": repo}); err == nil {
+				t.Fatal("NewClient() error = nil, want fixed command rejection")
+			}
+		})
 	}
 }
 

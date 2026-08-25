@@ -537,6 +537,73 @@ func TestOperatorMergeRCVerifiesCommitRunsChecksAndSkipsHooks(t *testing.T) {
 	assertNoTemporaryRefs(t, fixture.repo)
 }
 
+func TestOperatorMergeRCCleanupFailurePreventsPush(t *testing.T) {
+	tests := []struct {
+		name      string
+		failMatch string
+	}{
+		{name: "worktree cleanup", failMatch: " worktree remove --force "},
+		{name: "temporary ref cleanup", failMatch: " update-ref -d refs/qqcodex/"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fixture := newOpsFixture(t)
+			branch, taskCommit := fixture.createTaskCommit(t, testTaskID, "feature.txt", "feature\n")
+			if err := pushTaskBundle(t, fixture.operator, fixture.projectID, fixture.repo, testTaskID, branch, taskCommit, nil); err != nil {
+				t.Fatal(err)
+			}
+			oldRC := fixture.remoteRef(t, "rc")
+			real := realGit(t)
+			wrapper := writeExecutable(t, filepath.Join(privateTempDir(t), "cleanup-failing-git"), `#!/bin/sh
+case " $* " in
+  *"`+tt.failMatch+`"*) exit 88 ;;
+esac
+exec "`+real+`" "$@"
+`)
+			fixture.config.GitBinary = wrapper
+			fixture.operator = mustNewOperator(t, fixture.config)
+
+			if _, err := fixture.operator.MergeRC(context.Background(), fixture.projectID, testTaskID, taskCommit); err == nil {
+				t.Fatal("MergeRC() error = nil, want cleanup failure")
+			}
+			if got := fixture.remoteRef(t, "rc"); got != oldRC {
+				t.Fatalf("cleanup failure changed remote RC to %q, want %q", got, oldRC)
+			}
+		})
+	}
+}
+
+func TestOperatorMergeRCHasNoFallibleCleanupAfterPush(t *testing.T) {
+	fixture := newOpsFixture(t)
+	branch, taskCommit := fixture.createTaskCommit(t, testTaskID, "feature.txt", "feature\n")
+	if err := pushTaskBundle(t, fixture.operator, fixture.projectID, fixture.repo, testTaskID, branch, taskCommit, nil); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(t.TempDir(), "push-ran")
+	real := realGit(t)
+	wrapper := writeExecutable(t, filepath.Join(privateTempDir(t), "post-push-cleanup-failing-git"), `#!/bin/sh
+case " $* " in
+  *" push "*) touch "`+marker+`" ;;
+esac
+if [ -e "`+marker+`" ]; then
+  case " $* " in
+    *" worktree remove --force "*|*" update-ref -d refs/qqcodex/"*) exit 88 ;;
+  esac
+fi
+exec "`+real+`" "$@"
+`)
+	fixture.config.GitBinary = wrapper
+	fixture.operator = mustNewOperator(t, fixture.config)
+
+	merged, err := fixture.operator.MergeRC(context.Background(), fixture.projectID, testTaskID, taskCommit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fixture.remoteRef(t, "rc"); got != merged {
+		t.Fatalf("remote RC = %q, want returned merge %q", got, merged)
+	}
+}
+
 func TestOperatorMergeRCFailureLeavesRemoteUnchanged(t *testing.T) {
 	t.Parallel()
 

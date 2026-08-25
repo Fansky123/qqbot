@@ -243,7 +243,9 @@ func (o *Operator) MergeRC(ctx context.Context, projectID, taskID, taskCommit st
 	remoteTask, remoteRC, cleanupRefs, err := o.fetchMergeBranches(ctx, project, branch)
 	if cleanupRefs != nil {
 		defer func() {
-			runErr = errors.Join(runErr, cleanupRefs())
+			if cleanupRefs != nil {
+				runErr = errors.Join(runErr, cleanupRefs())
+			}
 		}()
 	}
 	if err != nil {
@@ -258,8 +260,11 @@ func (o *Operator) MergeRC(ctx context.Context, projectID, taskID, taskCommit st
 		return "", err
 	}
 	added := false
+	cleanupWorktreePending := true
 	defer func() {
-		runErr = errors.Join(runErr, o.cleanupWorktree(project.RepoPath, worktree, added))
+		if cleanupWorktreePending {
+			runErr = errors.Join(runErr, o.cleanupWorktree(project.RepoPath, worktree, added))
+		}
 	}()
 	if _, err := o.runGit(ctx, project.RepoPath, "worktree", "add", "--detach", worktree, remoteRC); err != nil {
 		return "", errors.New("create RC worktree failed")
@@ -286,10 +291,23 @@ func (o *Operator) MergeRC(ctx context.Context, projectID, taskID, taskCommit st
 	if err != nil || checkedHead != merged {
 		return "", errors.New("RC checks changed the merge commit")
 	}
+	cleanupErr := o.cleanupWorktree(project.RepoPath, worktree, added)
+	cleanupWorktreePending = false
+	if cleanupRefs != nil {
+		cleanupErr = errors.Join(cleanupErr, cleanupRefs())
+		cleanupRefs = nil
+	}
+	if cleanupErr != nil {
+		return "", cleanupErr
+	}
+	resolved, err := o.resolveCommit(ctx, project.RepoPath, merged)
+	if err != nil || resolved != merged {
+		return "", errors.New("merged RC object became unavailable")
+	}
 	if err := o.guardRepository(ctx, project); err != nil {
 		return "", err
 	}
-	if _, err := o.runGit(ctx, worktree, pushArgs(project.RemoteURL, "HEAD:refs/heads/"+project.RCBranch)...); err != nil {
+	if _, err := o.runGit(ctx, project.RepoPath, pushArgs(project.RemoteURL, merged+":refs/heads/"+project.RCBranch)...); err != nil {
 		return "", errors.New("RC push failed")
 	}
 	return merged, nil

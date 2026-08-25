@@ -750,7 +750,7 @@ qqcodex-ops -config <path> merge --project <id> --task <id> --commit <sha>
 qqcodex-ops -config <path> deploy --project <id> --task <id> --rc-commit <sha>
 ```
 
-It writes one JSON object to stdout, for example `{"ok":true,"rc_commit":"0123456789abcdef0123456789abcdef01234567"}` or `{"ok":false,"error":"remote RC changed"}`, and uses non-zero exit status for failure. `internal/ops/client.go` builds these argv from typed methods, sends task bundles through stdin for `push`, and parses only that JSON object. The public client constructor accepts only root-owned helper/source Git executables; same-package tests use an unexported current-UID constructor.
+It writes one JSON object to stdout, for example `{"ok":true,"rc_commit":"0123456789abcdef0123456789abcdef01234567"}` or `{"ok":false,"error":"remote RC changed"}`, and uses non-zero exit status for failure. `internal/ops/client.go` builds these argv from typed methods, sends task bundles through stdin for `push`, and parses only that JSON object. The public client constructor accepts exactly `[root-owned absolute helper, "-config", root-owned absolute config]`, requires a root-owned source Git executable, and validates non-replaceable files and parent directories; same-package tests use an unexported current-UID constructor with arbitrary test-helper arguments.
 
 - [ ] **Step 6: Add the example config and run tests**
 

@@ -34,8 +34,16 @@ type helperResponse struct {
 }
 
 func NewClient(command []string, sourceRepos map[string]string) (*Client, error) {
-	return newClient(command, sourceRepos, false)
-
+	if len(command) != 3 || command[1] != "-config" {
+		return nil, errors.New("ops command is invalid")
+	}
+	configPath, err := trustedConfigFile(command[2])
+	if err != nil {
+		return nil, errors.New("ops command is invalid")
+	}
+	clonedCommand := append([]string(nil), command...)
+	clonedCommand[2] = configPath
+	return newClient(clonedCommand, sourceRepos, false)
 }
 
 func newClient(command []string, sourceRepos map[string]string, allowCurrentUID bool) (*Client, error) {

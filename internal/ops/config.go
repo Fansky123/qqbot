@@ -256,6 +256,34 @@ func trustedExecutable(path string, repositories []string, allowCurrentUID bool)
 	return resolved, nil
 }
 
+func trustedConfigFile(path string) (string, error) {
+	if !filepath.IsAbs(path) {
+		return "", errors.New("path must be absolute")
+	}
+	resolved, err := filepath.EvalSymlinks(filepath.Clean(path))
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Lstat(resolved)
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() {
+		return "", errors.New("path is not a regular file")
+	}
+	if info.Mode().Perm()&0o022 != 0 {
+		return "", errors.New("config is group or world writable")
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat.Uid != 0 {
+		return "", errors.New("config has an untrusted owner")
+	}
+	if err := validateExecutableParents(resolved, info); err != nil {
+		return "", err
+	}
+	return resolved, nil
+}
+
 func validateExecutableParents(path string, child os.FileInfo) error {
 	for parent := filepath.Dir(path); ; parent = filepath.Dir(parent) {
 		info, err := os.Lstat(parent)
