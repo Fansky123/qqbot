@@ -22,7 +22,7 @@ type Client struct {
 }
 
 type helperResponse struct {
-	OK       bool   `json:"ok"`
+	OK       *bool  `json:"ok"`
 	Error    string `json:"error,omitempty"`
 	RCCommit string `json:"rc_commit,omitempty"`
 }
@@ -62,7 +62,7 @@ func (c Client) call(ctx context.Context, wantCommit string, args ...string) (st
 		}
 		return "", decodeErr
 	}
-	if response.OK {
+	if *response.OK {
 		if runErr != nil {
 			return "", errors.New("ops helper reported success with a non-zero exit status")
 		}
@@ -131,6 +131,9 @@ func decodeHelperResponse(data []byte) (helperResponse, error) {
 	var extra any
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
 		return helperResponse{}, errors.New("ops helper returned multiple JSON values")
+	}
+	if response.OK == nil {
+		return helperResponse{}, errors.New("ops helper response has no status")
 	}
 	return response, nil
 }

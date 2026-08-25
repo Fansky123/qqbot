@@ -76,12 +76,19 @@ func TestClientBuildsTypedArgvAndParsesResponse(t *testing.T) {
 }
 
 func TestClientRejectsInvalidOrMultipleJSONResponses(t *testing.T) {
-	for _, mode := range []string{"unknown-field", "multiple", "success-with-error", "failure-without-error"} {
+	for _, mode := range []string{
+		"unknown-field", "multiple", "success-with-error", "failure-without-error",
+		"missing-status", "null-status",
+	} {
 		mode := mode
 		t.Run(mode, func(t *testing.T) {
 			client := Client{Command: helperCommand(t, filepath.Join(t.TempDir(), "argv.json"), mode)}
-			if err := client.Sync(context.Background(), "order-api"); err == nil {
+			err := client.Sync(context.Background(), "order-api")
+			if err == nil {
 				t.Fatal("Sync() error = nil, want strict response error")
+			}
+			if (mode == "missing-status" || mode == "null-status") && err.Error() != "ops helper failed with an invalid response" {
+				t.Fatalf("Sync() error = %v, want invalid response error", err)
 			}
 		})
 	}
@@ -137,6 +144,12 @@ func TestOpsClientHelper(t *testing.T) {
 		_, _ = os.Stdout.WriteString(`{"ok":true,"error":"bad"}`)
 	case "failure-without-error":
 		_, _ = os.Stdout.WriteString(`{"ok":false}`)
+	case "missing-status":
+		_, _ = os.Stdout.WriteString(`{"error":"public failure"}`)
+		os.Exit(1)
+	case "null-status":
+		_, _ = os.Stdout.WriteString(`{"ok":null,"error":"public failure"}`)
+		os.Exit(1)
 	case "check-env":
 		if os.Getenv("CODEX_API_KEY") != "" {
 			_, _ = os.Stdout.WriteString(`{"ok":false,"error":"credential leaked"}`)
