@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"database/sql/driver"
 	"errors"
+	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -35,6 +37,55 @@ func TestOpenInitializesSchemaAndPragmas(t *testing.T) {
 
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestOpenAppliesConnectionPragmasAfterReplacement(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "tasks #1?.db")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	})
+
+	conn, err := db.db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Raw(func(any) error { return driver.ErrBadConn }); !errors.Is(err, driver.ErrBadConn) {
+		t.Fatalf("discard connection error = %v, want driver.ErrBadConn", err)
+	}
+	_ = conn.Close()
+
+	for pragma, want := range map[string]string{
+		"foreign_keys": "1",
+		"busy_timeout": "5000",
+	} {
+		var got string
+		if err := db.db.QueryRowContext(ctx, "PRAGMA "+pragma).Scan(&got); err != nil {
+			t.Fatalf("read replacement connection PRAGMA %s: %v", pragma, err)
+		}
+		if got != want {
+			t.Errorf("replacement connection PRAGMA %s = %q, want %q", pragma, got, want)
+		}
+	}
+
+	if _, err := db.db.ExecContext(ctx, `
+		INSERT INTO task_inputs (task_id, kind, user_id, group_id, message_id, body, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		"missing-task", "confirmation", "user-1", "group-1", "message-1", "body", time.Now().UnixMilli(),
+	); err == nil {
+		t.Fatal("replacement connection accepted an orphan task input")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("stat database at supplied path: %v", err)
 	}
 }
 

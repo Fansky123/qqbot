@@ -6,6 +6,8 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"net/url"
+	"path/filepath"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -31,7 +33,20 @@ type Store struct {
 }
 
 func Open(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path)
+	absolutePath, err := filepath.Abs(path)
+	if err != nil {
+		return nil, fmt.Errorf("resolve sqlite store path: %w", err)
+	}
+	query := make(url.Values)
+	query.Set("_foreign_keys", "on")
+	query.Set("_busy_timeout", "5000")
+	dsn := (&url.URL{
+		Scheme:   "file",
+		Path:     filepath.ToSlash(absolutePath),
+		RawQuery: query.Encode(),
+	}).String()
+
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite store: %w", err)
 	}
