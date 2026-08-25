@@ -286,24 +286,28 @@ func TestRunnerRejectsEnvironmentAssignment(t *testing.T) {
 	assertNotCreated(t, recordPath)
 }
 
-func TestRunnerTimeoutKillsProcessGroup(t *testing.T) {
+func TestRunnerCancellationKillsProcessGroup(t *testing.T) {
 	runner, req, _ := helperRunner(t)
 	pidPath := filepath.Join(t.TempDir(), "child.pid")
 	setEnv(t, helperSpawn, "1")
 	setEnv(t, helperPID, pidPath)
 	setEnv(t, helperSleep, "10s")
 	runner.KeepEnv = append(runner.KeepEnv, helperSpawn, helperPID, helperSleep)
-	req.Timeout = 150 * time.Millisecond
+	t.Cleanup(func() { killProcessFromFile(pidPath) })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	_, err := runner.Plan(context.Background(), req)
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("error = %v, want context deadline exceeded", err)
+	done := make(chan error, 1)
+	go func() {
+		_, err := runner.Plan(ctx, req)
+		done <- err
+	}()
+
+	pid := waitForPIDFile(t, pidPath)
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context canceled", err)
 	}
-	data, readErr := os.ReadFile(pidPath)
-	if readErr != nil {
-		t.Fatalf("read descendant PID: %v", readErr)
-	}
-	pid, _ := strconv.Atoi(string(data))
 	deadline := time.Now().Add(2 * time.Second)
 	for processAlive(pid) && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
@@ -313,7 +317,7 @@ func TestRunnerTimeoutKillsProcessGroup(t *testing.T) {
 	}
 }
 
-func TestRunnerCancellationWithDetachedStdoutPreservesSuccessfulExit(t *testing.T) {
+func TestRunnerCancellationWithDetachedStdoutReturnsContextErrorAndPartialResult(t *testing.T) {
 	runner, req, recordPath := helperRunner(t)
 	pidPath := filepath.Join(t.TempDir(), "detached.pid")
 	setEnv(t, helperSpawn, "detached")
@@ -339,11 +343,11 @@ func TestRunnerCancellationWithDetachedStdoutPreservesSuccessfulExit(t *testing.
 
 	select {
 	case got := <-done:
-		if got.err != nil {
-			t.Fatalf("Plan() error = %v, want successful outer process result", got.err)
+		if !errors.Is(got.err, context.Canceled) {
+			t.Fatalf("Plan() error = %v, want context canceled", got.err)
 		}
-		if got.result.SessionID != "thread-123" || len(got.result.EventsJSONL) == 0 {
-			t.Fatalf("result = %#v, want retained events and session", got.result)
+		if got.result.SessionID != "thread-123" || got.result.Final != "final answer" || len(got.result.EventsJSONL) == 0 {
+			t.Fatalf("result = %#v, want retained events, session, and final message", got.result)
 		}
 	case <-time.After(2 * time.Second):
 		killProcessFromFile(pidPath)
@@ -926,6 +930,23 @@ func waitForHelperPID(t *testing.T, path string) int {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("helper record %q did not contain a PID", path)
+	return 0
+}
+
+func waitForPIDFile(t *testing.T, path string) int {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			pid, err := strconv.Atoi(string(data))
+			if err == nil && pid > 0 {
+				return pid
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("PID file %q was not written", path)
 	return 0
 }
 

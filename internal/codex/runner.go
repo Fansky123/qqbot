@@ -183,23 +183,19 @@ func (r Runner) run(parent context.Context, req Request, kind invocation) (resul
 		_ = killProcessGroup(cmd.Process)
 	}
 	waitErr := cmd.Wait()
-	if canceled.Load() && cmd.ProcessState != nil && cmd.ProcessState.Success() {
-		waitErr = nil
-	}
 	var finalErr error
 	result, finalErr = readFinal(lastPath, outcome.result)
 	closeErr := closeLog(stderr)
 
-	var protocolErr *jsonlProtocolError
-	if outcome.err != nil && (!canceled.Load() || errors.As(outcome.err, &protocolErr)) {
-		return result, fmt.Errorf("scan codex JSONL: %w", outcome.err)
-	}
-	if canceled.Load() && waitErr != nil {
+	if canceled.Load() {
 		cause := ctx.Err()
 		if cause == nil {
 			cause = context.Canceled
 		}
 		return result, fmt.Errorf("codex %s canceled: %w", kind, cause)
+	}
+	if outcome.err != nil {
+		return result, fmt.Errorf("scan codex JSONL: %w", outcome.err)
 	}
 	if waitErr != nil {
 		return result, fmt.Errorf("codex %s failed: %w", kind, waitErr)
@@ -443,18 +439,6 @@ func environmentPolicyArgs(names []string) []string {
 	return args
 }
 
-type jsonlProtocolError struct {
-	err error
-}
-
-func (e *jsonlProtocolError) Error() string {
-	return e.err.Error()
-}
-
-func (e *jsonlProtocolError) Unwrap() error {
-	return e.err
-}
-
 func scanEvents(reader io.Reader) (Result, error) {
 	var result Result
 	scanner := bufio.NewScanner(reader)
@@ -467,10 +451,10 @@ func scanEvents(reader io.Reader) (Result, error) {
 		}
 		var event map[string]json.RawMessage
 		if err := json.Unmarshal(line, &event); err != nil {
-			return result, &jsonlProtocolError{err: fmt.Errorf("decode event object: %w", err)}
+			return result, fmt.Errorf("decode event object: %w", err)
 		}
 		if event == nil {
-			return result, &jsonlProtocolError{err: fmt.Errorf("event must be a JSON object")}
+			return result, fmt.Errorf("event must be a JSON object")
 		}
 
 		var eventType string
@@ -478,10 +462,10 @@ func scanEvents(reader io.Reader) (Result, error) {
 		if eventType == "thread.started" {
 			var sessionID string
 			if err := json.Unmarshal(event["thread_id"], &sessionID); err != nil {
-				return result, &jsonlProtocolError{err: fmt.Errorf("decode thread.started session ID: %w", err)}
+				return result, fmt.Errorf("decode thread.started session ID: %w", err)
 			}
 			if err := validateSessionID(sessionID); err != nil {
-				return result, &jsonlProtocolError{err: err}
+				return result, err
 			}
 			if result.SessionID == "" {
 				result.SessionID = sessionID
