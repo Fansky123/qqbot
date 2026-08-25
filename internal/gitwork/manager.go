@@ -18,15 +18,16 @@ import (
 )
 
 var (
-	taskIDPattern = regexp.MustCompile(`^T-[A-F0-9]{12}$`)
-	branchPattern = regexp.MustCompile(`^codex/T-[A-F0-9]{12}$`)
-	commitPattern = regexp.MustCompile(`^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$`)
+	taskIDPattern      = regexp.MustCompile(`^T-[A-F0-9]{12}$`)
+	branchPattern      = regexp.MustCompile(`^codex/T-[A-F0-9]{12}$`)
+	commitPattern      = regexp.MustCompile(`^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$`)
+	errOutputTruncated = errors.New("subprocess output truncated")
 )
 
 const (
-	checkWaitDelay         = time.Second
-	prepareRollbackTimeout = 5 * time.Second
-	maxCheckOutputBytes    = 1 << 20
+	subprocessWaitDelay      = time.Second
+	prepareRollbackTimeout   = 5 * time.Second
+	maxSubprocessOutputBytes = 1 << 20
 )
 
 type Prepared struct {
@@ -63,8 +64,19 @@ func (m Manager) Prepare(ctx context.Context, project config.Project, taskID str
 		return Prepared{}, fmt.Errorf("resolve base commit: %w", err)
 	}
 	branch := "codex/" + taskID
+	if err := requireAbsentPath(worktree); err != nil {
+		return Prepared{}, err
+	}
+	branchExists, err := localBranchExists(ctx, repo, branch)
+	if err != nil {
+		return Prepared{}, fmt.Errorf("inspect task branch: %w", err)
+	}
+	if branchExists {
+		return Prepared{}, fmt.Errorf("task branch %q already exists", branch)
+	}
 	if _, err := runGit(ctx, repo, "worktree", "add", "-b", branch, worktree, baseCommit); err != nil {
-		return Prepared{}, fmt.Errorf("add worktree: %w", err)
+		cleanupErr := rollbackFailedAdd(repo, worktree, branch)
+		return Prepared{}, errors.Join(fmt.Errorf("add worktree: %w", err), cleanupErr)
 	}
 
 	commonDir, err := gitCommonDir(ctx, worktree)
@@ -86,6 +98,48 @@ func rollbackPreparedWorktree(repo, worktree, branch string) error {
 	defer cancel()
 	if _, err := runGit(ctx, repo, "worktree", "remove", "--force", worktree); err != nil {
 		return fmt.Errorf("roll back worktree: %w", err)
+	}
+	return deleteTaskBranchIfUnattached(ctx, repo, branch)
+}
+
+func rollbackFailedAdd(repo, worktree, branch string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), prepareRollbackTimeout)
+	defer cancel()
+
+	targetExists, err := pathExists(worktree)
+	if err != nil {
+		return fmt.Errorf("inspect failed worktree path: %w", err)
+	}
+	registered, _, err := worktreeState(ctx, repo, worktree, branch)
+	if err != nil {
+		return fmt.Errorf("inspect failed worktree registration: %w", err)
+	}
+	var cleanupErr error
+	if targetExists || registered {
+		if _, err := runGit(ctx, repo, "worktree", "remove", "--force", worktree); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("roll back failed worktree add: %w", err))
+		}
+	}
+	if err := deleteTaskBranchIfUnattached(ctx, repo, branch); err != nil {
+		cleanupErr = errors.Join(cleanupErr, err)
+	}
+	return cleanupErr
+}
+
+func deleteTaskBranchIfUnattached(ctx context.Context, repo, branch string) error {
+	exists, err := localBranchExists(ctx, repo, branch)
+	if err != nil {
+		return fmt.Errorf("inspect rollback task branch: %w", err)
+	}
+	if !exists {
+		return nil
+	}
+	_, attached, err := worktreeState(ctx, repo, "", branch)
+	if err != nil {
+		return fmt.Errorf("inspect rollback branch attachment: %w", err)
+	}
+	if attached {
+		return fmt.Errorf("cannot roll back task branch %q while it is attached", branch)
 	}
 	if _, err := runGit(ctx, repo, "branch", "-D", "--", branch); err != nil {
 		return fmt.Errorf("roll back task branch: %w", err)
@@ -115,11 +169,24 @@ func (m Manager) RunChecks(ctx context.Context, project config.Project, worktree
 }
 
 func runCheck(ctx context.Context, worktree string, check []string) error {
-	cmd := exec.CommandContext(ctx, check[0], check[1:]...)
-	cmd.Dir = worktree
+	result, err := runSubprocess(ctx, worktree, check)
+	if err != nil {
+		return fmt.Errorf("failed: %w: %s", err, result.formattedOutput("check"))
+	}
+	return nil
+}
+
+type subprocessResult struct {
+	output    string
+	truncated bool
+}
+
+func runSubprocess(ctx context.Context, dir string, argv []string) (subprocessResult, error) {
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd.Dir = dir
 	cmd.Env = minimalEnvironment()
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.WaitDelay = checkWaitDelay
+	cmd.WaitDelay = subprocessWaitDelay
 	var output boundedCapture
 	cmd.Stdout = &output
 	cmd.Stderr = &output
@@ -130,17 +197,23 @@ func runCheck(ctx context.Context, worktree string, check []string) error {
 		return killProcessGroup(cmd.Process)
 	}
 	err := cmd.Run()
+	result := subprocessResult{output: strings.TrimSpace(output.String()), truncated: output.truncated}
 	if canceled.Load() {
 		cause := ctx.Err()
 		if cause == nil {
 			cause = context.Canceled
 		}
-		return fmt.Errorf("canceled: %w", cause)
+		return result, fmt.Errorf("canceled: %w", cause)
 	}
-	if err != nil {
-		return fmt.Errorf("failed: %w: %s", err, output.String())
+	return result, err
+}
+
+func (r subprocessResult) formattedOutput(label string) string {
+	output := r.output
+	if r.truncated {
+		output += fmt.Sprintf("\n[%s output truncated after %d bytes]", label, maxSubprocessOutputBytes)
 	}
-	return nil
+	return strings.TrimSpace(output)
 }
 
 type boundedCapture struct {
@@ -150,7 +223,7 @@ type boundedCapture struct {
 
 func (c *boundedCapture) Write(p []byte) (int, error) {
 	written := len(p)
-	remaining := maxCheckOutputBytes - c.buffer.Len()
+	remaining := maxSubprocessOutputBytes - c.buffer.Len()
 	if remaining > 0 {
 		if remaining > len(p) {
 			remaining = len(p)
@@ -164,11 +237,7 @@ func (c *boundedCapture) Write(p []byte) (int, error) {
 }
 
 func (c *boundedCapture) String() string {
-	output := strings.TrimSpace(c.buffer.String())
-	if c.truncated {
-		output += fmt.Sprintf("\n[check output truncated after %d bytes]", maxCheckOutputBytes)
-	}
-	return output
+	return c.buffer.String()
 }
 
 func (m Manager) ValidateCommit(ctx context.Context, prepared Prepared) (string, error) {
@@ -311,6 +380,57 @@ func resolveContained(root, path string, mustExist bool) (string, error) {
 	return resolved, nil
 }
 
+func requireAbsentPath(path string) error {
+	exists, err := pathExists(path)
+	if err != nil {
+		return fmt.Errorf("inspect task worktree path: %w", err)
+	}
+	if exists {
+		return fmt.Errorf("task worktree path %q already exists", path)
+	}
+	return nil
+}
+
+func pathExists(path string) (bool, error) {
+	_, err := os.Lstat(path)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	return false, err
+}
+
+func localBranchExists(ctx context.Context, repo, branch string) (bool, error) {
+	_, err := runGit(ctx, repo, "show-ref", "--verify", "--quiet", "--", "refs/heads/"+branch)
+	if err == nil {
+		return true, nil
+	}
+	var exitErr *exec.ExitError
+	if !errors.Is(err, errOutputTruncated) && errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, err
+}
+
+func worktreeState(ctx context.Context, repo, worktree, branch string) (bool, bool, error) {
+	output, err := runGit(ctx, repo, "worktree", "list", "--porcelain", "-z")
+	if err != nil {
+		return false, false, err
+	}
+	var pathRegistered, branchAttached bool
+	for _, field := range strings.Split(output, "\x00") {
+		if worktree != "" && field == "worktree "+worktree {
+			pathRegistered = true
+		}
+		if field == "branch refs/heads/"+branch {
+			branchAttached = true
+		}
+	}
+	return pathRegistered, branchAttached, nil
+}
+
 func gitCommonDir(ctx context.Context, worktree string) (string, error) {
 	commonDir, err := runGit(ctx, worktree, "rev-parse", "--git-common-dir")
 	if err != nil {
@@ -349,28 +469,27 @@ func remoteBaseRef(ctx context.Context, repo, remote, branch string) (string, er
 }
 
 func isAncestor(ctx context.Context, repo, base, commit string) error {
-	cmd := exec.CommandContext(ctx, "git", "-C", repo, "merge-base", "--is-ancestor", base, commit)
-	cmd.Env = minimalEnvironment()
-	output, err := cmd.CombinedOutput()
+	_, err := runGit(ctx, repo, "merge-base", "--is-ancestor", base, commit)
 	if err == nil {
 		return nil
 	}
 	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+	if !errors.Is(err, errOutputTruncated) && errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
 		return errors.New("task commit is not descended from base")
 	}
-	return fmt.Errorf("verify task ancestry: %w: %s", err, strings.TrimSpace(string(output)))
+	return fmt.Errorf("verify task ancestry: %w", err)
 }
 
 func runGit(ctx context.Context, repo string, args ...string) (string, error) {
-	gitArgs := append([]string{"-C", repo}, args...)
-	cmd := exec.CommandContext(ctx, "git", gitArgs...)
-	cmd.Env = minimalEnvironment()
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(output)))
+	argv := append([]string{"git", "-C", repo}, args...)
+	result, err := runSubprocess(ctx, repo, argv)
+	if result.truncated {
+		err = errors.Join(err, fmt.Errorf("git output exceeded %d bytes: %w", maxSubprocessOutputBytes, errOutputTruncated))
 	}
-	return strings.TrimSpace(string(output)), nil
+	if err != nil {
+		return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, result.formattedOutput("git"))
+	}
+	return result.output, nil
 }
 
 func minimalEnvironment() []string {

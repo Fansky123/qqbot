@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,6 +21,13 @@ const (
 	firstTaskID  = "T-012345ABCDEF"
 	secondTaskID = "T-FEDCBA654321"
 )
+
+func TestMain(m *testing.M) {
+	if filepath.Base(os.Args[0]) == "git" {
+		os.Exit(runGitHelper())
+	}
+	os.Exit(m.Run())
+}
 
 func TestManagerPrepareAndRemove(t *testing.T) {
 	t.Parallel()
@@ -177,22 +185,7 @@ func TestManagerPrepareRejectsNonLiteralRemoteRef(t *testing.T) {
 
 func TestManagerPrepareRollsBackAfterCommonDirCancellation(t *testing.T) {
 	fixture := newGitFixture(t)
-	realGit, err := exec.LookPath("git")
-	if err != nil {
-		t.Fatal(err)
-	}
-	binDir := t.TempDir()
-	marker := filepath.Join(binDir, "common-dir.started")
-	once := filepath.Join(binDir, "common-dir.once")
-	wrapper := filepath.Join(binDir, "git")
-	script := "#!/bin/sh\ncase \"$*\" in\n*'rev-parse --git-common-dir'*)\n" +
-		"  if [ ! -e " + strconv.Quote(once) + " ]; then\n" +
-		"    : > " + strconv.Quote(once) + "\n" +
-		"    : > " + strconv.Quote(marker) + "\n" +
-		"    while :; do :; done\n" +
-		"  fi\n;;\nesac\nexec " + strconv.Quote(realGit) + " \"$@\"\n"
-	writeExecutable(t, wrapper, script)
-	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	helper := setupGitHelper(t, "block-common-dir")
 	manager := Manager{Root: fixture.worktreeRoot}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -206,7 +199,7 @@ func TestManagerPrepareRollsBackAfterCommonDirCancellation(t *testing.T) {
 		prepared, err := manager.Prepare(ctx, fixture.project, firstTaskID)
 		done <- outcome{prepared: prepared, err: err}
 	}()
-	waitForFile(t, marker)
+	waitForFile(t, helper.markerPath)
 	cancel()
 	got := <-done
 	if got.err == nil {
@@ -333,10 +326,8 @@ func TestManagerRunChecksDoesNotInvokeShell(t *testing.T) {
 	}
 	record := filepath.Join(worktree, "record")
 	marker := filepath.Join(worktree, "injected")
-	script := filepath.Join(root, "record-argument")
-	writeExecutable(t, script, "#!/bin/sh\nprintf '%s' \"$1\" > \"$2\"\n")
 	payload := "$(touch " + marker + ")"
-	project := config.Project{Checks: [][]string{{script, payload, record}}}
+	project := config.Project{Checks: [][]string{checkHelperCommand("record-argument", payload, record)}}
 
 	if err := (Manager{Root: root}).RunChecks(context.Background(), project, worktree); err != nil {
 		t.Fatal(err)
@@ -361,11 +352,9 @@ func TestManagerSubprocessesUseMinimalEnvironment(t *testing.T) {
 			t.Fatal(err)
 		}
 		record := filepath.Join(root, "check.env")
-		script := filepath.Join(root, "record-environment")
-		writeExecutable(t, script, "#!/bin/sh\nenv > \"$1\"\n")
 		setSensitiveEnvironment(t)
 
-		project := config.Project{Checks: [][]string{{script, record}}}
+		project := config.Project{Checks: [][]string{checkHelperCommand("record-environment", record)}}
 		if err := (Manager{Root: root}).RunChecks(context.Background(), project, worktree); err != nil {
 			t.Fatal(err)
 		}
@@ -374,21 +363,117 @@ func TestManagerSubprocessesUseMinimalEnvironment(t *testing.T) {
 
 	t.Run("git", func(t *testing.T) {
 		fixture := newGitFixture(t)
-		realGit, err := exec.LookPath("git")
-		if err != nil {
-			t.Fatal(err)
-		}
-		binDir := t.TempDir()
-		record := filepath.Join(binDir, "git.env")
-		wrapper := filepath.Join(binDir, "git")
-		writeExecutable(t, wrapper, "#!/bin/sh\nenv > "+strconv.Quote(record)+"\nexec "+strconv.Quote(realGit)+" \"$@\"\n")
-		t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+		helper := setupGitHelper(t, "record-environment")
 		setSensitiveEnvironment(t)
 
 		if _, err := (Manager{Root: fixture.worktreeRoot}).Prepare(context.Background(), fixture.project, firstTaskID); err != nil {
 			t.Errorf("Prepare() was affected by inherited Git environment: %v", err)
 		}
-		assertMinimalEnvironment(t, record)
+		assertMinimalEnvironment(t, helper.recordPath)
+	})
+}
+
+func TestManagerGitCancellationKillsProcessGroupAndRetainsOutput(t *testing.T) {
+	fixture := newGitFixture(t)
+	helper := setupGitHelper(t, "cancel")
+	t.Cleanup(func() { killProcessFromFile(helper.childPath) })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := (Manager{Root: fixture.worktreeRoot}).Prepare(ctx, fixture.project, firstTaskID)
+		done <- err
+	}()
+	pid := waitForPIDFile(t, helper.childPath)
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Prepare() error = %v, want context canceled", err)
+		}
+		if !strings.Contains(err.Error(), "git-output-before-cancel") {
+			t.Fatalf("Prepare() cancellation error lost Git output: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		killProcessFromFile(helper.childPath)
+		<-done
+		t.Fatal("Prepare remained blocked by Git descendant output")
+	}
+	waitForProcessExit(t, pid)
+}
+
+func TestManagerRejectsTruncatedGitOutput(t *testing.T) {
+	fixture := newGitFixture(t)
+	setupGitHelper(t, "large-output")
+
+	_, err := (Manager{Root: fixture.worktreeRoot}).Prepare(context.Background(), fixture.project, firstTaskID)
+	if err == nil {
+		t.Fatal("Prepare() error = nil, want truncated Git output error")
+	}
+	if !strings.Contains(err.Error(), "[git output truncated after 1048576 bytes]") {
+		t.Fatalf("Prepare() error lacks Git truncation marker: length=%d", len(err.Error()))
+	}
+	if len(err.Error()) > (1<<20)+1024 {
+		t.Fatalf("Prepare() error length = %d, want bounded Git output", len(err.Error()))
+	}
+}
+
+func TestManagerPrepareRollsBackWhenAddReportsFailureAfterSuccess(t *testing.T) {
+	fixture := newGitFixture(t)
+	helper := setupGitHelper(t, "add-success-then-error")
+	manager := Manager{Root: fixture.worktreeRoot}
+
+	if _, err := manager.Prepare(context.Background(), fixture.project, firstTaskID); err == nil {
+		t.Fatal("Prepare() error = nil, want wrapped add failure")
+	}
+	assertTaskArtifactsAbsent(t, fixture, firstTaskID)
+	writeFile(t, helper.modePath, "pass")
+	prepared, err := manager.Prepare(context.Background(), fixture.project, firstTaskID)
+	if err != nil {
+		t.Fatalf("deterministic retry failed: %v", err)
+	}
+	assertWorktree(t, fixture.worktreeRoot, prepared)
+}
+
+func TestManagerPreparePreservesPreexistingExactArtifacts(t *testing.T) {
+	t.Parallel()
+
+	t.Run("branch", func(t *testing.T) {
+		t.Parallel()
+		fixture := newGitFixture(t)
+		branch := "codex/" + firstTaskID
+		git(t, fixture.project.RepoPath, "branch", branch, fixture.mainCommit)
+		before := git(t, fixture.project.RepoPath, "rev-parse", branch)
+
+		if _, err := (Manager{Root: fixture.worktreeRoot}).Prepare(context.Background(), fixture.project, firstTaskID); err == nil {
+			t.Fatal("Prepare() error = nil, want preexisting branch error")
+		}
+		if after := git(t, fixture.project.RepoPath, "rev-parse", branch); after != before {
+			t.Fatalf("preexisting branch changed from %q to %q", before, after)
+		}
+	})
+
+	t.Run("path", func(t *testing.T) {
+		t.Parallel()
+		fixture := newGitFixture(t)
+		worktree := filepath.Join(fixture.worktreeRoot, firstTaskID)
+		if err := os.Mkdir(worktree, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		sentinel := filepath.Join(worktree, "keep.txt")
+		writeFile(t, sentinel, "keep")
+
+		if _, err := (Manager{Root: fixture.worktreeRoot}).Prepare(context.Background(), fixture.project, firstTaskID); err == nil {
+			t.Fatal("Prepare() error = nil, want preexisting path error")
+		}
+		data, err := os.ReadFile(sentinel)
+		if err != nil || string(data) != "keep" {
+			t.Fatalf("preexisting path was changed: data=%q error=%v", data, err)
+		}
+		if branch := git(t, fixture.project.RepoPath, "branch", "--list", "codex/"+firstTaskID); branch != "" {
+			t.Fatalf("failed Prepare created branch for preexisting path: %s", branch)
+		}
 	})
 }
 
@@ -401,15 +486,13 @@ func TestManagerRunChecksCancellationKillsProcessGroup(t *testing.T) {
 		t.Fatal(err)
 	}
 	pidPath := filepath.Join(root, "child.pid")
-	script := filepath.Join(root, "spawn-child")
-	writeExecutable(t, script, "#!/bin/sh\nsleep 60 &\necho $! > \"$1\"\nwait\n")
 	t.Cleanup(func() { killProcessFromFile(pidPath) })
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	done := make(chan error, 1)
 	go func() {
-		project := config.Project{Checks: [][]string{{script, pidPath}}}
+		project := config.Project{Checks: [][]string{checkHelperCommand("spawn-child", pidPath)}}
 		done <- (Manager{Root: root}).RunChecks(ctx, project, worktree)
 	}()
 
@@ -419,6 +502,9 @@ func TestManagerRunChecksCancellationKillsProcessGroup(t *testing.T) {
 	case err := <-done:
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("RunChecks() error = %v, want context canceled", err)
+		}
+		if !strings.Contains(err.Error(), "check-output-before-cancel") {
+			t.Fatalf("RunChecks() cancellation error lost captured output: %v", err)
 		}
 	case <-time.After(2 * time.Second):
 		killProcessFromFile(pidPath)
@@ -431,28 +517,19 @@ func TestManagerRunChecksCancellationKillsProcessGroup(t *testing.T) {
 func TestManagerRunChecksCancellationBoundsDetachedOutput(t *testing.T) {
 	t.Parallel()
 
-	if _, err := exec.LookPath("setsid"); err != nil {
-		t.Skipf("setsid is unavailable: %v", err)
-	}
 	root := t.TempDir()
 	worktree := filepath.Join(root, "worktree")
 	if err := os.Mkdir(worktree, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	pidPath := filepath.Join(root, "detached.pid")
-	fifoPath := filepath.Join(root, "outer.fifo")
-	if err := syscall.Mkfifo(fifoPath, 0o600); err != nil {
-		t.Skipf("cannot create FIFO: %v", err)
-	}
-	script := filepath.Join(root, "retain-output")
-	writeExecutable(t, script, "#!/bin/sh\nsetsid sh -c 'sleep 60' &\necho $! > \"$1\"\nread ignored < \"$2\"\n")
 	t.Cleanup(func() { killProcessFromFile(pidPath) })
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	done := make(chan error, 1)
 	go func() {
-		project := config.Project{Checks: [][]string{{script, pidPath, fifoPath}}}
+		project := config.Project{Checks: [][]string{checkHelperCommand("spawn-detached-child", pidPath)}}
 		done <- (Manager{Root: root}).RunChecks(ctx, project, worktree)
 	}()
 
@@ -478,7 +555,7 @@ func TestManagerRunChecksBoundsFailureOutput(t *testing.T) {
 	if err := os.Mkdir(worktree, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	project := config.Project{Checks: [][]string{{os.Args[0], "-test.run=^TestGitworkCheckHelperProcess$", "--", "large-output"}}}
+	project := config.Project{Checks: [][]string{checkHelperCommand("large-output")}}
 
 	err := (Manager{Root: root}).RunChecks(context.Background(), project, worktree)
 	if err == nil {
@@ -497,15 +574,39 @@ func TestManagerRunChecksBoundsFailureOutput(t *testing.T) {
 }
 
 func TestGitworkCheckHelperProcess(t *testing.T) {
-	if os.Args[len(os.Args)-1] != "large-output" {
+	args := checkHelperArgs()
+	if len(args) == 0 {
 		return
 	}
-	chunk := bytes.Repeat([]byte{'x'}, 32<<10)
-	for range 96 {
-		_, _ = os.Stdout.Write(chunk)
+	switch args[0] {
+	case "record-argument":
+		_ = os.WriteFile(args[2], []byte(args[1]), 0o600)
+	case "record-environment":
+		_ = os.WriteFile(args[1], []byte(strings.Join(os.Environ(), "\n")+"\n"), 0o600)
+	case "large-output":
+		chunk := bytes.Repeat([]byte{'x'}, 32<<10)
+		for range 96 {
+			_, _ = os.Stdout.Write(chunk)
+		}
+		_, _ = os.Stderr.WriteString("TAIL\n")
+		os.Exit(7)
+	case "spawn-child", "spawn-detached-child":
+		childArgs := checkHelperCommand("hold-output")
+		child := exec.Command(childArgs[0], childArgs[1:]...)
+		child.Stdout = os.Stdout
+		child.Stderr = os.Stderr
+		if args[0] == "spawn-detached-child" {
+			child.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+		}
+		if err := child.Start(); err != nil {
+			os.Exit(125)
+		}
+		_ = os.WriteFile(args[1], []byte(strconv.Itoa(child.Process.Pid)), 0o600)
+		_, _ = os.Stdout.WriteString("check-output-before-cancel\n")
+		time.Sleep(time.Hour)
+	case "hold-output":
+		time.Sleep(time.Hour)
 	}
-	_, _ = os.Stderr.WriteString("TAIL\n")
-	os.Exit(7)
 }
 
 func TestManagerRejectsWorktreeOutsideRoot(t *testing.T) {
@@ -603,6 +704,21 @@ func assertWorktree(t *testing.T, root string, prepared Prepared) {
 	}
 }
 
+func assertTaskArtifactsAbsent(t *testing.T, fixture gitFixture, taskID string) {
+	t.Helper()
+	worktree := filepath.Join(fixture.worktreeRoot, taskID)
+	if _, err := os.Stat(worktree); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("task worktree stat error = %v, want not exist", err)
+	}
+	listed := git(t, fixture.project.RepoPath, "worktree", "list", "--porcelain")
+	if strings.Contains(listed, worktree) {
+		t.Errorf("task worktree remains registered:\n%s", listed)
+	}
+	if branch := git(t, fixture.project.RepoPath, "branch", "--list", "codex/"+taskID); branch != "" {
+		t.Errorf("task branch remains: %s", branch)
+	}
+}
+
 func commitChange(t *testing.T, worktree string) {
 	t.Helper()
 
@@ -631,12 +747,162 @@ func writeFile(t *testing.T, path, content string) {
 	}
 }
 
-func writeExecutable(t *testing.T, path, content string) {
-	t.Helper()
+type gitHelperFixture struct {
+	modePath   string
+	markerPath string
+	recordPath string
+	childPath  string
+}
 
-	if err := os.WriteFile(path, []byte(content), 0o700); err != nil {
+func setupGitHelper(t *testing.T, mode string) gitHelperFixture {
+	t.Helper()
+	realGit, err := exec.LookPath("git")
+	if err != nil {
 		t.Fatal(err)
 	}
+	testBinary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	binDir := t.TempDir()
+	helperBinary := filepath.Join(binDir, "git")
+	if err := os.Link(testBinary, helperBinary); err != nil {
+		data, readErr := os.ReadFile(testBinary)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if writeErr := os.WriteFile(helperBinary, data, 0o700); writeErr != nil {
+			t.Fatal(writeErr)
+		}
+	}
+	helper := gitHelperFixture{
+		modePath:   filepath.Join(binDir, "mode"),
+		markerPath: filepath.Join(binDir, "marker"),
+		recordPath: filepath.Join(binDir, "record"),
+		childPath:  filepath.Join(binDir, "child.pid"),
+	}
+	writeFile(t, filepath.Join(binDir, "real-git"), realGit)
+	writeFile(t, helper.modePath, mode)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return helper
+}
+
+func runGitHelper() int {
+	executable, err := os.Executable()
+	if err != nil {
+		return 125
+	}
+	dir := filepath.Dir(executable)
+	if len(os.Args) == 3 && os.Args[1] == "gitwork-hold-output" {
+		_ = os.WriteFile(os.Args[2], []byte(strconv.Itoa(os.Getpid())), 0o600)
+		time.Sleep(time.Hour)
+		return 0
+	}
+	realGitData, err := os.ReadFile(filepath.Join(dir, "real-git"))
+	if err != nil {
+		return 125
+	}
+	modeData, err := os.ReadFile(filepath.Join(dir, "mode"))
+	if err != nil {
+		return 125
+	}
+	realGit := strings.TrimSpace(string(realGitData))
+	mode := strings.TrimSpace(string(modeData))
+	command := gitSubcommand(os.Args[1:])
+
+	switch mode {
+	case "record-environment":
+		_ = os.WriteFile(filepath.Join(dir, "record"), []byte(strings.Join(os.Environ(), "\n")+"\n"), 0o600)
+	case "block-common-dir":
+		if hasArgSequence(os.Args[1:], "rev-parse", "--git-common-dir") {
+			once, createErr := os.OpenFile(filepath.Join(dir, "once"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+			if createErr == nil {
+				_ = once.Close()
+				_ = os.WriteFile(filepath.Join(dir, "marker"), []byte("started"), 0o600)
+				time.Sleep(time.Hour)
+			}
+		}
+	case "cancel":
+		if command == "remote" {
+			pidPath := filepath.Join(dir, "child.pid")
+			child := exec.Command(executable, "gitwork-hold-output", pidPath)
+			child.Stdout = os.Stdout
+			child.Stderr = os.Stderr
+			if err := child.Start(); err != nil {
+				_, _ = fmt.Fprintln(os.Stderr, err)
+				return 125
+			}
+			_, _ = os.Stdout.WriteString("git-output-before-cancel\n")
+			time.Sleep(time.Hour)
+		}
+	case "large-output":
+		if command == "remote" {
+			chunk := bytes.Repeat([]byte{'g'}, 32<<10)
+			for range 96 {
+				_, _ = os.Stdout.Write(chunk)
+			}
+			return 0
+		}
+	case "add-success-then-error":
+		if command == "worktree" && hasArgSequence(os.Args[1:], "worktree", "add") {
+			if exitCode := runRealGit(realGit); exitCode != 0 {
+				return exitCode
+			}
+			return 42
+		}
+	}
+	return runRealGit(realGit)
+}
+
+func runRealGit(realGit string) int {
+	cmd := exec.Command(realGit, os.Args[1:]...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Env = os.Environ()
+	if err := cmd.Run(); err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return exitErr.ExitCode()
+		}
+		_, _ = fmt.Fprintln(os.Stderr, err)
+		return 126
+	}
+	return 0
+}
+
+func gitSubcommand(args []string) string {
+	for i := 0; i < len(args); i++ {
+		if args[i] == "-C" && i+1 < len(args) {
+			i++
+			continue
+		}
+		return args[i]
+	}
+	return ""
+}
+
+func hasArgSequence(args []string, want ...string) bool {
+	for i := 0; i+len(want) <= len(args); i++ {
+		if strings.Join(args[i:i+len(want)], "\x00") == strings.Join(want, "\x00") {
+			return true
+		}
+	}
+	return false
+}
+
+func checkHelperCommand(mode string, args ...string) []string {
+	command := []string{os.Args[0], "-test.run=^TestGitworkCheckHelperProcess$", "--", mode}
+	return append(command, args...)
+}
+
+func checkHelperArgs() []string {
+	for i, arg := range os.Args {
+		if arg == "--" {
+			return os.Args[i+1:]
+		}
+	}
+	return nil
 }
 
 func setSensitiveEnvironment(t *testing.T) {
@@ -709,12 +975,13 @@ func waitForFile(t *testing.T, path string) {
 func waitForProcessExit(t *testing.T, pid int) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
-	for processAlive(pid) && time.Now().Before(deadline) {
+	for time.Now().Before(deadline) {
+		if !processAlive(pid) {
+			return
+		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if processAlive(pid) {
-		t.Fatalf("process %d survived cancellation", pid)
-	}
+	t.Fatalf("process %d survived cancellation", pid)
 }
 
 func processAlive(pid int) bool {
