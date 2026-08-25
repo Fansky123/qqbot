@@ -1,0 +1,420 @@
+package tasksvc
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
+
+	"qqcodex/internal/auth"
+	"qqcodex/internal/codex"
+	"qqcodex/internal/command"
+	"qqcodex/internal/config"
+	"qqcodex/internal/model"
+	"qqcodex/internal/store"
+)
+
+const maxNotificationRunes = 1200
+
+var notificationSecretAssignment = regexp.MustCompile(`(?i)\b[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)\s*=\s*[^\s,;]+`)
+var notificationBearer = regexp.MustCompile(`(?i)\bBearer\s+[^\s,;]+`)
+
+var (
+	errUnauthorized = errors.New("user is not authorized for this group")
+	errTaskAccess   = errors.New("user is not authorized for this task")
+)
+
+// Service translates authenticated group commands into durable task transitions.
+type Service struct {
+	registry   *config.Registry
+	db         *store.Store
+	authorizer auth.Authorizer
+	planner    Planner
+	scheduler  SchedulerControl
+	notifier   Notifier
+	logs       LogReader
+	locks      keyedLocks
+}
+
+func NewService(registry *config.Registry, db *store.Store, authorizer auth.Authorizer, planner Planner, scheduler SchedulerControl, notifier Notifier, logs LogReader) *Service {
+	return &Service{
+		registry:   registry,
+		db:         db,
+		authorizer: authorizer,
+		planner:    planner,
+		scheduler:  scheduler,
+		notifier:   notifier,
+		logs:       logs,
+	}
+}
+
+// TaskID derives the stable task identifier for a OneBot group message.
+func TaskID(groupID, messageID string) string {
+	digest := sha256.Sum256([]byte(groupID + "\x00" + messageID))
+	return fmt.Sprintf("T-%X", digest[:6])
+}
+
+func (s *Service) Handle(ctx context.Context, message Message) error {
+	if s == nil || s.registry == nil || s.db == nil || s.planner == nil || s.scheduler == nil || s.notifier == nil || s.logs == nil {
+		return errors.New("task service is not configured")
+	}
+	if message.GroupID == "" || message.UserID == "" || message.MessageID == "" {
+		return errors.New("message group, user, and ID are required")
+	}
+	if !s.authorizer.AllowedGroup(message.GroupID) || s.authorizer.Role(message.UserID) == auth.RoleNone {
+		return errUnauthorized
+	}
+	parsed, err := command.Parse(message.Text, message.Mentioned)
+	if err != nil {
+		return err
+	}
+	key := message.GroupID + "\x00" + message.MessageID
+	unlock := s.locks.lock(key)
+	defer unlock()
+	taskKey := parsed.TaskID
+	if parsed.Kind == command.KindCreate {
+		taskKey = TaskID(message.GroupID, message.MessageID)
+	}
+	unlockTask := s.locks.lock("task\x00" + taskKey)
+	defer unlockTask()
+
+	processed, err := s.db.MessageProcessed(ctx, key)
+	if err != nil {
+		return err
+	}
+	if processed {
+		if parsed.Kind == command.KindCreate {
+			return s.notifyExisting(ctx, message.GroupID, TaskID(message.GroupID, message.MessageID))
+		}
+		return nil
+	}
+
+	switch parsed.Kind {
+	case command.KindCreate:
+		return s.create(ctx, message, parsed, key)
+	case command.KindConfirm:
+		return s.confirm(ctx, message, parsed, key)
+	case command.KindSupplement:
+		return s.supplement(ctx, message, parsed, key)
+	case command.KindCancel:
+		return s.cancel(ctx, message, parsed, key)
+	case command.KindStatus:
+		return s.status(ctx, message, parsed, key)
+	case command.KindLog:
+		return s.log(ctx, message, parsed, key)
+	case command.KindApproveMerge:
+		return errors.New("merge approval is not available yet")
+	case command.KindApproveDeploy:
+		return errors.New("deploy approval is not available yet")
+	default:
+		return errors.New("unsupported command")
+	}
+}
+
+func (s *Service) create(ctx context.Context, message Message, parsed command.Command, key string) error {
+	project, ok := s.registry.Project(parsed.ProjectAlias)
+	if !ok {
+		return fmt.Errorf("unknown project alias %q", parsed.ProjectAlias)
+	}
+	id := TaskID(message.GroupID, message.MessageID)
+	now := time.Now().UTC()
+	task := &model.Task{
+		ID: id, ProjectID: project.ID, GroupID: message.GroupID, CreatorID: message.UserID,
+		Requirement: parsed.Body, Status: model.StatusDraft, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := s.db.CreateTask(ctx, task); err != nil {
+		if existing, getErr := s.db.GetTask(ctx, id); getErr == nil {
+			if existing.GroupID != message.GroupID {
+				return errors.New("task identifier collision")
+			}
+			if existing.CreatorID != message.UserID {
+				return errTaskAccess
+			}
+			if recordErr := s.record(ctx, message, key, existing.ID, "create", "existing task"); recordErr != nil {
+				return recordErr
+			}
+			return s.notifyExisting(ctx, message.GroupID, existing.ID)
+		}
+		return err
+	}
+
+	result, planErr := s.planner.Plan(ctx, codex.Request{
+		TaskID: id, WorkingDir: project.RepoPath,
+		Prompt:  codex.PlanningPrompt(project.ID, parsed.Body, project.Checks),
+		Timeout: time.Duration(project.CodexTimeoutSeconds) * time.Second,
+	})
+	if planErr != nil {
+		task.Status = model.StatusFailed
+		task.Failure = "planning failed"
+		task.UpdatedAt = time.Now().UTC()
+		if saveErr := s.db.SaveTask(ctx, task, task.Version); saveErr != nil {
+			return errors.Join(planErr, saveErr)
+		}
+		if recordErr := s.record(ctx, message, key, task.ID, "create", "planning failed"); recordErr != nil {
+			return errors.Join(planErr, recordErr)
+		}
+		_ = s.notifier.Send(ctx, message.GroupID, "任务 #"+id+" 规划失败，请查看本地日志")
+		return planErr
+	}
+
+	plan, err := codex.ParsePlan(result.Final)
+	if err != nil {
+		task.Status = model.StatusFailed
+		task.Failure = "invalid planning result"
+		task.UpdatedAt = time.Now().UTC()
+		if saveErr := s.db.SaveTask(ctx, task, task.Version); saveErr != nil {
+			return errors.Join(err, saveErr)
+		}
+		if recordErr := s.record(ctx, message, key, task.ID, "create", "invalid planning result"); recordErr != nil {
+			return errors.Join(err, recordErr)
+		}
+		_ = s.notifier.Send(ctx, message.GroupID, "任务 #"+id+" 规划结果无效，请查看本地日志")
+		return err
+	}
+
+	planJSON, err := json.Marshal(plan)
+	if err != nil {
+		return fmt.Errorf("encode task plan: %w", err)
+	}
+	task.Plan = string(planJSON)
+	task.Summary = bound(plan.Summary)
+	task.Status = model.StatusAwaitingConfirmation
+	task.UpdatedAt = time.Now().UTC()
+	if err := s.db.SaveTask(ctx, task, task.Version); err != nil {
+		return err
+	}
+	if err := s.record(ctx, message, key, task.ID, "create", "awaiting confirmation"); err != nil {
+		return err
+	}
+	return s.notifier.Send(ctx, message.GroupID, confirmation(task, plan))
+}
+
+func (s *Service) confirm(ctx context.Context, message Message, parsed command.Command, key string) error {
+	task, err := s.loadOperable(ctx, message, parsed.TaskID)
+	if err != nil {
+		return err
+	}
+	if task.Status != model.StatusAwaitingConfirmation {
+		return fmt.Errorf("task %s cannot be confirmed from %s", task.ID, task.Status)
+	}
+	if err := s.transition(task, model.StatusQueued); err != nil {
+		return err
+	}
+	if err := s.db.SaveTask(ctx, task, task.Version); err != nil {
+		return err
+	}
+	if err := s.record(ctx, message, key, task.ID, "confirmation", "queued"); err != nil {
+		return err
+	}
+	s.scheduler.Wake()
+	return s.notifier.Send(ctx, message.GroupID, "任务 #"+task.ID+" 已确认并排队")
+}
+
+func (s *Service) supplement(ctx context.Context, message Message, parsed command.Command, key string) error {
+	task, err := s.loadOperable(ctx, message, parsed.TaskID)
+	if err != nil {
+		return err
+	}
+	if task.Status != model.StatusAwaitingConfirmation && task.Status != model.StatusBlocked && task.Status != model.StatusAwaitingMergeApproval {
+		return fmt.Errorf("task %s cannot accept supplement from %s", task.ID, task.Status)
+	}
+	task.Requirement = strings.TrimSpace(task.Requirement + "\n\n补充：" + parsed.Body)
+	wake := false
+	detail := "supplemented"
+	if task.Status == model.StatusBlocked || task.Status == model.StatusAwaitingMergeApproval {
+		if err := s.transition(task, model.StatusQueued); err != nil {
+			return err
+		}
+		task.TaskCommit, task.RCCommit = "", ""
+		if err := s.db.InvalidateApprovals(ctx, task.ID, "merge", "superseded_by_new_commit"); err != nil {
+			return err
+		}
+		wake = true
+		detail = "supplemented and queued"
+	}
+	task.UpdatedAt = time.Now().UTC()
+	version := task.Version
+	if err := s.db.SaveTask(ctx, task, version); err != nil {
+		return err
+	}
+	if err := s.record(ctx, message, key, task.ID, "supplement", detail); err != nil {
+		return err
+	}
+	if wake {
+		s.scheduler.Wake()
+	}
+	return s.notifier.Send(ctx, message.GroupID, "任务 #"+task.ID+" 已记录补充内容")
+}
+
+func (s *Service) cancel(ctx context.Context, message Message, parsed command.Command, key string) error {
+	task, err := s.loadOperable(ctx, message, parsed.TaskID)
+	if err != nil {
+		return err
+	}
+	if task.Status == model.StatusMerged || task.Status == model.StatusAwaitingDeployApproval || task.Status == model.StatusDeploying || task.Status == model.StatusDeployed || task.Status == model.StatusDeployFailed {
+		return fmt.Errorf("task %s cannot be cancelled after merge", task.ID)
+	}
+	if !model.CanTransition(task.Status, model.StatusCancelled) {
+		return fmt.Errorf("task %s cannot be cancelled from %s", task.ID, task.Status)
+	}
+	running := task.Status == model.StatusRunning || task.Status == model.StatusChecking
+	if err := s.transition(task, model.StatusCancelled); err != nil {
+		return err
+	}
+	if err := s.db.SaveTask(ctx, task, task.Version); err != nil {
+		return err
+	}
+	if err := s.record(ctx, message, key, task.ID, "cancel", "cancelled"); err != nil {
+		return err
+	}
+	if running {
+		s.scheduler.Cancel(task.ID)
+	}
+	return s.notifier.Send(ctx, message.GroupID, "任务 #"+task.ID+" 已取消")
+}
+
+func (s *Service) status(ctx context.Context, message Message, parsed command.Command, key string) error {
+	task, err := s.loadOperable(ctx, message, parsed.TaskID)
+	if err != nil {
+		return err
+	}
+	if err := s.record(ctx, message, key, task.ID, "status", "status viewed"); err != nil {
+		return err
+	}
+	return s.notifier.Send(ctx, message.GroupID, statusText(task))
+}
+
+func (s *Service) log(ctx context.Context, message Message, parsed command.Command, key string) error {
+	task, err := s.loadOperable(ctx, message, parsed.TaskID)
+	if err != nil {
+		return err
+	}
+	text, err := s.logs.Summary(task.ID, maxNotificationRunes-80)
+	if err != nil {
+		return err
+	}
+	if err := s.record(ctx, message, key, task.ID, "log", "log viewed"); err != nil {
+		return err
+	}
+	return s.notifier.Send(ctx, message.GroupID, bound("任务 #"+task.ID+" 日志摘要：\n"+text))
+}
+
+func (s *Service) loadOperable(ctx context.Context, message Message, id string) (*model.Task, error) {
+	task, err := s.loadTask(ctx, message, id)
+	if err != nil {
+		return nil, err
+	}
+	if !s.authorizer.CanOperate(message.UserID, task.CreatorID) {
+		return nil, errTaskAccess
+	}
+	return task, nil
+}
+
+func (s *Service) loadTask(ctx context.Context, message Message, id string) (*model.Task, error) {
+	task, err := s.db.GetTask(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if task.GroupID != message.GroupID {
+		return nil, errTaskAccess
+	}
+	return task, nil
+}
+
+func (s *Service) transition(task *model.Task, next model.Status) error {
+	if !model.CanTransition(task.Status, next) {
+		return fmt.Errorf("invalid task transition %s -> %s", task.Status, next)
+	}
+	task.Status = next
+	task.UpdatedAt = time.Now().UTC()
+	return nil
+}
+
+func (s *Service) record(ctx context.Context, message Message, key, taskID, kind, detail string) error {
+	now := time.Now().UTC()
+	if err := s.db.AppendInput(ctx, model.Input{TaskID: taskID, Kind: kind, UserID: message.UserID, GroupID: message.GroupID, MessageID: message.MessageID, Body: message.Text, CreatedAt: now}); err != nil {
+		return err
+	}
+	if err := s.db.AppendAudit(ctx, taskID, kind, bound(detail), now); err != nil {
+		return err
+	}
+	return s.db.MarkMessageProcessed(ctx, key, now)
+}
+
+func (s *Service) notifyExisting(ctx context.Context, groupID, id string) error {
+	task, err := s.db.GetTask(ctx, id)
+	if err != nil {
+		return err
+	}
+	return s.notifier.Send(ctx, groupID, bound("任务 #"+task.ID+" 已存在，当前状态："+string(task.Status)))
+}
+
+func confirmation(task *model.Task, plan codex.Plan) string {
+	return bound(fmt.Sprintf("任务 #%s 规划完成\n项目：%s\n摘要：%s\n范围：%s\n检查：%s\n风险：%s\n请回复：确认 #%s", task.ID, task.ProjectID, plan.Summary, strings.Join(plan.Scope, "、"), strings.Join(plan.Checks, "、"), strings.Join(plan.Risks, "、"), task.ID))
+}
+
+func statusText(task *model.Task) string {
+	parts := []string{"任务 #" + task.ID, "项目：" + task.ProjectID, "状态：" + string(task.Status)}
+	if task.Summary != "" {
+		parts = append(parts, "摘要："+task.Summary)
+	}
+	if task.TaskCommit != "" {
+		parts = append(parts, "任务提交："+task.TaskCommit)
+	}
+	if task.RCCommit != "" {
+		parts = append(parts, "RC 提交："+task.RCCommit)
+	}
+	if task.Failure != "" {
+		parts = append(parts, "失败原因："+task.Failure)
+	}
+	return bound(strings.Join(parts, "\n"))
+}
+
+func bound(text string) string {
+	text = notificationSecretAssignment.ReplaceAllString(text, "[REDACTED]")
+	text = notificationBearer.ReplaceAllString(text, "Bearer [REDACTED]")
+	runes := []rune(text)
+	if len(runes) > maxNotificationRunes {
+		return string(runes[:maxNotificationRunes-1]) + "…"
+	}
+	return text
+}
+
+type keyedLocks struct {
+	mu sync.Mutex
+	m  map[string]*keyLock
+}
+
+type keyLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+func (l *keyedLocks) lock(key string) func() {
+	l.mu.Lock()
+	if l.m == nil {
+		l.m = make(map[string]*keyLock)
+	}
+	entry := l.m[key]
+	if entry == nil {
+		entry = &keyLock{}
+		l.m[key] = entry
+	}
+	entry.refs++
+	l.mu.Unlock()
+	entry.mu.Lock()
+	return func() {
+		entry.mu.Unlock()
+		l.mu.Lock()
+		entry.refs--
+		if entry.refs == 0 {
+			delete(l.m, key)
+		}
+		l.mu.Unlock()
+	}
+}
