@@ -1,6 +1,7 @@
 package gitwork
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -9,6 +10,9 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync/atomic"
+	"syscall"
+	"time"
 
 	"qqcodex/internal/config"
 )
@@ -17,6 +21,12 @@ var (
 	taskIDPattern = regexp.MustCompile(`^T-[A-F0-9]{12}$`)
 	branchPattern = regexp.MustCompile(`^codex/T-[A-F0-9]{12}$`)
 	commitPattern = regexp.MustCompile(`^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$`)
+)
+
+const (
+	checkWaitDelay         = time.Second
+	prepareRollbackTimeout = 5 * time.Second
+	maxCheckOutputBytes    = 1 << 20
 )
 
 type Prepared struct {
@@ -59,8 +69,8 @@ func (m Manager) Prepare(ctx context.Context, project config.Project, taskID str
 
 	commonDir, err := gitCommonDir(ctx, worktree)
 	if err != nil {
-		_, removeErr := runGit(ctx, repo, "worktree", "remove", worktree)
-		return Prepared{}, errors.Join(fmt.Errorf("resolve Git common directory: %w", err), removeErr)
+		rollbackErr := rollbackPreparedWorktree(repo, worktree, branch)
+		return Prepared{}, errors.Join(fmt.Errorf("resolve Git common directory: %w", err), rollbackErr)
 	}
 
 	return Prepared{
@@ -69,6 +79,18 @@ func (m Manager) Prepare(ctx context.Context, project config.Project, taskID str
 		BaseCommit:   baseCommit,
 		GitCommonDir: commonDir,
 	}, nil
+}
+
+func rollbackPreparedWorktree(repo, worktree, branch string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), prepareRollbackTimeout)
+	defer cancel()
+	if _, err := runGit(ctx, repo, "worktree", "remove", "--force", worktree); err != nil {
+		return fmt.Errorf("roll back worktree: %w", err)
+	}
+	if _, err := runGit(ctx, repo, "branch", "-D", "--", branch); err != nil {
+		return fmt.Errorf("roll back task branch: %w", err)
+	}
+	return nil
 }
 
 func (m Manager) RunChecks(ctx context.Context, project config.Project, worktree string) error {
@@ -85,14 +107,68 @@ func (m Manager) RunChecks(ctx context.Context, project config.Project, worktree
 		if len(check) == 0 || check[0] == "" {
 			return fmt.Errorf("check %d has no executable", i+1)
 		}
-		cmd := exec.CommandContext(ctx, check[0], check[1:]...)
-		cmd.Dir = worktree
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("check %d failed: %w: %s", i+1, err, strings.TrimSpace(string(output)))
+		if err := runCheck(ctx, worktree, check); err != nil {
+			return fmt.Errorf("check %d: %w", i+1, err)
 		}
 	}
 	return nil
+}
+
+func runCheck(ctx context.Context, worktree string, check []string) error {
+	cmd := exec.CommandContext(ctx, check[0], check[1:]...)
+	cmd.Dir = worktree
+	cmd.Env = minimalEnvironment()
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.WaitDelay = checkWaitDelay
+	var output boundedCapture
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+
+	var canceled atomic.Bool
+	cmd.Cancel = func() error {
+		canceled.Store(true)
+		return killProcessGroup(cmd.Process)
+	}
+	err := cmd.Run()
+	if canceled.Load() {
+		cause := ctx.Err()
+		if cause == nil {
+			cause = context.Canceled
+		}
+		return fmt.Errorf("canceled: %w", cause)
+	}
+	if err != nil {
+		return fmt.Errorf("failed: %w: %s", err, output.String())
+	}
+	return nil
+}
+
+type boundedCapture struct {
+	buffer    bytes.Buffer
+	truncated bool
+}
+
+func (c *boundedCapture) Write(p []byte) (int, error) {
+	written := len(p)
+	remaining := maxCheckOutputBytes - c.buffer.Len()
+	if remaining > 0 {
+		if remaining > len(p) {
+			remaining = len(p)
+		}
+		_, _ = c.buffer.Write(p[:remaining])
+	}
+	if remaining < len(p) {
+		c.truncated = true
+	}
+	return written, nil
+}
+
+func (c *boundedCapture) String() string {
+	output := strings.TrimSpace(c.buffer.String())
+	if c.truncated {
+		output += fmt.Sprintf("\n[check output truncated after %d bytes]", maxCheckOutputBytes)
+	}
+	return output
 }
 
 func (m Manager) ValidateCommit(ctx context.Context, prepared Prepared) (string, error) {
@@ -142,7 +218,7 @@ func (m Manager) ValidateCommit(ctx context.Context, prepared Prepared) (string,
 	if err != nil {
 		return "", fmt.Errorf("resolve task commit: %w", err)
 	}
-	if commit == prepared.BaseCommit {
+	if strings.EqualFold(commit, prepared.BaseCommit) {
 		return "", errors.New("task has no new commits")
 	}
 	if err := isAncestor(ctx, worktree, prepared.BaseCommit, commit); err != nil {
@@ -274,6 +350,7 @@ func remoteBaseRef(ctx context.Context, repo, remote, branch string) (string, er
 
 func isAncestor(ctx context.Context, repo, base, commit string) error {
 	cmd := exec.CommandContext(ctx, "git", "-C", repo, "merge-base", "--is-ancestor", base, commit)
+	cmd.Env = minimalEnvironment()
 	output, err := cmd.CombinedOutput()
 	if err == nil {
 		return nil
@@ -288,9 +365,31 @@ func isAncestor(ctx context.Context, repo, base, commit string) error {
 func runGit(ctx context.Context, repo string, args ...string) (string, error) {
 	gitArgs := append([]string{"-C", repo}, args...)
 	cmd := exec.CommandContext(ctx, "git", gitArgs...)
+	cmd.Env = minimalEnvironment()
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(output)))
 	}
 	return strings.TrimSpace(string(output)), nil
+}
+
+func minimalEnvironment() []string {
+	var env []string
+	for _, name := range []string{"PATH", "HOME", "LANG", "TMPDIR", "TMP", "TEMP"} {
+		if value, ok := os.LookupEnv(name); ok {
+			env = append(env, name+"="+value)
+		}
+	}
+	return env
+}
+
+func killProcessGroup(process *os.Process) error {
+	if process == nil {
+		return os.ErrProcessDone
+	}
+	err := syscall.Kill(-process.Pid, syscall.SIGKILL)
+	if errors.Is(err, syscall.ESRCH) {
+		return os.ErrProcessDone
+	}
+	return err
 }

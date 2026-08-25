@@ -1,12 +1,17 @@
 package gitwork
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"qqcodex/internal/config"
 )
@@ -170,6 +175,64 @@ func TestManagerPrepareRejectsNonLiteralRemoteRef(t *testing.T) {
 	}
 }
 
+func TestManagerPrepareRollsBackAfterCommonDirCancellation(t *testing.T) {
+	fixture := newGitFixture(t)
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	binDir := t.TempDir()
+	marker := filepath.Join(binDir, "common-dir.started")
+	once := filepath.Join(binDir, "common-dir.once")
+	wrapper := filepath.Join(binDir, "git")
+	script := "#!/bin/sh\ncase \"$*\" in\n*'rev-parse --git-common-dir'*)\n" +
+		"  if [ ! -e " + strconv.Quote(once) + " ]; then\n" +
+		"    : > " + strconv.Quote(once) + "\n" +
+		"    : > " + strconv.Quote(marker) + "\n" +
+		"    while :; do :; done\n" +
+		"  fi\n;;\nesac\nexec " + strconv.Quote(realGit) + " \"$@\"\n"
+	writeExecutable(t, wrapper, script)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	manager := Manager{Root: fixture.worktreeRoot}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	type outcome struct {
+		prepared Prepared
+		err      error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		prepared, err := manager.Prepare(ctx, fixture.project, firstTaskID)
+		done <- outcome{prepared: prepared, err: err}
+	}()
+	waitForFile(t, marker)
+	cancel()
+	got := <-done
+	if got.err == nil {
+		t.Fatal("Prepare() error = nil, want canceled common-dir error")
+	}
+
+	worktree := filepath.Join(fixture.worktreeRoot, firstTaskID)
+	if _, err := os.Stat(worktree); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("rolled-back worktree stat error = %v, want not exist", err)
+	}
+	listed := git(t, fixture.project.RepoPath, "worktree", "list", "--porcelain")
+	if strings.Contains(listed, worktree) {
+		t.Errorf("rolled-back worktree remains registered:\n%s", listed)
+	}
+	branch := "codex/" + firstTaskID
+	if got := git(t, fixture.project.RepoPath, "branch", "--list", branch); got != "" {
+		t.Errorf("rolled-back branch still exists: %s", got)
+	}
+
+	prepared, err := manager.Prepare(context.Background(), fixture.project, firstTaskID)
+	if err != nil {
+		t.Fatalf("deterministic retry failed: %v", err)
+	}
+	assertWorktree(t, fixture.worktreeRoot, prepared)
+}
+
 func TestManagerValidateCommit(t *testing.T) {
 	t.Parallel()
 
@@ -244,6 +307,22 @@ func TestManagerValidateCommit(t *testing.T) {
 	}
 }
 
+func TestManagerValidateCommitComparesHashesCaseInsensitively(t *testing.T) {
+	t.Parallel()
+
+	fixture := newGitFixture(t)
+	manager := Manager{Root: fixture.worktreeRoot}
+	prepared, err := manager.Prepare(context.Background(), fixture.project, firstTaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared.BaseCommit = strings.ToUpper(prepared.BaseCommit)
+
+	if _, err := manager.ValidateCommit(context.Background(), prepared); err == nil || !strings.Contains(err.Error(), "no new commits") {
+		t.Fatalf("ValidateCommit() error = %v, want no new commits", err)
+	}
+}
+
 func TestManagerRunChecksDoesNotInvokeShell(t *testing.T) {
 	t.Parallel()
 
@@ -272,6 +351,161 @@ func TestManagerRunChecksDoesNotInvokeShell(t *testing.T) {
 	if _, err := os.Stat(marker); !os.IsNotExist(err) {
 		t.Fatalf("shell payload marker stat error = %v, want not exist", err)
 	}
+}
+
+func TestManagerSubprocessesUseMinimalEnvironment(t *testing.T) {
+	t.Run("configured check", func(t *testing.T) {
+		root := t.TempDir()
+		worktree := filepath.Join(root, "worktree")
+		if err := os.Mkdir(worktree, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		record := filepath.Join(root, "check.env")
+		script := filepath.Join(root, "record-environment")
+		writeExecutable(t, script, "#!/bin/sh\nenv > \"$1\"\n")
+		setSensitiveEnvironment(t)
+
+		project := config.Project{Checks: [][]string{{script, record}}}
+		if err := (Manager{Root: root}).RunChecks(context.Background(), project, worktree); err != nil {
+			t.Fatal(err)
+		}
+		assertMinimalEnvironment(t, record)
+	})
+
+	t.Run("git", func(t *testing.T) {
+		fixture := newGitFixture(t)
+		realGit, err := exec.LookPath("git")
+		if err != nil {
+			t.Fatal(err)
+		}
+		binDir := t.TempDir()
+		record := filepath.Join(binDir, "git.env")
+		wrapper := filepath.Join(binDir, "git")
+		writeExecutable(t, wrapper, "#!/bin/sh\nenv > "+strconv.Quote(record)+"\nexec "+strconv.Quote(realGit)+" \"$@\"\n")
+		t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+		setSensitiveEnvironment(t)
+
+		if _, err := (Manager{Root: fixture.worktreeRoot}).Prepare(context.Background(), fixture.project, firstTaskID); err != nil {
+			t.Errorf("Prepare() was affected by inherited Git environment: %v", err)
+		}
+		assertMinimalEnvironment(t, record)
+	})
+}
+
+func TestManagerRunChecksCancellationKillsProcessGroup(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	worktree := filepath.Join(root, "worktree")
+	if err := os.Mkdir(worktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	pidPath := filepath.Join(root, "child.pid")
+	script := filepath.Join(root, "spawn-child")
+	writeExecutable(t, script, "#!/bin/sh\nsleep 60 &\necho $! > \"$1\"\nwait\n")
+	t.Cleanup(func() { killProcessFromFile(pidPath) })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		project := config.Project{Checks: [][]string{{script, pidPath}}}
+		done <- (Manager{Root: root}).RunChecks(ctx, project, worktree)
+	}()
+
+	pid := waitForPIDFile(t, pidPath)
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("RunChecks() error = %v, want context canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		killProcessFromFile(pidPath)
+		<-done
+		t.Fatal("RunChecks did not return after cancellation")
+	}
+	waitForProcessExit(t, pid)
+}
+
+func TestManagerRunChecksCancellationBoundsDetachedOutput(t *testing.T) {
+	t.Parallel()
+
+	if _, err := exec.LookPath("setsid"); err != nil {
+		t.Skipf("setsid is unavailable: %v", err)
+	}
+	root := t.TempDir()
+	worktree := filepath.Join(root, "worktree")
+	if err := os.Mkdir(worktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	pidPath := filepath.Join(root, "detached.pid")
+	fifoPath := filepath.Join(root, "outer.fifo")
+	if err := syscall.Mkfifo(fifoPath, 0o600); err != nil {
+		t.Skipf("cannot create FIFO: %v", err)
+	}
+	script := filepath.Join(root, "retain-output")
+	writeExecutable(t, script, "#!/bin/sh\nsetsid sh -c 'sleep 60' &\necho $! > \"$1\"\nread ignored < \"$2\"\n")
+	t.Cleanup(func() { killProcessFromFile(pidPath) })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		project := config.Project{Checks: [][]string{{script, pidPath, fifoPath}}}
+		done <- (Manager{Root: root}).RunChecks(ctx, project, worktree)
+	}()
+
+	waitForPIDFile(t, pidPath)
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("RunChecks() error = %v, want context canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		killProcessFromFile(pidPath)
+		<-done
+		t.Fatal("RunChecks remained blocked by detached process output")
+	}
+}
+
+func TestManagerRunChecksBoundsFailureOutput(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	worktree := filepath.Join(root, "worktree")
+	if err := os.Mkdir(worktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	project := config.Project{Checks: [][]string{{os.Args[0], "-test.run=^TestGitworkCheckHelperProcess$", "--", "large-output"}}}
+
+	err := (Manager{Root: root}).RunChecks(context.Background(), project, worktree)
+	if err == nil {
+		t.Fatal("RunChecks() error = nil, want failed check error")
+	}
+	message := err.Error()
+	if !strings.Contains(message, "[check output truncated after 1048576 bytes]") {
+		t.Fatalf("RunChecks() error lacks truncation marker: length=%d", len(message))
+	}
+	if len(message) > (1<<20)+512 {
+		t.Fatalf("RunChecks() error length = %d, want bounded output", len(message))
+	}
+	if !strings.Contains(message, strings.Repeat("x", 64)) {
+		t.Fatal("RunChecks() error did not retain initial output")
+	}
+}
+
+func TestGitworkCheckHelperProcess(t *testing.T) {
+	if os.Args[len(os.Args)-1] != "large-output" {
+		return
+	}
+	chunk := bytes.Repeat([]byte{'x'}, 32<<10)
+	for range 96 {
+		_, _ = os.Stdout.Write(chunk)
+	}
+	_, _ = os.Stderr.WriteString("TAIL\n")
+	os.Exit(7)
 }
 
 func TestManagerRejectsWorktreeOutsideRoot(t *testing.T) {
@@ -402,5 +636,107 @@ func writeExecutable(t *testing.T, path, content string) {
 
 	if err := os.WriteFile(path, []byte(content), 0o700); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func setSensitiveEnvironment(t *testing.T) {
+	t.Helper()
+	for name, value := range map[string]string{
+		"CODEX_API_KEY":       "codex-secret",
+		"NAPCAT_ACCESS_TOKEN": "napcat-secret",
+		"QQCODEX_TEST_SECRET": "arbitrary-secret",
+		"GIT_DIR":             filepath.Join(t.TempDir(), "wrong.git"),
+		"GIT_WORK_TREE":       t.TempDir(),
+		"GIT_CONFIG_COUNT":    "1",
+		"GIT_CONFIG_KEY_0":    "core.bare",
+		"GIT_CONFIG_VALUE_0":  "true",
+		"GIT_SSH_COMMAND":     "false",
+	} {
+		t.Setenv(name, value)
+	}
+}
+
+func assertMinimalEnvironment(t *testing.T, path string) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	environment := string(data)
+	for _, name := range []string{
+		"CODEX_API_KEY", "NAPCAT_ACCESS_TOKEN", "QQCODEX_TEST_SECRET",
+		"GIT_DIR", "GIT_WORK_TREE", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0",
+		"GIT_CONFIG_VALUE_0", "GIT_SSH_COMMAND",
+	} {
+		if strings.Contains(environment, name+"=") {
+			t.Errorf("subprocess environment contains %s", name)
+		}
+	}
+	if !strings.Contains(environment, "PATH="+os.Getenv("PATH")+"\n") {
+		t.Errorf("subprocess environment did not preserve PATH:\n%s", environment)
+	}
+}
+
+func waitForPIDFile(t *testing.T, path string) int {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+			if err == nil && pid > 0 {
+				return pid
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("PID file %q was not written", path)
+	return 0
+}
+
+func waitForFile(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("file %q was not created", path)
+}
+
+func waitForProcessExit(t *testing.T, pid int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for processAlive(pid) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if processAlive(pid) {
+		t.Fatalf("process %d survived cancellation", pid)
+	}
+}
+
+func processAlive(pid int) bool {
+	data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
+	if errors.Is(err, os.ErrNotExist) {
+		return false
+	}
+	if err != nil {
+		return syscall.Kill(pid, 0) == nil
+	}
+	fields := strings.Fields(string(data))
+	return len(fields) < 3 || fields[2] != "Z"
+}
+
+func killProcessFromFile(path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err == nil {
+		_ = syscall.Kill(-pid, syscall.SIGKILL)
+		_ = syscall.Kill(pid, syscall.SIGKILL)
 	}
 }
