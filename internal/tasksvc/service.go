@@ -46,10 +46,16 @@ type Service struct {
 	scheduler  SchedulerControl
 	notifier   Notifier
 	logs       LogReader
+	redactor   textRedactor
 	locks      keyedLocks
 }
 
+type textRedactor interface {
+	RedactText(string) string
+}
+
 func NewService(registry *config.Registry, db *store.Store, authorizer auth.Authorizer, planner Planner, scheduler SchedulerControl, notifier Notifier, logs LogReader) *Service {
+	redactor, _ := logs.(textRedactor)
 	return &Service{
 		registry:   registry,
 		db:         db,
@@ -58,6 +64,7 @@ func NewService(registry *config.Registry, db *store.Store, authorizer auth.Auth
 		scheduler:  scheduler,
 		notifier:   notifier,
 		logs:       logs,
+		redactor:   redactor,
 	}
 }
 
@@ -71,7 +78,7 @@ func (s *Service) Handle(ctx context.Context, message Message) error {
 	if ctx == nil {
 		return errors.New("context is required")
 	}
-	if s == nil || s.registry == nil || s.db == nil || s.planner == nil || s.scheduler == nil || s.notifier == nil || s.logs == nil {
+	if s == nil || s.registry == nil || s.db == nil || s.planner == nil || s.scheduler == nil || s.notifier == nil || s.logs == nil || s.redactor == nil {
 		return errors.New("task service is not configured")
 	}
 	if message.GroupID == "" || message.UserID == "" || message.MessageID == "" {
@@ -175,7 +182,7 @@ func (s *Service) create(ctx context.Context, message Message, parsed command.Co
 		if recordErr := s.commitMutation(ctx, message, key, task, task.Version, "create", "planning failed"); recordErr != nil {
 			return errors.Join(planErr, recordErr)
 		}
-		_ = s.notifier.Send(ctx, message.GroupID, "任务 #"+id+" 规划失败，请查看本地日志")
+		_ = s.send(ctx, message.GroupID, "任务 #"+id+" 规划失败，请查看本地日志")
 		return planErr
 	}
 
@@ -199,7 +206,7 @@ func (s *Service) create(ctx context.Context, message Message, parsed command.Co
 		if recordErr := s.commitMutation(ctx, message, key, task, task.Version, "create", "invalid planning result"); recordErr != nil {
 			return errors.Join(err, recordErr)
 		}
-		_ = s.notifier.Send(ctx, message.GroupID, "任务 #"+id+" 规划结果无效，请查看本地日志")
+		_ = s.send(ctx, message.GroupID, "任务 #"+id+" 规划结果无效，请查看本地日志")
 		return err
 	}
 	if err := validatePlan(plan); err != nil {
@@ -212,6 +219,7 @@ func (s *Service) create(ctx context.Context, message Message, parsed command.Co
 		}
 		return err
 	}
+	plan = s.sanitizePlan(plan)
 
 	planJSON, err := json.Marshal(plan)
 	if err != nil {
@@ -225,7 +233,7 @@ func (s *Service) create(ctx context.Context, message Message, parsed command.Co
 	if err := s.commitMutation(ctx, message, key, task, task.Version, "create", "awaiting confirmation"); err != nil {
 		return err
 	}
-	return s.notifier.Send(ctx, message.GroupID, confirmation(task, plan))
+	return s.send(ctx, message.GroupID, s.confirmation(task, plan))
 }
 
 func (s *Service) confirm(ctx context.Context, message Message, parsed command.Command, key string) error {
@@ -247,7 +255,7 @@ func (s *Service) confirm(ctx context.Context, message Message, parsed command.C
 		return err
 	}
 	s.scheduler.Wake()
-	return s.notifier.Send(ctx, message.GroupID, "任务 #"+task.ID+" 已确认并排队")
+	return s.send(ctx, message.GroupID, "任务 #"+task.ID+" 已确认并排队")
 }
 
 func (s *Service) supplement(ctx context.Context, message Message, parsed command.Command, key string) error {
@@ -280,7 +288,7 @@ func (s *Service) supplement(ctx context.Context, message Message, parsed comman
 	if wake {
 		s.scheduler.Wake()
 	}
-	return s.notifier.Send(ctx, message.GroupID, "任务 #"+task.ID+" 已记录补充内容")
+	return s.send(ctx, message.GroupID, "任务 #"+task.ID+" 已记录补充内容")
 }
 
 func (s *Service) cancel(ctx context.Context, message Message, parsed command.Command, key string) error {
@@ -305,7 +313,7 @@ func (s *Service) cancel(ctx context.Context, message Message, parsed command.Co
 	if running {
 		s.scheduler.Cancel(task.ID)
 	}
-	return s.notifier.Send(ctx, message.GroupID, "任务 #"+task.ID+" 已取消")
+	return s.send(ctx, message.GroupID, "任务 #"+task.ID+" 已取消")
 }
 
 func (s *Service) status(ctx context.Context, message Message, parsed command.Command, key string) error {
@@ -316,7 +324,7 @@ func (s *Service) status(ctx context.Context, message Message, parsed command.Co
 	if err := s.commitRecords(ctx, message, key, task.ID, "status", "status viewed"); err != nil {
 		return err
 	}
-	return s.notifier.Send(ctx, message.GroupID, statusText(task))
+	return s.send(ctx, message.GroupID, statusText(task))
 }
 
 func (s *Service) log(ctx context.Context, message Message, parsed command.Command, key string) error {
@@ -331,7 +339,7 @@ func (s *Service) log(ctx context.Context, message Message, parsed command.Comma
 	if err := s.commitRecords(ctx, message, key, task.ID, "log", "log viewed"); err != nil {
 		return err
 	}
-	return s.notifier.Send(ctx, message.GroupID, bound("任务 #"+task.ID+" 日志摘要：\n"+text))
+	return s.send(ctx, message.GroupID, "任务 #"+task.ID+" 日志摘要：\n"+text)
 }
 
 func (s *Service) loadOperable(ctx context.Context, message Message, id string) (*model.Task, error) {
@@ -388,7 +396,7 @@ func (s *Service) notifyExisting(ctx context.Context, groupID, id string) error 
 	if err != nil {
 		return err
 	}
-	return s.notifier.Send(ctx, groupID, bound("任务 #"+task.ID+" 已存在，当前状态："+string(task.Status)))
+	return s.send(ctx, groupID, "任务 #"+task.ID+" 已存在，当前状态："+string(task.Status))
 }
 
 func (s *Service) replayNotification(ctx context.Context, message Message, parsed command.Command) error {
@@ -407,23 +415,23 @@ func (s *Service) replayNotification(ctx context.Context, message Message, parse
 			if err := json.Unmarshal([]byte(task.Plan), &plan); err != nil {
 				return fmt.Errorf("decode stored task plan: %w", err)
 			}
-			return s.notifier.Send(ctx, message.GroupID, confirmation(task, plan))
+			return s.send(ctx, message.GroupID, s.confirmation(task, plan))
 		}
 		return s.notifyExisting(ctx, message.GroupID, task.ID)
 	case command.KindConfirm:
-		return s.notifier.Send(ctx, message.GroupID, "任务 #"+task.ID+" 已确认并排队")
+		return s.send(ctx, message.GroupID, "任务 #"+task.ID+" 已确认并排队")
 	case command.KindSupplement:
-		return s.notifier.Send(ctx, message.GroupID, "任务 #"+task.ID+" 已记录补充内容")
+		return s.send(ctx, message.GroupID, "任务 #"+task.ID+" 已记录补充内容")
 	case command.KindCancel:
-		return s.notifier.Send(ctx, message.GroupID, "任务 #"+task.ID+" 已取消")
+		return s.send(ctx, message.GroupID, "任务 #"+task.ID+" 已取消")
 	case command.KindStatus:
-		return s.notifier.Send(ctx, message.GroupID, statusText(task))
+		return s.send(ctx, message.GroupID, statusText(task))
 	case command.KindLog:
 		text, err := s.logs.Summary(task.ID, maxNotificationRunes-80)
 		if err != nil {
 			return err
 		}
-		return s.notifier.Send(ctx, message.GroupID, bound("任务 #"+task.ID+" 日志摘要：\n"+text))
+		return s.send(ctx, message.GroupID, "任务 #"+task.ID+" 日志摘要：\n"+text)
 	default:
 		return nil
 	}
@@ -444,8 +452,29 @@ func validatePlan(plan codex.Plan) error {
 	return nil
 }
 
-func confirmation(task *model.Task, plan codex.Plan) string {
-	return bound(fmt.Sprintf("任务 #%s 规划完成\n项目：%s\n摘要：%s\n范围：%s\n检查：%s\n风险：%s\n请回复：确认 #%s", task.ID, task.ProjectID, plan.Summary, strings.Join(plan.Scope, "、"), strings.Join(plan.Checks, "、"), strings.Join(plan.Risks, "、"), task.ID))
+func (s *Service) confirmation(task *model.Task, plan codex.Plan) string {
+	const omitted = "…（已省略）"
+	fixed := fmt.Sprintf("任务 #%s 规划完成\n项目：\n摘要：\n范围：\n检查：\n风险：\n请回复：确认 #%s", task.ID, task.ID)
+	remaining := maxNotificationRunes - len([]rune(fixed))
+	if remaining < 0 {
+		remaining = 0
+	}
+	values := []string{
+		s.sanitize(task.ProjectID),
+		s.sanitize(plan.Summary),
+		s.sanitize(strings.Join(plan.Scope, "、")),
+		s.sanitize(strings.Join(plan.Checks, "、")),
+		s.sanitize(strings.Join(plan.Risks, "、")),
+	}
+	budgets := make([]int, len(values))
+	for i := range budgets {
+		budgets[i] = remaining / len(values)
+		if i < remaining%len(values) {
+			budgets[i]++
+		}
+		values[i] = truncateSection(values[i], budgets[i], omitted)
+	}
+	return fmt.Sprintf("任务 #%s 规划完成\n项目：%s\n摘要：%s\n范围：%s\n检查：%s\n风险：%s\n请回复：确认 #%s", task.ID, values[0], values[1], values[2], values[3], values[4], task.ID)
 }
 
 func statusText(task *model.Task) string {
@@ -462,12 +491,49 @@ func statusText(task *model.Task) string {
 	if task.Failure != "" {
 		parts = append(parts, "失败原因："+task.Failure)
 	}
-	return bound(strings.Join(parts, "\n"))
+	return strings.Join(parts, "\n")
+}
+
+func (s *Service) send(ctx context.Context, groupID, text string) error {
+	return s.notifier.Send(ctx, groupID, s.boundNotification(text))
+}
+
+func (s *Service) boundNotification(text string) string {
+	return bound(s.sanitize(text))
+}
+
+func (s *Service) sanitize(text string) string {
+	text = s.redactor.RedactText(text)
+	text = notificationSecretAssignment.ReplaceAllString(text, "[REDACTED]")
+	return notificationBearer.ReplaceAllString(text, "Bearer [REDACTED]")
+}
+
+func (s *Service) sanitizePlan(plan codex.Plan) codex.Plan {
+	plan.Summary = s.sanitize(plan.Summary)
+	for _, fields := range [][]string{plan.Scope, plan.Checks, plan.Risks} {
+		for i := range fields {
+			fields[i] = s.sanitize(fields[i])
+		}
+	}
+	return plan
+}
+
+func truncateSection(text string, budget int, marker string) string {
+	if budget <= 0 {
+		return ""
+	}
+	runes := []rune(text)
+	if len(runes) <= budget {
+		return text
+	}
+	markerRunes := []rune(marker)
+	if len(markerRunes) >= budget {
+		return string(markerRunes[:budget])
+	}
+	return string(runes[:budget-len(markerRunes)]) + marker
 }
 
 func bound(text string) string {
-	text = notificationSecretAssignment.ReplaceAllString(text, "[REDACTED]")
-	text = notificationBearer.ReplaceAllString(text, "Bearer [REDACTED]")
 	runes := []rune(text)
 	if len(runes) > maxNotificationRunes {
 		return string(runes[:maxNotificationRunes-1]) + "…"

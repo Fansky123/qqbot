@@ -204,6 +204,38 @@ func TestWriterImmediatelyAppendsCompleteRecordWithoutNewline(t *testing.T) {
 	}
 }
 
+func TestRedactTextCoversPlainAndJSONEscapedSecrets(t *testing.T) {
+	secret := "quote\\line\ncontrol\tvalue"
+	logs, err := Open(t.TempDir(), []string{secret})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	escaped := string(encoded[1 : len(encoded)-1])
+	got := logs.RedactText("plain=" + secret + " escaped=" + escaped)
+	if strings.Contains(got, secret) || strings.Contains(got, escaped) {
+		t.Fatalf("RedactText leaked configured secret: %q", got)
+	}
+	if strings.Count(got, redactionMarker) != 2 {
+		t.Fatalf("RedactText() = %q", got)
+	}
+}
+
+func TestRedactTextIsIdempotentForSingleCharacterSecret(t *testing.T) {
+	logs, err := Open(t.TempDir(), []string{"A"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	once := logs.RedactText("A")
+	twice := logs.RedactText(once)
+	if once != redactionMarker || twice != once {
+		t.Fatalf("redaction is not idempotent: once=%q twice=%q", once, twice)
+	}
+}
+
 func TestSummaryIsUnicodeSafeBoundedAndReredacted(t *testing.T) {
 	t.Parallel()
 	store := openStore(t, []string{"summary-secret"})

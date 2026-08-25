@@ -429,12 +429,21 @@ func (s *Store) Remove(taskID string) error {
 }
 
 func (s *Store) redact(value string) string {
+	value = strings.ReplaceAll(value, redactionMarker, redactionSentinel)
 	value = bearerPattern.ReplaceAllString(value, `${1}`+redactionSentinel)
 	value = keyPattern.ReplaceAllString(value, `${1}=`+redactionSentinel)
 	if s.secretRedactor != nil {
 		value = s.secretRedactor.Replace(value)
 	}
 	return strings.ReplaceAll(value, redactionSentinel, redactionMarker)
+}
+
+// RedactText removes configured exact secrets and recognized credentials from text.
+func (s *Store) RedactText(value string) string {
+	if s == nil {
+		return redactionMarker
+	}
+	return s.redact(value)
 }
 
 func (s *Store) taskLock(taskID string) *sync.Mutex {

@@ -11,12 +11,14 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"qqcodex/internal/auth"
 	"qqcodex/internal/codex"
 	"qqcodex/internal/config"
 	"qqcodex/internal/model"
 	"qqcodex/internal/store"
+	"qqcodex/internal/tasklog"
 )
 
 type fakePlanner struct {
@@ -96,6 +98,12 @@ func (n *fakeNotifier) Last() string {
 	return n.messages[len(n.messages)-1]
 }
 
+func (n *fakeNotifier) Messages() []string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return append([]string(nil), n.messages...)
+}
+
 type fakeLogs struct{ text string }
 
 func (l fakeLogs) Summary(_ string, maxRunes int) (string, error) {
@@ -106,7 +114,13 @@ func (l fakeLogs) Summary(_ string, maxRunes int) (string, error) {
 	return string(runes), nil
 }
 
+func (l fakeLogs) RedactText(text string) string { return text }
+
 func testService(t *testing.T, planner Planner) (*Service, *store.Store, *fakeScheduler, *fakeNotifier) {
+	return testServiceWithLogs(t, planner, fakeLogs{"OPENAI_API_KEY=raw-secret NAPCAT_ACCESS_TOKEN=raw-token " + strings.Repeat("secret ", 1000)})
+}
+
+func testServiceWithLogs(t *testing.T, planner Planner, logs LogReader) (*Service, *store.Store, *fakeScheduler, *fakeNotifier) {
 	t.Helper()
 	db, err := store.Open(filepath.Join(t.TempDir(), "tasks.db"))
 	if err != nil {
@@ -128,7 +142,7 @@ func testService(t *testing.T, planner Planner) (*Service, *store.Store, *fakeSc
 	}
 	scheduler := &fakeScheduler{}
 	notifier := &fakeNotifier{}
-	return NewService(registry, db, auth.New(cfg.AllowedGroupIDs, cfg.EmployeeIDs, cfg.AdminIDs), planner, scheduler, notifier, fakeLogs{"OPENAI_API_KEY=raw-secret NAPCAT_ACCESS_TOKEN=raw-token " + strings.Repeat("secret ", 1000)}), db, scheduler, notifier
+	return NewService(registry, db, auth.New(cfg.AllowedGroupIDs, cfg.EmployeeIDs, cfg.AdminIDs), planner, scheduler, notifier, logs), db, scheduler, notifier
 }
 
 func planResult() codex.Result {
@@ -484,6 +498,114 @@ func TestServiceRejectsOversizedInputsAndPlans(t *testing.T) {
 	var nilContext context.Context
 	if err := svc.Handle(nilContext, msg("nil-context", "u1", "[orders] task")); err == nil {
 		t.Fatal("nil context succeeded")
+	}
+}
+
+func TestServiceConfirmationPreservesSectionsAndCommand(t *testing.T) {
+	plan := codex.Plan{
+		Summary: strings.Repeat("摘", 1300),
+		Scope:   []string{strings.Repeat("范围", 300), strings.Repeat("二", 300)},
+		Checks:  []string{strings.Repeat("检查", 300), strings.Repeat("三", 300)},
+		Risks:   []string{strings.Repeat("风险", 300), strings.Repeat("四", 300)},
+	}
+	encoded, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planner := &fakePlanner{result: codex.Result{Final: string(encoded)}}
+	svc, _, _, notifier := testService(t, planner)
+	create := msg("long-plan", "u1", "[orders] task")
+	if err := svc.Handle(context.Background(), create); err != nil {
+		t.Fatal(err)
+	}
+	id := TaskID("g1", "long-plan")
+	got := notifier.Last()
+	for _, required := range []string{"任务 #" + id, "项目：orders", "摘要：", "范围：", "检查：", "风险：", "请回复：确认 #" + id} {
+		if !strings.Contains(got, required) {
+			t.Errorf("confirmation lacks %q: %q", required, got)
+		}
+	}
+	if !strings.HasSuffix(got, "请回复：确认 #"+id) {
+		t.Errorf("confirmation suffix = %q", got)
+	}
+	if len([]rune(got)) > maxNotificationRunes || !utf8.ValidString(got) {
+		t.Fatalf("confirmation runes=%d valid=%v", len([]rune(got)), utf8.ValidString(got))
+	}
+	longProjectTask := &model.Task{ID: id, ProjectID: strings.Repeat("project", 1000)}
+	got = svc.boundNotification(svc.confirmation(longProjectTask, plan))
+	if !strings.Contains(got, "项目：") || !strings.HasSuffix(got, "请回复：确认 #"+id) || len([]rune(got)) > maxNotificationRunes {
+		t.Fatalf("long-project confirmation lost structure: runes=%d suffix=%v", len([]rune(got)), strings.HasSuffix(got, "请回复：确认 #"+id))
+	}
+}
+
+func TestServiceRedactsExactSecretsFromEveryNotificationPath(t *testing.T) {
+	secret := "quote\\line\ncontrol\tvalue"
+	encodedSecret, err := json.Marshal(secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	escapedSecret := string(encodedSecret[1 : len(encodedSecret)-1])
+	logs, err := tasklog.Open(t.TempDir(), []string{secret})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := codex.Plan{
+		Summary: strings.Repeat("x", 1190) + " plain " + secret,
+		Scope:   []string{"escaped " + escapedSecret},
+		Checks:  []string{"check " + secret},
+		Risks:   []string{"risk " + escapedSecret},
+	}
+	encodedPlan, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planner := &fakePlanner{result: codex.Result{Final: string(encodedPlan)}}
+	svc, db, _, notifier := testServiceWithLogs(t, planner, logs)
+	ctx := context.Background()
+	create := msg("exact-secret", "u1", "[orders] task")
+	notifier.FailNext()
+	if err := svc.Handle(ctx, create); err == nil {
+		t.Fatal("initial notification failure was not returned")
+	}
+	if err := svc.Handle(ctx, create); err != nil {
+		t.Fatal(err)
+	}
+	id := TaskID("g1", "exact-secret")
+	task, err := db.GetTask(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(task.Plan, secret) || strings.Contains(task.Plan, escapedSecret) || strings.Contains(task.Summary, secret) || strings.Contains(task.Summary, escapedSecret) {
+		t.Fatalf("stored task leaked exact secret: plan=%q summary=%q", task.Plan, task.Summary)
+	}
+	if err := logs.Append(id, "test", []byte("raw log "+secret+" escaped "+escapedSecret)); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Handle(ctx, msg("secret-status", "u1", "状态 #"+id)); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Handle(ctx, msg("secret-log", "u1", "日志 #"+id)); err != nil {
+		t.Fatal(err)
+	}
+	for i, message := range notifier.Messages() {
+		if strings.Contains(message, secret) || strings.Contains(message, escapedSecret) {
+			t.Fatalf("notification %d leaked exact secret: %q", i, message)
+		}
+	}
+}
+
+type unredactedLogs struct{}
+
+func (unredactedLogs) Summary(string, int) (string, error) { return "", nil }
+
+func TestServiceFailsClosedWithoutExactRedactor(t *testing.T) {
+	planner := &fakePlanner{result: planResult()}
+	svc, _, _, _ := testServiceWithLogs(t, planner, unredactedLogs{})
+	if err := svc.Handle(context.Background(), msg("no-redactor", "u1", "[orders] task")); err == nil {
+		t.Fatal("service handled message without exact redactor")
+	}
+	if planner.Calls() != 0 {
+		t.Fatalf("planner calls = %d", planner.Calls())
 	}
 }
 
