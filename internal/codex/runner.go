@@ -375,6 +375,7 @@ func sanitizedEnvironment(keep []string) ([]string, []string, error) {
 	if !present || home == "" || !filepath.IsAbs(home) {
 		return nil, nil, fmt.Errorf("HOME must be a non-empty absolute path")
 	}
+	home = filepath.Clean(home)
 	codexHome, present := os.LookupEnv("CODEX_HOME")
 	if !present {
 		codexHome = filepath.Join(home, ".codex")
@@ -382,11 +383,19 @@ func sanitizedEnvironment(keep []string) ([]string, []string, error) {
 	if codexHome == "" || !filepath.IsAbs(codexHome) {
 		return nil, nil, fmt.Errorf("CODEX_HOME must be a non-empty absolute path")
 	}
-	authPath := filepath.Join(codexHome, "auth.json")
-	if _, err := os.Lstat(authPath); err == nil {
-		return nil, nil, fmt.Errorf("cached Codex authentication %q is not allowed", authPath)
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return nil, nil, fmt.Errorf("inspect Codex auth.json: %w", err)
+	codexHome = filepath.Clean(codexHome)
+	seenAuth := make(map[string]struct{}, 2)
+	for _, root := range []string{codexHome, filepath.Join(home, ".codex")} {
+		authPath := filepath.Join(root, "auth.json")
+		if _, exists := seenAuth[authPath]; exists {
+			continue
+		}
+		seenAuth[authPath] = struct{}{}
+		if _, err := os.Lstat(authPath); err == nil {
+			return nil, nil, fmt.Errorf("cached Codex authentication %q is not allowed", authPath)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return nil, nil, fmt.Errorf("inspect Codex auth.json: %w", err)
+		}
 	}
 
 	toolNames, err := toolEnvironmentNames(keep)
@@ -401,7 +410,11 @@ func sanitizedEnvironment(keep []string) ([]string, []string, error) {
 			continue
 		}
 		seen[name] = struct{}{}
-		if value, present := os.LookupEnv(name); present {
+		value, present := os.LookupEnv(name)
+		if name == "HOME" {
+			value, present = home, true
+		}
+		if present {
 			env = append(env, name+"="+value)
 		}
 	}

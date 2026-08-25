@@ -357,6 +357,24 @@ func TestRunnerRejectsCachedCodexAuthenticationBeforeSpawning(t *testing.T) {
 	}
 }
 
+func TestRunnerRejectsDefaultHomeAuthenticationWithExplicitCodexHome(t *testing.T) {
+	runner, req, recordPath := helperRunner(t)
+	setEnv(t, "CODEX_HOME", t.TempDir())
+	defaultCodexHome := filepath.Join(os.Getenv("HOME"), ".codex")
+	if err := os.Mkdir(defaultCodexHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(defaultCodexHome, "auth.json"), []byte(`{"token":"cached"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := runner.Plan(context.Background(), req)
+	if err == nil || !strings.Contains(err.Error(), "auth.json") {
+		t.Fatalf("error = %v, want default HOME authentication rejection", err)
+	}
+	assertNotCreated(t, recordPath)
+}
+
 func TestRunnerPassesAmbientCodexHomeOnlyToParentProcess(t *testing.T) {
 	runner, req, recordPath := helperRunner(t)
 	codexHome := t.TempDir()
