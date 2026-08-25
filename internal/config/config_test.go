@@ -199,8 +199,11 @@ func TestRegistryResolvesAliasesAndReturnsCopies(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	cfg.Projects[0].Aliases[0] = "changed-in-source"
+	cfg.Projects[0].Checks[0][0] = "changed-in-source"
+
 	a, ok := registry.Project("orders")
-	if !ok || a.ID != "order-api" {
+	if !ok || a.ID != "order-api" || a.Aliases[0] != "orders" || a.Checks[0][0] != "go" {
 		t.Fatalf("orders project = %#v, %v", a, ok)
 	}
 	b, ok := registry.Project("订单")
