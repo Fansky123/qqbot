@@ -2,6 +2,7 @@ package codex
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	_ "embed"
 	"encoding/json"
@@ -359,24 +360,42 @@ func (kind invocation) String() string {
 }
 
 func ParsePlan(final string) (Plan, error) {
-	var raw struct {
-		Summary *string   `json:"summary"`
-		Scope   *[]string `json:"scope"`
-		Checks  *[]string `json:"checks"`
-		Risks   *[]string `json:"risks"`
-	}
+	var fields map[string]json.RawMessage
 	decoder := json.NewDecoder(strings.NewReader(final))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&raw); err != nil {
+	if err := decoder.Decode(&fields); err != nil {
 		return Plan{}, fmt.Errorf("decode codex plan: %w", err)
 	}
 	if err := requireJSONEOF(decoder); err != nil {
 		return Plan{}, err
 	}
-	if raw.Summary == nil || raw.Scope == nil || raw.Checks == nil || raw.Risks == nil {
-		return Plan{}, fmt.Errorf("codex plan requires summary, scope, checks, and risks")
+	for _, key := range []string{"summary", "scope", "checks", "risks"} {
+		if _, ok := fields[key]; !ok {
+			return Plan{}, fmt.Errorf("codex plan requires exact key %q", key)
+		}
 	}
-	return Plan{Summary: *raw.Summary, Scope: *raw.Scope, Checks: *raw.Checks, Risks: *raw.Risks}, nil
+	if len(fields) != 4 {
+		return Plan{}, fmt.Errorf("codex plan contains an unknown key")
+	}
+
+	var plan Plan
+	values := []struct {
+		key         string
+		destination any
+	}{
+		{"summary", &plan.Summary},
+		{"scope", &plan.Scope},
+		{"checks", &plan.Checks},
+		{"risks", &plan.Risks},
+	}
+	for _, value := range values {
+		if bytes.Equal(bytes.TrimSpace(fields[value.key]), []byte("null")) {
+			return Plan{}, fmt.Errorf("codex plan field %q must not be null", value.key)
+		}
+		if err := json.Unmarshal(fields[value.key], value.destination); err != nil {
+			return Plan{}, fmt.Errorf("decode codex plan field %q: %w", value.key, err)
+		}
+	}
+	return plan, nil
 }
 
 func requireJSONEOF(decoder *json.Decoder) error {

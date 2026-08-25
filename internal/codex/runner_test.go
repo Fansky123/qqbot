@@ -447,19 +447,30 @@ func TestParsePlan(t *testing.T) {
 		t.Fatalf("plan = %#v, want %#v", got, want)
 	}
 
-	invalid := []string{
-		`{`,
-		`{"summary":"ok","scope":[],"checks":[],"risks":[],"extra":true}`,
-		`{"summary":"ok","scope":[],"checks":[],"risks":[]} {}`,
-		`{"scope":[],"checks":[],"risks":[]}`,
-		`{"summary":"ok","checks":[],"risks":[]}`,
-		`{"summary":"ok","scope":null,"checks":[],"risks":[]}`,
-		`{"summary":"ok","scope":[],"checks":"go test","risks":[]}`,
+	invalid := []struct {
+		name  string
+		input string
+	}{
+		{"malformed", `{`},
+		{"unknown field", `{"summary":"ok","scope":[],"checks":[],"risks":[],"extra":true}`},
+		{"trailing value", `{"summary":"ok","scope":[],"checks":[],"risks":[]} {}`},
+		{"missing summary", `{"scope":[],"checks":[],"risks":[]}`},
+		{"missing scope", `{"summary":"ok","checks":[],"risks":[]}`},
+		{"capitalized alias", `{"Summary":"ok","scope":[],"checks":[],"risks":[]}`},
+		{"mixed-case alias", `{"sUmMaRy":"ok","scope":[],"checks":[],"risks":[]}`},
+		{"exact and case alias", `{"summary":"ok","Summary":"override","scope":[],"checks":[],"risks":[]}`},
+		{"null summary", `{"summary":null,"scope":[],"checks":[],"risks":[]}`},
+		{"null scope", `{"summary":"ok","scope":null,"checks":[],"risks":[]}`},
+		{"null checks", `{"summary":"ok","scope":[],"checks":null,"risks":[]}`},
+		{"null risks", `{"summary":"ok","scope":[],"checks":[],"risks":null}`},
+		{"wrong checks type", `{"summary":"ok","scope":[],"checks":"go test","risks":[]}`},
 	}
-	for _, input := range invalid {
-		if _, err := ParsePlan(input); err == nil {
-			t.Errorf("ParsePlan(%q) succeeded, want error", input)
-		}
+	for _, tt := range invalid {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := ParsePlan(tt.input); err == nil {
+				t.Errorf("ParsePlan(%q) succeeded, want error", tt.input)
+			}
+		})
 	}
 }
 
