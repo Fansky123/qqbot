@@ -969,6 +969,79 @@ func TestSchedulerReconciliationCannotStealVersionFromActivePush(t *testing.T) {
 	}
 }
 
+func TestSchedulerPushedReconciliationRequiresLeaseBeforeVersionWrite(t *testing.T) {
+	fixture := newSchedulerFixture(t, 1)
+	taskID := "T-000000000386"
+	fixture.createTask(t, taskID, "p1")
+	task := mustTask(t, fixture.db, taskID)
+	task.Status = model.StatusPushed
+	task.Worktree = filepath.Join("/worktrees", taskID)
+	task.Branch = "codex/" + taskID
+	task.BaseCommit = schedulerBaseCommit
+	task.GitCommonDir = filepath.Join("/git", taskID)
+	task.SessionID = "session-existing"
+	task.Summary = "persisted summary"
+	task.TaskCommit = schedulerTaskCommit
+	if err := fixture.db.SaveTask(context.Background(), task, task.Version); err != nil {
+		t.Fatal(err)
+	}
+
+	secondDB, err := store.Open(fixture.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := secondDB.Close(); err != nil {
+			t.Errorf("close second scheduler store: %v", err)
+		}
+	})
+	first := fixture.scheduler(t)
+	second := NewScheduler(fixture.registry, secondDB, fixture.runner, fixture.worktrees, fixture.operator, fixture.notifier, fixture.logs, slog.Default(), 5*time.Millisecond)
+	ctx := context.Background()
+	if !first.tryAcquirePushLease(ctx, taskID) {
+		t.Fatal("first scheduler failed to acquire pushed reconciliation lease")
+	}
+	release := make(chan struct{})
+	started := make(chan struct{})
+	errs := make(chan error, 1)
+	done := make(chan struct{})
+	go func() {
+		first.withAcquiredPushLease(ctx, taskID, func(leaseCtx context.Context) {
+			close(started)
+			for range 20 {
+				if err := second.scan(leaseCtx); err != nil {
+					errs <- err
+					return
+				}
+			}
+			close(release)
+		})
+		close(done)
+	}()
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("first scheduler did not hold pushed lease")
+	}
+	select {
+	case err := <-errs:
+		t.Fatal(err)
+	case <-release:
+	}
+	before := mustTask(t, secondDB, taskID)
+	if before.Status != model.StatusPushed || before.Version != task.Version {
+		t.Fatalf("second scheduler wrote without lease: %#v", before)
+	}
+	<-done
+	if err := second.scan(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitTaskStatus(t, secondDB, taskID, model.StatusAwaitingMergeApproval)
+	if got := fixture.operator.pushes(taskID); got != 0 {
+		t.Fatalf("pushed reconciliation performed an external push: %d", got)
+	}
+}
+
 func TestSchedulerCrashAfterPushReconcilesPersistedExactCommit(t *testing.T) {
 	fixture := newSchedulerFixture(t, 1)
 	taskID := "T-000000000391"

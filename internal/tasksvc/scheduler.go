@@ -226,14 +226,38 @@ func (s *Scheduler) scan(ctx context.Context) error {
 		return err
 	}
 	for _, task := range pushed {
-		project, ok := s.registry.ProjectByID(task.ProjectID)
-		if !ok {
-			s.failTask(ctx, task.ID, errors.New("configured project is unavailable"))
+		if s.isActive(task.ID) {
 			continue
 		}
-		if s.transition(ctx, task, model.StatusAwaitingMergeApproval, false) {
-			s.notify(ctx, task.GroupID, s.completion(task, project))
+		project, ok := s.registry.ProjectByID(task.ProjectID)
+		if !ok {
+			project = config.Project{ID: task.ProjectID, MaxConcurrent: 1}
 		}
+		state := s.projectState(project)
+		select {
+		case state.slots <- struct{}{}:
+		default:
+			continue
+		}
+		if !s.tryAcquirePushLease(ctx, task.ID) {
+			<-state.slots
+			continue
+		}
+		s.startProjectWorker(ctx, task.ID, state, func(workerCtx context.Context) {
+			s.withAcquiredPushLease(workerCtx, task.ID, func(leaseCtx context.Context) {
+				current, stopped := s.activeTask(leaseCtx, task.ID, model.StatusPushed)
+				if stopped {
+					return
+				}
+				if !ok {
+					s.failTask(leaseCtx, task.ID, errors.New("configured project is unavailable"))
+					return
+				}
+				if s.transition(leaseCtx, current, model.StatusAwaitingMergeApproval, false) {
+					s.notify(leaseCtx, current.GroupID, s.completion(current, project))
+				}
+			})
+		})
 	}
 
 	// Task 11 attaches serialized handlers to these durable queues.
