@@ -83,13 +83,22 @@ func (r Runner) Resume(ctx context.Context, req Request) (Result, error) {
 
 func (r Runner) run(parent context.Context, req Request, kind invocation) (result Result, runErr error) {
 	var temporaryPaths []string
+	var temporaryDirs []string
 	defer func() {
-		runErr = errors.Join(runErr, removeTemporaryFiles(temporaryPaths))
+		runErr = errors.Join(runErr, removeTemporaryFiles(temporaryPaths), removeTemporaryDirs(temporaryDirs))
 	}()
 
 	binary, env, toolEnv, err := r.validate(req, kind)
 	if err != nil {
 		return Result{}, err
+	}
+	if kind == invocationExecute || kind == invocationResume {
+		tempDir, err := privateTempDir(req.GitCommonDir)
+		if err != nil {
+			return Result{}, err
+		}
+		temporaryDirs = append(temporaryDirs, tempDir)
+		env = withTemporaryEnvironment(env, tempDir)
 	}
 	if err := ensurePrivateDir(r.LogDir); err != nil {
 		return Result{}, err
@@ -222,6 +231,16 @@ func removeTemporaryFiles(paths []string) error {
 	return cleanupErr
 }
 
+func removeTemporaryDirs(paths []string) error {
+	var cleanupErr error
+	for _, path := range paths {
+		if err := os.RemoveAll(path); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove private Codex temporary directory: %w", err))
+		}
+	}
+	return cleanupErr
+}
+
 func killProcessGroup(process *os.Process) error {
 	if process == nil {
 		return os.ErrProcessDone
@@ -267,7 +286,7 @@ func (r Runner) validate(req Request, kind invocation) (string, []string, []stri
 	if req.Timeout <= 0 {
 		return "", nil, nil, fmt.Errorf("codex timeout must be positive")
 	}
-	if kind == invocationExecute {
+	if kind == invocationExecute || kind == invocationResume {
 		if err := requireDirectory("Git common directory", req.GitCommonDir); err != nil {
 			return "", nil, nil, err
 		}
@@ -282,6 +301,24 @@ func (r Runner) validate(req Request, kind invocation) (string, []string, []stri
 		return "", nil, nil, err
 	}
 	return binary, env, toolEnv, nil
+}
+
+func withTemporaryEnvironment(env []string, tempDir string) []string {
+	for _, name := range []string{"TMPDIR", "TMP", "TEMP"} {
+		prefix := name + "="
+		updated := false
+		for i, entry := range env {
+			if strings.HasPrefix(entry, prefix) {
+				env[i] = prefix + tempDir
+				updated = true
+				break
+			}
+		}
+		if !updated {
+			env = append(env, prefix+tempDir)
+		}
+	}
+	return env
 }
 
 func resolveBinary(binary string) (string, error) {
@@ -330,13 +367,35 @@ func requireDirectory(label, path string) error {
 }
 
 func sanitizedEnvironment(keep []string) ([]string, []string, error) {
+	apiKey, present := os.LookupEnv("CODEX_API_KEY")
+	if !present || apiKey == "" {
+		return nil, nil, fmt.Errorf("CODEX_API_KEY is required")
+	}
+	home, present := os.LookupEnv("HOME")
+	if !present || home == "" || !filepath.IsAbs(home) {
+		return nil, nil, fmt.Errorf("HOME must be a non-empty absolute path")
+	}
+	codexHome, present := os.LookupEnv("CODEX_HOME")
+	if !present {
+		codexHome = filepath.Join(home, ".codex")
+	}
+	if codexHome == "" || !filepath.IsAbs(codexHome) {
+		return nil, nil, fmt.Errorf("CODEX_HOME must be a non-empty absolute path")
+	}
+	authPath := filepath.Join(codexHome, "auth.json")
+	if _, err := os.Lstat(authPath); err == nil {
+		return nil, nil, fmt.Errorf("cached Codex authentication %q is not allowed", authPath)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, nil, fmt.Errorf("inspect Codex auth.json: %w", err)
+	}
+
 	toolNames, err := toolEnvironmentNames(keep)
 	if err != nil {
 		return nil, nil, err
 	}
-	names := append([]string{"CODEX_API_KEY"}, toolNames...)
+	names := toolNames
 	seen := make(map[string]struct{}, len(names))
-	env := make([]string, 0, len(names))
+	env := []string{"CODEX_API_KEY=" + apiKey, "CODEX_HOME=" + codexHome}
 	for _, name := range names {
 		if _, exists := seen[name]; exists {
 			continue
@@ -357,7 +416,7 @@ func toolEnvironmentNames(keep []string) ([]string, error) {
 		if !envNamePattern.MatchString(name) {
 			return nil, fmt.Errorf("invalid environment variable name %q", name)
 		}
-		if name == "CODEX_API_KEY" {
+		if name == "CODEX_API_KEY" || name == "CODEX_HOME" {
 			continue
 		}
 		if _, exists := seen[name]; exists {
@@ -407,6 +466,20 @@ func privateTemp(dir, pattern string, content []byte) (string, error) {
 	return path, nil
 }
 
+func privateTempDir(gitCommonDir string) (string, error) {
+	path, err := os.MkdirTemp(gitCommonDir, ".qqcodex-tmp-*")
+	if err != nil {
+		return "", fmt.Errorf("create private Codex temporary directory: %w", err)
+	}
+	if err := os.Chmod(path, 0o700); err != nil {
+		return "", errors.Join(
+			fmt.Errorf("secure private Codex temporary directory: %w", err),
+			removeTemporaryDirs([]string{path}),
+		)
+	}
+	return path, nil
+}
+
 func invocationArgs(kind invocation, req Request, schemaPath, lastPath string, toolEnv []string) []string {
 	// The Codex process receives CODEX_API_KEY, while this CLI policy only allows
 	// explicitly named non-auth variables into model-invoked tool subprocesses.
@@ -418,13 +491,22 @@ func invocationArgs(kind invocation, req Request, schemaPath, lastPath string, t
 			"--output-schema", schemaPath, "--json", "-o", lastPath, "--", req.Prompt)
 	case invocationExecute:
 		args := append([]string{"exec"}, policy...)
+		args = append(args, workspaceTempPolicyArgs()...)
 		return append(args, "-C", req.WorkingDir, "--sandbox", "workspace-write", "--add-dir", req.GitCommonDir,
 			"--json", "-o", lastPath, "--", req.Prompt)
 	case invocationResume:
 		args := append([]string{"exec", "resume"}, policy...)
+		args = append(args, workspaceTempPolicyArgs()...)
 		return append(args, "--json", "-o", lastPath, "--", req.SessionID, req.Prompt)
 	default:
 		panic("unknown codex invocation")
+	}
+}
+
+func workspaceTempPolicyArgs() []string {
+	return []string{
+		"-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+		"-c", "sandbox_workspace_write.exclude_slash_tmp=true",
 	}
 }
 

@@ -45,6 +45,8 @@ type helperRecordData struct {
 	SchemaContent string   `json:"schema_content"`
 	LastPath      string   `json:"last_path"`
 	LastMode      uint32   `json:"last_mode"`
+	TempDir       string   `json:"temp_dir"`
+	TempMode      uint32   `json:"temp_mode"`
 }
 
 func init() {
@@ -67,6 +69,10 @@ func runCodexHelper() {
 	record.Dir, _ = os.Getwd()
 	record.SchemaPath = flagValue(record.Args, "--output-schema")
 	record.LastPath = flagValue(record.Args, "-o")
+	record.TempDir = os.Getenv("TMPDIR")
+	if info, err := os.Stat(record.TempDir); err == nil {
+		record.TempMode = uint32(info.Mode().Perm())
+	}
 	if record.SchemaPath != "" {
 		if info, err := os.Stat(record.SchemaPath); err == nil {
 			record.SchemaMode = uint32(info.Mode().Perm())
@@ -89,6 +95,10 @@ func runCodexHelper() {
 		helperMust(os.WriteFile(filepath.Join(record.SchemaPath, "retained"), []byte("private temp content"), 0o600))
 	} else if os.Getenv(helperDirty) == "remove-schema" {
 		helperMust(os.Remove(record.SchemaPath))
+	} else if os.Getenv(helperDirty) == "populate-git-temp" {
+		nested := filepath.Join(record.TempDir, "nested")
+		helperMust(os.Mkdir(nested, 0o700))
+		helperMust(os.WriteFile(filepath.Join(nested, "content"), []byte("temporary"), 0o600))
 	}
 
 	if spawn := os.Getenv(helperSpawn); spawn != "" {
@@ -201,6 +211,7 @@ func TestRunnerExecuteArguments(t *testing.T) {
 	}
 	record := readHelperRecord(t, recordPath)
 	want := append([]string{"exec"}, expectedPolicyArgs(runner.KeepEnv)...)
+	want = append(want, expectedWorkspaceTempArgs()...)
 	want = append(want, "-C", req.WorkingDir, "--sandbox", "workspace-write", "--add-dir", req.GitCommonDir,
 		"--json", "-o", record.LastPath, "--", req.Prompt)
 	if !reflect.DeepEqual(record.Args, want) {
@@ -209,6 +220,7 @@ func TestRunnerExecuteArguments(t *testing.T) {
 	if got := countArg(record.Args, "--add-dir"); got != 1 {
 		t.Fatalf("--add-dir count = %d, want 1", got)
 	}
+	assertPrivateGitTemp(t, record, req.GitCommonDir)
 	assertRemoved(t, record.LastPath)
 }
 
@@ -216,12 +228,14 @@ func TestRunnerResumeArgumentsAndWorkingDirectory(t *testing.T) {
 	runner, req, recordPath := helperRunner(t)
 	req.SessionID = "session-exact"
 	req.Prompt = "--last"
+	req.GitCommonDir = t.TempDir()
 
 	if _, err := runner.Resume(context.Background(), req); err != nil {
 		t.Fatal(err)
 	}
 	record := readHelperRecord(t, recordPath)
 	want := append([]string{"exec", "resume"}, expectedPolicyArgs(runner.KeepEnv)...)
+	want = append(want, expectedWorkspaceTempArgs()...)
 	want = append(want, "--json", "-o", record.LastPath, "--", req.SessionID, req.Prompt)
 	if !reflect.DeepEqual(record.Args, want) {
 		t.Fatalf("argv = %#v, want %#v", record.Args, want)
@@ -238,40 +252,128 @@ func TestRunnerResumeArgumentsAndWorkingDirectory(t *testing.T) {
 	if record.Dir != req.WorkingDir {
 		t.Fatalf("working directory = %q, want %q", record.Dir, req.WorkingDir)
 	}
+	assertPrivateGitTemp(t, record, req.GitCommonDir)
 }
 
 func TestRunnerSanitizesEnvironment(t *testing.T) {
+	runner, req, recordPath := helperRunner(t)
 	setEnv(t, "CODEX_API_KEY", "codex-key")
 	setEnv(t, "PATH", "/bin")
 	setEnv(t, "HOME", "/private/home")
+	unsetEnv(t, "CODEX_HOME")
 	setEnv(t, "LANG", "C.UTF-8")
 	setEnv(t, "TMPDIR", "/tmp")
 	unsetEnv(t, "TMP")
 	unsetEnv(t, "TEMP")
 	setEnv(t, "ALLOWED_CUSTOM", "kept")
 	setEnv(t, "UNKNOWN_SECRET", "must-not-leak")
-	runner, req, recordPath := helperRunner(t)
-	runner.KeepEnv = append(runner.KeepEnv, "ALLOWED_CUSTOM", "PATH", "CODEX_API_KEY", "ALLOWED_CUSTOM")
+	runner.KeepEnv = append(runner.KeepEnv, "ALLOWED_CUSTOM", "PATH", "CODEX_API_KEY", "CODEX_HOME", "ALLOWED_CUSTOM")
 
-	if _, err := runner.Execute(context.Background(), withGitCommonDir(t, req)); err != nil {
+	if _, err := runner.Plan(context.Background(), req); err != nil {
 		t.Fatal(err)
 	}
 	record := readHelperRecord(t, recordPath)
 	want := []string{
-		"CODEX_API_KEY=codex-key", "PATH=/bin", "HOME=/private/home", "LANG=C.UTF-8", "TMPDIR=/tmp",
+		"CODEX_API_KEY=codex-key", "CODEX_HOME=/private/home/.codex", "PATH=/bin", "HOME=/private/home", "LANG=C.UTF-8", "TMPDIR=/tmp",
 		"GO_WANT_CODEX_HELPER=1", "QQ_CODEX_HELPER_RECORD=" + recordPath, "ALLOWED_CUSTOM=kept",
 	}
 	if !reflect.DeepEqual(record.Env, want) {
 		t.Fatalf("environment = %#v, want %#v", record.Env, want)
 	}
 	for _, arg := range record.Args {
-		if strings.Contains(arg, "filters.CODEX_API_KEY") {
-			t.Fatalf("CODEX_API_KEY exposed to tool subprocess policy: %q", arg)
+		if strings.Contains(arg, "filters.CODEX_API_KEY") || strings.Contains(arg, "filters.CODEX_HOME") {
+			t.Fatalf("authentication environment exposed to tool subprocess policy: %q", arg)
 		}
 	}
 	wantPolicy := expectedPolicyArgs(runner.KeepEnv)
 	if len(record.Args) < 1+len(wantPolicy) || !slices.Equal(record.Args[1:1+len(wantPolicy)], wantPolicy) {
 		t.Fatalf("argv = %#v, want policy prefix %#v", record.Args, wantPolicy)
+	}
+}
+
+func TestRunnerRequiresAPIKeyAndAbsoluteHomes(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*testing.T)
+		want   string
+	}{
+		{"empty API key", func(t *testing.T) { setEnv(t, "CODEX_API_KEY", "") }, "CODEX_API_KEY"},
+		{"missing API key", func(t *testing.T) { unsetEnv(t, "CODEX_API_KEY") }, "CODEX_API_KEY"},
+		{"empty HOME", func(t *testing.T) { setEnv(t, "HOME", "") }, "HOME"},
+		{"relative HOME", func(t *testing.T) { setEnv(t, "HOME", "relative") }, "HOME"},
+		{"empty CODEX_HOME", func(t *testing.T) { setEnv(t, "CODEX_HOME", "") }, "CODEX_HOME"},
+		{"relative CODEX_HOME", func(t *testing.T) { setEnv(t, "CODEX_HOME", "relative") }, "CODEX_HOME"},
+		{"auth lookup error", func(t *testing.T) {
+			blocker := filepath.Join(t.TempDir(), "not-a-directory")
+			if err := os.WriteFile(blocker, []byte("block auth lookup"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			setEnv(t, "CODEX_HOME", filepath.Join(blocker, "codex"))
+		}, "inspect Codex auth.json"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runner, req, recordPath := helperRunner(t)
+			tt.mutate(t)
+
+			_, err := runner.Plan(context.Background(), req)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error = %v, want %q validation error", err, tt.want)
+			}
+			assertNotCreated(t, recordPath)
+		})
+	}
+}
+
+func TestRunnerRejectsCachedCodexAuthenticationBeforeSpawning(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(*testing.T, string)
+	}{
+		{"file", func(t *testing.T, path string) {
+			if err := os.WriteFile(path, []byte(`{"token":"cached"}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"symlink", func(t *testing.T, path string) {
+			if err := os.Symlink(filepath.Join(t.TempDir(), "missing-target"), path); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runner, req, recordPath := helperRunner(t)
+			codexHome := t.TempDir()
+			setEnv(t, "CODEX_HOME", codexHome)
+			tt.setup(t, filepath.Join(codexHome, "auth.json"))
+
+			_, err := runner.Plan(context.Background(), req)
+			if err == nil || !strings.Contains(err.Error(), "auth.json") {
+				t.Fatalf("error = %v, want cached authentication error", err)
+			}
+			assertNotCreated(t, recordPath)
+		})
+	}
+}
+
+func TestRunnerPassesAmbientCodexHomeOnlyToParentProcess(t *testing.T) {
+	runner, req, recordPath := helperRunner(t)
+	codexHome := t.TempDir()
+	setEnv(t, "CODEX_HOME", codexHome)
+	runner.KeepEnv = append(runner.KeepEnv, "CODEX_HOME", "CODEX_HOME")
+
+	if _, err := runner.Plan(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	record := readHelperRecord(t, recordPath)
+	if got := environmentValue(record.Env, "CODEX_HOME"); got != codexHome {
+		t.Fatalf("CODEX_HOME = %q, want %q", got, codexHome)
+	}
+	for _, arg := range record.Args {
+		if strings.Contains(arg, "filters.CODEX_HOME") {
+			t.Fatalf("CODEX_HOME exposed to tool subprocess policy: %q", arg)
+		}
 	}
 }
 
@@ -517,7 +619,7 @@ func TestRunnerRequiresSessionIDAfterSuccessfulPersistentInvocation(t *testing.T
 		}},
 		{"resume", func(r Runner, req Request) (Result, error) {
 			req.SessionID = "existing-session"
-			return r.Resume(context.Background(), req)
+			return r.Resume(context.Background(), withGitCommonDir(t, req))
 		}},
 	}
 	for _, tt := range tests {
@@ -531,6 +633,77 @@ func TestRunnerRequiresSessionIDAfterSuccessfulPersistentInvocation(t *testing.T
 				t.Fatalf("result = %#v, error = %v, want missing session error", result, err)
 			}
 		})
+	}
+}
+
+func TestRunnerRemovesGitTemporaryDirectoryAfterFailure(t *testing.T) {
+	runner, req, recordPath := helperRunner(t)
+	req.GitCommonDir = t.TempDir()
+	setEnv(t, helperExit, "7")
+	setEnv(t, helperDirty, "populate-git-temp")
+	runner.KeepEnv = append(runner.KeepEnv, helperExit, helperDirty)
+
+	result, err := runner.Execute(context.Background(), req)
+	if err == nil {
+		t.Fatal("expected nonzero-exit error")
+	}
+	record := readHelperRecord(t, recordPath)
+	assertPrivateGitTemp(t, record, req.GitCommonDir)
+	if result.SessionID != "thread-123" || result.Final != "final answer" {
+		t.Fatalf("partial result = %#v", result)
+	}
+}
+
+func TestRunnerRemovesGitTemporaryDirectoryAfterCancellation(t *testing.T) {
+	runner, req, recordPath := helperRunner(t)
+	req.GitCommonDir = t.TempDir()
+	setEnv(t, helperSleep, "10s")
+	runner.KeepEnv = append(runner.KeepEnv, helperSleep)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	type outcome struct {
+		result Result
+		err    error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		result, err := runner.Execute(ctx, req)
+		done <- outcome{result: result, err: err}
+	}()
+	waitForHelperPID(t, recordPath)
+	cancel()
+	got := <-done
+	if !errors.Is(got.err, context.Canceled) {
+		t.Fatalf("error = %v, want context canceled", got.err)
+	}
+	record := readHelperRecord(t, recordPath)
+	assertPrivateGitTemp(t, record, req.GitCommonDir)
+	if got.result.SessionID != "thread-123" || got.result.Final != "final answer" {
+		t.Fatalf("partial result = %#v", got.result)
+	}
+}
+
+func TestRunnerRemovesGitTemporaryDirectoryAfterSetupError(t *testing.T) {
+	runner, req, recordPath := helperRunner(t)
+	req.GitCommonDir = t.TempDir()
+	logFile := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(logFile, []byte("block log setup"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner.LogDir = logFile
+
+	_, err := runner.Execute(context.Background(), req)
+	if err == nil || !strings.Contains(err.Error(), "log directory") {
+		t.Fatalf("error = %v, want log setup error", err)
+	}
+	assertNotCreated(t, recordPath)
+	entries, err := os.ReadDir(req.GitCommonDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("Git common directory contains leaked setup files: %#v", entries)
 	}
 }
 
@@ -667,6 +840,8 @@ func TestRunnerValidatesBeforeSpawning(t *testing.T) {
 		{"negative timeout", "plan", func(_ *Runner, q *Request) { q.Timeout = -time.Second }},
 		{"empty git common directory", "execute", func(_ *Runner, q *Request) { q.GitCommonDir = "" }},
 		{"relative git common directory", "execute", func(_ *Runner, q *Request) { q.GitCommonDir = "relative" }},
+		{"empty git common directory for resume", "resume", func(_ *Runner, q *Request) { q.GitCommonDir = "" }},
+		{"relative git common directory for resume", "resume", func(_ *Runner, q *Request) { q.GitCommonDir = "relative" }},
 		{"empty session ID", "resume", func(_ *Runner, q *Request) { q.SessionID = "" }},
 		{"option session ID", "resume", func(_ *Runner, q *Request) { q.SessionID = "--last" }},
 		{"leading dash session ID", "resume", func(_ *Runner, q *Request) { q.SessionID = "-session" }},
@@ -682,6 +857,7 @@ func TestRunnerValidatesBeforeSpawning(t *testing.T) {
 			}
 			if tt.mode == "resume" {
 				req.SessionID = "session"
+				req = withGitCommonDir(t, req)
 			}
 			tt.mutate(&runner, &req)
 			var err error
@@ -787,6 +963,9 @@ func TestPromptBuildersKeepUntrustedDataDelimited(t *testing.T) {
 func helperRunner(t *testing.T) (Runner, Request, string) {
 	t.Helper()
 	recordPath := filepath.Join(t.TempDir(), "record.json")
+	setEnv(t, "CODEX_API_KEY", "test-codex-api-key")
+	setEnv(t, "HOME", t.TempDir())
+	unsetEnv(t, "CODEX_HOME")
 	setEnv(t, helperEnabled, "1")
 	setEnv(t, helperRecord, recordPath)
 	for _, name := range []string{
@@ -846,7 +1025,7 @@ func expectedPolicyArgs(keep []string) []string {
 	names := append([]string{"PATH", "HOME", "LANG", "TMPDIR", "TMP", "TEMP"}, keep...)
 	seen := make(map[string]struct{}, len(names))
 	for _, name := range names {
-		if name == "CODEX_API_KEY" {
+		if name == "CODEX_API_KEY" || name == "CODEX_HOME" {
 			continue
 		}
 		if _, ok := seen[name]; ok {
@@ -856,6 +1035,43 @@ func expectedPolicyArgs(keep []string) []string {
 		args = append(args, "-c", `shell_environment_policy.filters.`+name+`="include"`)
 	}
 	return args
+}
+
+func expectedWorkspaceTempArgs() []string {
+	return []string{
+		"-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+		"-c", "sandbox_workspace_write.exclude_slash_tmp=true",
+	}
+}
+
+func environmentValue(env []string, name string) string {
+	prefix := name + "="
+	for _, entry := range env {
+		if value, ok := strings.CutPrefix(entry, prefix); ok {
+			return value
+		}
+	}
+	return ""
+}
+
+func assertPrivateGitTemp(t *testing.T, record helperRecordData, gitCommonDir string) {
+	t.Helper()
+	if record.TempDir == "" {
+		t.Fatal("Codex process did not receive TMPDIR")
+	}
+	rel, err := filepath.Rel(gitCommonDir, record.TempDir)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		t.Fatalf("temporary directory %q is not a child of Git common directory %q", record.TempDir, gitCommonDir)
+	}
+	if record.TempMode != 0o700 {
+		t.Fatalf("temporary directory mode = %o, want 700", record.TempMode)
+	}
+	for _, name := range []string{"TMPDIR", "TMP", "TEMP"} {
+		if got := environmentValue(record.Env, name); got != record.TempDir {
+			t.Errorf("%s = %q, want %q", name, got, record.TempDir)
+		}
+	}
+	assertRemoved(t, record.TempDir)
 }
 
 func assertRemoved(t *testing.T, path string) {
