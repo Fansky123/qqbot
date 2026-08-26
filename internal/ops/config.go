@@ -240,6 +240,18 @@ func canonicalDirectory(path string) (string, error) {
 	return resolved, nil
 }
 
+func directoryIdentity(path string) (uint64, uint64, error) {
+	info, err := os.Lstat(path)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return 0, 0, errors.New("repository identity is unavailable")
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, 0, errors.New("repository identity is unavailable")
+	}
+	return uint64(stat.Dev), uint64(stat.Ino), nil
+}
+
 func trustedExecutable(path string, repositories []string, allowCurrentUID bool) (string, error) {
 	if !filepath.IsAbs(path) {
 		return "", errors.New("path must be absolute")

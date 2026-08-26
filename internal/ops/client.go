@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -101,8 +102,24 @@ func (c *Client) Sync(ctx context.Context, projectID string) error {
 
 // Preflight asks the privileged helper to validate one expected release configuration.
 func (c *Client) Preflight(ctx context.Context, projectID, remote, baseBranch, rcBranch string, checks [][]string) error {
+	if c == nil || c.sourceRepos == nil {
+		return errors.New("ops client is not initialized")
+	}
+	source, ok := c.sourceRepos[projectID]
+	if !ok {
+		return errors.New("unknown source project")
+	}
+	device, inode, err := directoryIdentity(source)
+	if err != nil {
+		return err
+	}
 	fingerprint := ProjectFingerprint(Project{Remote: remote, BaseBranch: baseBranch, RCBranch: rcBranch, Checks: checks})
-	_, err := c.call(ctx, "", nil, "validate", "--project", projectID, "--config-sha256", fingerprint)
+	_, err = c.call(ctx, "", nil,
+		"validate", "--project", projectID,
+		"--config-sha256", fingerprint,
+		"--source-device", strconv.FormatUint(device, 10),
+		"--source-inode", strconv.FormatUint(inode, 10),
+	)
 	return err
 }
 
@@ -389,11 +406,18 @@ func validateClientInputs(args []string) error {
 			return errors.New("invalid sync request")
 		}
 	case "validate":
-		if len(args) != 5 || args[3] != "--config-sha256" || len(args[4]) != sha256.Size*2 {
+		if len(args) != 9 || args[3] != "--config-sha256" || len(args[4]) != sha256.Size*2 ||
+			args[5] != "--source-device" || args[7] != "--source-inode" {
 			return errors.New("invalid validate request")
 		}
 		if _, err := hex.DecodeString(args[4]); err != nil {
 			return errors.New("invalid validate request")
+		}
+		for _, value := range []string{args[6], args[8]} {
+			parsed, err := strconv.ParseUint(value, 10, 64)
+			if err != nil || strconv.FormatUint(parsed, 10) != value {
+				return errors.New("invalid validate request")
+			}
 		}
 	case "push":
 		if len(args) != 9 || args[3] != "--task" || args[5] != "--branch" || args[7] != "--commit" {

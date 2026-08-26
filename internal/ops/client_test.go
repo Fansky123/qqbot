@@ -24,6 +24,10 @@ func TestClientBuildsTypedArgvAndParsesResponse(t *testing.T) {
 	record := filepath.Join(t.TempDir(), "argv.json")
 	source, commit := clientTaskSource(t)
 	client := mustNewClient(t, helperCommand(t, record, "success"), map[string]string{"order-api": source})
+	device, inode, err := directoryIdentity(source)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	tests := []struct {
 		name string
@@ -35,7 +39,11 @@ func TestClientBuildsTypedArgvAndParsesResponse(t *testing.T) {
 			call: func() (string, error) {
 				return "", client.Preflight(ctx, "order-api", "origin", "main", "rc", [][]string{{"go", "test", "./..."}})
 			},
-			want: []string{"validate", "--project", "order-api", "--config-sha256", ProjectFingerprint(Project{Remote: "origin", BaseBranch: "main", RCBranch: "rc", Checks: [][]string{{"go", "test", "./..."}}})},
+			want: []string{
+				"validate", "--project", "order-api",
+				"--config-sha256", ProjectFingerprint(Project{Remote: "origin", BaseBranch: "main", RCBranch: "rc", Checks: [][]string{{"go", "test", "./..."}}}),
+				"--source-device", strconv.FormatUint(device, 10), "--source-inode", strconv.FormatUint(inode, 10),
+			},
 		},
 		{
 			name: "sync",
@@ -86,6 +94,9 @@ func TestClientBuildsTypedArgvAndParsesResponse(t *testing.T) {
 			}
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Fatalf("argv = %#v, want %#v", got, tt.want)
+			}
+			if tt.name == "validate" && strings.Contains(strings.Join(got, "\x00"), source) {
+				t.Fatal("validate argv exposed source repository path")
 			}
 		})
 	}

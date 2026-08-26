@@ -8,6 +8,7 @@ import (
 	"flag"
 	"io"
 	"os"
+	"strconv"
 
 	"qqcodex/internal/ops"
 )
@@ -48,7 +49,7 @@ func run(ctx context.Context, args []string) (response, int) {
 		if err != nil {
 			return failed(err), 1
 		}
-		project, err := operator.Preflight(ctx, expected.project)
+		project, err := operator.Preflight(ctx, expected.project, expected.sourceDevice, expected.sourceInode)
 		if err != nil {
 			return failed(errors.New("project preflight failed")), 1
 		}
@@ -96,20 +97,39 @@ func run(ctx context.Context, args []string) (response, int) {
 }
 
 type validateRequest struct {
-	project, fingerprint string
+	project, fingerprint      string
+	sourceDevice, sourceInode uint64
 }
 
 func parseValidate(args []string) (validateRequest, error) {
 	flags := newActionFlags("validate")
 	project := flags.String("project", "", "")
 	fingerprint := flags.String("config-sha256", "", "")
+	sourceDevice := flags.String("source-device", "", "")
+	sourceInode := flags.String("source-inode", "", "")
 	if err := parseAction(flags, args); err != nil || *project == "" || len(*fingerprint) != 64 {
 		return validateRequest{}, errors.New("invalid validate command")
 	}
 	if _, err := hex.DecodeString(*fingerprint); err != nil {
 		return validateRequest{}, errors.New("invalid validate command")
 	}
-	return validateRequest{project: *project, fingerprint: *fingerprint}, nil
+	device, err := parseUint64(*sourceDevice)
+	if err != nil {
+		return validateRequest{}, errors.New("invalid validate command")
+	}
+	inode, err := parseUint64(*sourceInode)
+	if err != nil {
+		return validateRequest{}, errors.New("invalid validate command")
+	}
+	return validateRequest{project: *project, fingerprint: *fingerprint, sourceDevice: device, sourceInode: inode}, nil
+}
+
+func parseUint64(value string) (uint64, error) {
+	parsed, err := strconv.ParseUint(value, 10, 64)
+	if err != nil || strconv.FormatUint(parsed, 10) != value {
+		return 0, errors.New("invalid unsigned integer")
+	}
+	return parsed, nil
 }
 
 func validateExpectedProject(project ops.Project, expected validateRequest) error {

@@ -212,12 +212,28 @@ func TestOperatorPreflightValidatesRepositoryAndReleaseRefs(t *testing.T) {
 
 	t.Run("valid", func(t *testing.T) {
 		fixture := newOpsFixture(t)
-		project, err := fixture.operator.Preflight(context.Background(), fixture.projectID)
+		source := fixture.clone(t)
+		device, inode, err := directoryIdentity(source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		project, err := fixture.operator.Preflight(context.Background(), fixture.projectID, device, inode)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if ProjectFingerprint(project) != ProjectFingerprint(fixture.config.Projects[fixture.projectID]) {
 			t.Fatal("Preflight returned unexpected project metadata")
+		}
+	})
+
+	t.Run("same physical repository", func(t *testing.T) {
+		fixture := newOpsFixture(t)
+		device, inode, err := directoryIdentity(fixture.repo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.operator.Preflight(context.Background(), fixture.projectID, device, inode); err == nil || err.Error() != "repositories must be physically separate" {
+			t.Fatalf("Preflight same repository error = %v", err)
 		}
 	})
 
@@ -227,7 +243,7 @@ func TestOperatorPreflightValidatesRepositoryAndReleaseRefs(t *testing.T) {
 		project.RepoPath = privateTempDir(t)
 		fixture.config.Projects[fixture.projectID] = project
 		operator := mustNewOperator(t, fixture.config)
-		if _, err := operator.Preflight(context.Background(), fixture.projectID); err == nil {
+		if _, err := operator.Preflight(context.Background(), fixture.projectID, 1, 2); err == nil {
 			t.Fatal("Preflight accepted non-Git repository")
 		}
 	})
@@ -235,7 +251,7 @@ func TestOperatorPreflightValidatesRepositoryAndReleaseRefs(t *testing.T) {
 	t.Run("unsafe local config", func(t *testing.T) {
 		fixture := newOpsFixture(t)
 		git(t, fixture.repo, "config", "remote.origin.pushurl", "ext::sh -c false")
-		if _, err := fixture.operator.Preflight(context.Background(), fixture.projectID); err == nil {
+		if _, err := fixture.operator.Preflight(context.Background(), fixture.projectID, 1, 2); err == nil {
 			t.Fatal("Preflight accepted unsafe local Git config")
 		}
 	})
@@ -243,7 +259,7 @@ func TestOperatorPreflightValidatesRepositoryAndReleaseRefs(t *testing.T) {
 	t.Run("missing release ref", func(t *testing.T) {
 		fixture := newOpsFixture(t)
 		git(t, fixture.repo, "update-ref", "-d", "refs/remotes/origin/rc")
-		if _, err := fixture.operator.Preflight(context.Background(), fixture.projectID); err == nil {
+		if _, err := fixture.operator.Preflight(context.Background(), fixture.projectID, 1, 2); err == nil {
 			t.Fatal("Preflight accepted missing RC ref")
 		}
 	})

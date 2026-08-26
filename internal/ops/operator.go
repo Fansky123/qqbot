@@ -96,10 +96,21 @@ func NewOperator(cfg Config) (*Operator, error) {
 }
 
 // Preflight verifies the helper-owned repository without contacting its remote.
-func (o *Operator) Preflight(ctx context.Context, projectID string) (Project, error) {
+func (o *Operator) Preflight(ctx context.Context, projectID string, sourceDevice, sourceInode uint64) (Project, error) {
 	project, err := o.project(projectID)
 	if err != nil {
 		return Project{}, err
+	}
+	repository, err := canonicalDirectory(project.RepoPath)
+	if err != nil || repository != project.RepoPath {
+		return Project{}, errors.New("repository is unavailable")
+	}
+	device, inode, err := directoryIdentity(repository)
+	if err != nil {
+		return Project{}, err
+	}
+	if device == sourceDevice && inode == sourceInode {
+		return Project{}, errors.New("repositories must be physically separate")
 	}
 	if err := o.guardRepository(ctx, project); err != nil {
 		return Project{}, err
