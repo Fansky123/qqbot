@@ -591,13 +591,171 @@ func TestRunShutdownTimeoutCancelsInFlightWorker(t *testing.T) {
 	startedShutdown := time.Now()
 	cancel()
 	err := waitError(t, done, "bounded shutdown")
-	if !errors.Is(err, errShutdownTimeout) {
+	if !errors.Is(err, ErrShutdownTimeout) {
 		t.Fatalf("Run error = %v, want shutdown timeout", err)
 	}
 	if elapsed := time.Since(startedShutdown); elapsed > 500*time.Millisecond {
 		t.Fatalf("bounded shutdown took %s", elapsed)
 	}
 	waitClosed(t, canceled, "worker cancellation")
+}
+
+func TestRunShutdownTimeoutReturnsWhenServiceIgnoresCancellationAndRetainsLock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tasks.db")
+	db := openStore(t, path)
+	accepted := make(chan struct{}, 1)
+	started := make(chan struct{})
+	client := emittingClient{messages: []onebot.GroupMessage{{GroupID: "100", UserID: "200", MessageID: "1"}}, accepted: accepted}
+	service := serviceFunc(func(context.Context, tasksvc.Message) error {
+		close(started)
+		select {}
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- (App{
+			Store: db, Client: client, Scheduler: blockingScheduler{}, Service: service,
+			Groups: groupFunc(func(string) bool { return true }), MessageWorkers: 1, Logger: discardLogger(),
+			ShutdownTimeout: 30 * time.Millisecond,
+		}).Run(ctx)
+	}()
+	waitClosed(t, accepted, "accepted message")
+	waitClosed(t, started, "blocking service start")
+	startedShutdown := time.Now()
+	cancel()
+	err := waitError(t, done, "bounded service shutdown")
+	if !errors.Is(err, ErrShutdownTimeout) {
+		t.Fatalf("Run error = %v, want shutdown timeout", err)
+	}
+	if elapsed := time.Since(startedShutdown); elapsed > 500*time.Millisecond {
+		t.Fatalf("bounded service shutdown took %s", elapsed)
+	}
+	closeStore(t, db)
+	assertRuntimeLockRetained(t, path)
+}
+
+func TestRunShutdownTimeoutReturnsWhenLoopsIgnoreCancellationAndRetainsLock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tasks.db")
+	db := openStore(t, path)
+	defer closeStore(t, db)
+	clientStarted := make(chan struct{})
+	schedulerStarted := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- (App{
+			Store: db,
+			Client: clientFunc(func(context.Context, onebot.Handler) error {
+				close(clientStarted)
+				select {}
+			}),
+			Scheduler: schedulerFunc(func(context.Context) error {
+				close(schedulerStarted)
+				select {}
+			}),
+			Service: serviceFunc(func(context.Context, tasksvc.Message) error { return nil }),
+			Groups:  groupFunc(func(string) bool { return true }), MessageWorkers: 1, Logger: discardLogger(),
+			ShutdownTimeout: 30 * time.Millisecond,
+		}).Run(ctx)
+	}()
+	waitClosed(t, clientStarted, "blocking client start")
+	waitClosed(t, schedulerStarted, "blocking scheduler start")
+	startedShutdown := time.Now()
+	cancel()
+	err := waitError(t, done, "bounded loop shutdown")
+	if !errors.Is(err, ErrShutdownTimeout) {
+		t.Fatalf("Run error = %v, want shutdown timeout", err)
+	}
+	if elapsed := time.Since(startedShutdown); elapsed > 500*time.Millisecond {
+		t.Fatalf("bounded loop shutdown took %s", elapsed)
+	}
+	assertRuntimeLockRetained(t, path)
+}
+
+func TestRunFatalStoreCancelsOtherWorkerBeforeSlowLoopsExit(t *testing.T) {
+	db := openStore(t, filepath.Join(t.TempDir(), "tasks.db"))
+	defer closeStore(t, db)
+	allAccepted := make(chan struct{})
+	secondStarted := make(chan struct{})
+	secondCanceled := make(chan struct{})
+	queuedProcessed := make(chan struct{})
+	loopsCanceled := make(chan struct{}, 2)
+	releaseLoops := make(chan struct{})
+	client := clientFunc(func(ctx context.Context, handler onebot.Handler) error {
+		if err := handler(ctx, onebot.GroupMessage{GroupID: "100", UserID: "200", MessageID: "fatal"}); err != nil {
+			return err
+		}
+		if err := handler(ctx, onebot.GroupMessage{GroupID: "100", UserID: "200", MessageID: "second"}); err != nil {
+			return err
+		}
+		if err := handler(ctx, onebot.GroupMessage{GroupID: "100", UserID: "200", MessageID: "queued"}); err != nil {
+			return err
+		}
+		close(allAccepted)
+		<-ctx.Done()
+		loopsCanceled <- struct{}{}
+		<-releaseLoops
+		return nil
+	})
+	service := serviceFunc(func(ctx context.Context, message tasksvc.Message) error {
+		if message.MessageID == "fatal" {
+			<-secondStarted
+			<-allAccepted
+			return errors.Join(tasksvc.ErrFatalStore, errors.New("store failed"))
+		}
+		if message.MessageID == "queued" {
+			close(queuedProcessed)
+			return nil
+		}
+		close(secondStarted)
+		<-ctx.Done()
+		close(secondCanceled)
+		return ctx.Err()
+	})
+	done := make(chan error, 1)
+	go func() {
+		done <- (App{
+			Store: db, Client: client,
+			Scheduler: schedulerFunc(func(ctx context.Context) error {
+				<-ctx.Done()
+				loopsCanceled <- struct{}{}
+				<-releaseLoops
+				return nil
+			}),
+			Service: service, Groups: groupFunc(func(string) bool { return true }),
+			MessageWorkers: 2, Logger: discardLogger(), ShutdownTimeout: time.Second,
+		}).Run(context.Background())
+	}()
+	waitClosed(t, secondStarted, "second worker start")
+	for range 2 {
+		select {
+		case <-loopsCanceled:
+		case <-time.After(2 * time.Second):
+			t.Fatal("loops did not observe fatal cancellation")
+		}
+	}
+	waitClosed(t, secondCanceled, "other worker immediate cancellation")
+	close(releaseLoops)
+	if err := waitError(t, done, "fatal shutdown"); !errors.Is(err, tasksvc.ErrFatalStore) {
+		t.Fatalf("Run error = %v, want fatal store", err)
+	}
+	select {
+	case <-queuedProcessed:
+		t.Fatal("queued message was processed after fatal store error")
+	default:
+	}
+}
+
+func assertRuntimeLockRetained(t *testing.T, path string) {
+	t.Helper()
+	second := openStore(t, path)
+	defer closeStore(t, second)
+	if lock, err := second.AcquireRuntimeLock(); !errors.Is(err, store.ErrRuntimeLocked) {
+		if lock != nil {
+			_ = lock.Close()
+		}
+		t.Fatalf("runtime lock after timeout = %v, want ErrRuntimeLocked", err)
+	}
 }
 
 type fakeOneBot struct {

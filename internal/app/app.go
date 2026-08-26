@@ -19,7 +19,13 @@ const (
 	defaultShutdownTimeout = 30 * time.Second
 )
 
-var errShutdownTimeout = errors.New("application shutdown timed out")
+// ErrShutdownTimeout means at least one application component ignored graceful cancellation.
+var ErrShutdownTimeout = errors.New("application shutdown timed out")
+
+var retainedRuntimeLocks struct {
+	sync.Mutex
+	locks []*store.RuntimeLock
+}
 
 type Client interface {
 	Run(context.Context, onebot.Handler) error
@@ -66,6 +72,14 @@ func (a App) Run(ctx context.Context) (runErr error) {
 		return fmt.Errorf("acquire application runtime lock: %w", err)
 	}
 	defer func() {
+		if errors.Is(runErr, ErrShutdownTimeout) {
+			// A component may still access durable state. Keep the process-wide fence
+			// until process exit instead of allowing another runtime to take over.
+			retainedRuntimeLocks.Lock()
+			retainedRuntimeLocks.locks = append(retainedRuntimeLocks.locks, lock)
+			retainedRuntimeLocks.Unlock()
+			return
+		}
 		runErr = errors.Join(runErr, lock.Close())
 	}()
 	if err := a.Store.RecoverInterrupted(ctx, lock); err != nil {
@@ -138,6 +152,7 @@ func (a App) runLoops(parent context.Context) error {
 		cancelLoops()
 	case fatalErr = <-fatal:
 		cancelLoops()
+		cancelWorkers()
 	case first = <-results:
 		cancelLoops()
 	}
@@ -152,7 +167,6 @@ func (a App) runLoops(parent context.Context) error {
 	shutdownTimer := time.NewTimer(shutdownTimeout)
 	defer shutdownTimer.Stop()
 	shutdownC := shutdownTimer.C
-	shutdownTimedOut := false
 
 	// Stop intake before closing the queue; the client handler can no longer enqueue after both loops join.
 	remaining := 2
@@ -171,12 +185,9 @@ func (a App) runLoops(parent context.Context) error {
 				fatalErr = err
 				cancelWorkers()
 			}
-			<-results
 		case <-shutdownC:
-			shutdownTimedOut = true
 			cancelWorkers()
-			shutdownC = nil
-			<-results
+			return shutdownTimeoutError(fatalErr)
 		}
 	}
 	close(messages)
@@ -198,11 +209,8 @@ func (a App) runLoops(parent context.Context) error {
 		case <-workersDone:
 			workersDone = nil
 		case <-shutdownC:
-			shutdownTimedOut = true
 			cancelWorkers()
-			shutdownC = nil
-			<-workersDone
-			workersDone = nil
+			return shutdownTimeoutError(fatalErr)
 		}
 	}
 	select {
@@ -214,13 +222,7 @@ func (a App) runLoops(parent context.Context) error {
 	}
 
 	if fatalErr != nil {
-		if shutdownTimedOut {
-			return errors.Join(fatalErr, errShutdownTimeout)
-		}
 		return fatalErr
-	}
-	if shutdownTimedOut {
-		return errShutdownTimeout
 	}
 	if parent.Err() != nil {
 		return nil
@@ -231,8 +233,18 @@ func (a App) runLoops(parent context.Context) error {
 	return fmt.Errorf("%s loop failed: %w", first.name, first.err)
 }
 
+func shutdownTimeoutError(fatalErr error) error {
+	if fatalErr != nil {
+		return errors.Join(fatalErr, ErrShutdownTimeout)
+	}
+	return ErrShutdownTimeout
+}
+
 func (a App) messageWorker(ctx context.Context, logger *slog.Logger, messages <-chan tasksvc.Message, fatal chan<- error) {
 	for {
+		if ctx.Err() != nil {
+			return
+		}
 		var message tasksvc.Message
 		var ok bool
 		select {
@@ -242,6 +254,9 @@ func (a App) messageWorker(ctx context.Context, logger *slog.Logger, messages <-
 			if !ok {
 				return
 			}
+		}
+		if ctx.Err() != nil {
+			return
 		}
 		if err := a.handleMessage(ctx, message); err != nil {
 			if errors.Is(err, tasksvc.ErrFatalStore) {
