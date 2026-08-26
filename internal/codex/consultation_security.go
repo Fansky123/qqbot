@@ -269,7 +269,7 @@ func (p *consultationProxy) Close() error {
 		defer cancel()
 		closeErr = p.server.Shutdown(ctx)
 		if errors.Is(closeErr, context.DeadlineExceeded) {
-			closeErr = errors.Join(closeErr, p.server.Close())
+			closeErr = p.server.Close()
 		}
 		if closer, ok := p.client.Transport.(interface{ CloseIdleConnections() }); ok {
 			closer.CloseIdleConnections()

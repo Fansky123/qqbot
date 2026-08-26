@@ -1,12 +1,14 @@
 package codex
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -666,6 +668,110 @@ func TestConsultationProxyRevokesTokenOnCloseAndAcrossInvocations(t *testing.T) 
 	_, err = http.Post(url+consultationResponsesPath, "application/json", nil)
 	if err == nil {
 		t.Fatal("closed proxy accepted a request")
+	}
+}
+
+func TestConsultationProxyCancellationStopsActiveStreamAndClosesTransport(t *testing.T) {
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "data: started\n\n")
+		w.(http.Flusher).Flush()
+		close(started)
+		<-r.Context().Done()
+		close(canceled)
+	}))
+	defer upstream.Close()
+	base, err := parseConsultationBaseURL(upstream.URL + "/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport := &countingTransport{RoundTripper: upstream.Client().Transport}
+	ctx, cancel := context.WithCancel(context.Background())
+	proxy, err := startConsultationProxy(ctx, base, "real", []byte("stream-token"), &http.Client{Transport: transport})
+	if err != nil {
+		t.Fatal(err)
+	}
+	url := proxy.URL()
+	done := make(chan error, 1)
+	go func() {
+		r, _ := http.NewRequest(http.MethodPost, url+consultationResponsesPath, strings.NewReader(`{}`))
+		r.Header.Set("Authorization", "Bearer stream-token")
+		res, err := http.DefaultClient.Do(r)
+		if err == nil {
+			_, err = io.ReadAll(res.Body)
+			res.Body.Close()
+		}
+		done <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("upstream did not start")
+	}
+	cancel()
+	select {
+	case <-canceled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("upstream context not canceled")
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("client did not return")
+	}
+	if err := proxy.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := proxy.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := transport.closeCount(); got != 1 {
+		t.Fatalf("CloseIdleConnections calls = %d, want 1", got)
+	}
+	if _, err := http.Post(url+consultationResponsesPath, "application/json", nil); err == nil {
+		t.Fatal("closed listener accepted request")
+	}
+}
+
+func TestConsultationProxyCancellationClosesSlowAuthenticatedBody(t *testing.T) {
+	base, err := parseConsultationBaseURL("https://api.example.test/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	proxy, err := startConsultationProxy(ctx, base, "real", []byte("upload-token"), &http.Client{Transport: rejectingTransport{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := net.Dial("tcp", strings.TrimPrefix(proxy.URL(), "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_, _ = fmt.Fprintf(conn, "POST %s HTTP/1.1\r\nHost: %s\r\nAuthorization: Bearer upload-token\r\nContent-Length: 10\r\nExpect: 100-continue\r\n\r\n", consultationResponsesPath, strings.TrimPrefix(proxy.URL(), "http://"))
+	reader := bufio.NewReader(conn)
+	line, err := reader.ReadString('\n')
+	if err != nil || !strings.Contains(line, "100") {
+		t.Fatalf("100 continue = %q, %v", line, err)
+	}
+	_, _ = conn.Write([]byte("x"))
+	cancel()
+	start := time.Now()
+	if err := proxy.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatal("Close exceeded bound")
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := io.ReadAll(reader); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("slow upload connection remained open")
 	}
 }
 
@@ -1945,6 +2051,24 @@ type rejectingTransport struct{}
 
 func (rejectingTransport) RoundTrip(*http.Request) (*http.Response, error) {
 	return nil, errors.New("upstream must not be called")
+}
+
+type countingTransport struct {
+	http.RoundTripper
+	mu     sync.Mutex
+	closes int
+}
+
+func (t *countingTransport) CloseIdleConnections() {
+	t.mu.Lock()
+	t.closes++
+	t.mu.Unlock()
+}
+
+func (t *countingTransport) closeCount() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.closes
 }
 
 func (s *recordingLogSink) Append(taskID, stream string, data []byte) error {
