@@ -18,6 +18,27 @@ import (
 )
 
 const testTaskID = "T-ABCDEF012345"
+const consultationTaskID = "Q-012345ABCDEF"
+
+func TestTaskLogAcceptsConsultationTaskID(t *testing.T) {
+	t.Parallel()
+	store := openStore(t, nil)
+
+	if err := store.Append(consultationTaskID, "codex.events", []byte("consultation")); err != nil {
+		t.Fatalf("Append() error = %v", err)
+	}
+	if _, err := store.Summary(consultationTaskID, 100); err != nil {
+		t.Fatalf("Summary() error = %v", err)
+	}
+	for _, taskID := range []string{"Q-012345abcDEF", "Q-012345ABCDE", "q-012345ABCDEF", "X-012345ABCDEF"} {
+		if err := store.Append(taskID, "codex.events", []byte("data")); err == nil {
+			t.Errorf("Append(%q) error = nil, want invalid task ID", taskID)
+		}
+		if _, err := store.Summary(taskID, 100); err == nil {
+			t.Errorf("Summary(%q) error = nil, want invalid task ID", taskID)
+		}
+	}
+}
 
 func TestStoreRejectsInvalidTaskIDsAndStreams(t *testing.T) {
 	t.Parallel()

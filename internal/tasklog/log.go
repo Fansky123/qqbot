@@ -36,7 +36,7 @@ var ErrLimitExceeded = errors.New("task log limit exceeded")
 var taskLimitRecord = []byte(`{"time":"1970-01-01T00:00:00Z","stream":"tasklog.limit","data":"task log output limit reached"}` + "\n")
 
 var (
-	taskIDPattern = regexp.MustCompile(`^T-[A-F0-9]{12}$`)
+	taskIDPattern = regexp.MustCompile(`^[TQ]-[A-F0-9]{12}$`)
 	streamPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 	bearerPattern = regexp.MustCompile(`(?i)(\b(?:authorization[ \t]*:[ \t]*)?bearer[ \t]+)[^\s,;]+`)
 	keyPattern    = regexp.MustCompile(`(?i)\b(CODEX_API_KEY|OPENAI_API_KEY|NAPCAT_ACCESS_TOKEN)=[^\s"'` + "`" + `,;]+`)
