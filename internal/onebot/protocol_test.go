@@ -78,6 +78,31 @@ func TestProtocolDoesNotTreatOtherMentionsAsSelf(t *testing.T) {
 	}
 }
 
+func TestProtocolIgnoresEventsForAnotherSelfID(t *testing.T) {
+	t.Parallel()
+
+	raw := []byte(`{
+		"post_type":"message",
+		"message_type":"group",
+		"message_id":"9988",
+		"group_id":"123456",
+		"user_id":"654321",
+		"self_id":"999000",
+		"message":[
+			{"type":"at","data":{"qq":"111222"}},
+			{"type":"text","data":{"text":"[orders] ignored"}}
+		]
+	}`)
+
+	message, accepted, err := DecodeGroupMessage(raw, "111222")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if accepted || message != (GroupMessage{}) {
+		t.Fatalf("event for another self ID was accepted: %#v, %v", message, accepted)
+	}
+}
+
 func TestProtocolIgnoresNonGroupEvents(t *testing.T) {
 	t.Parallel()
 
@@ -152,6 +177,10 @@ func TestProtocolRejectsMalformedTargetGroupEvents(t *testing.T) {
 		`{"post_type":"message","message_type":"group","message_id":1,"group_id":2,"user_id":3,"self_id":4,"message":null}`,
 		`{"post_type":"message","message_type":"group","message_id":1,"group_id":2,"user_id":3,"self_id":4,"message":"text mode"}`,
 		`{"post_type":"message","message_type":"group","message_id":1,"group_id":2,"user_id":3,"self_id":4,"message":[{"type":"text","data":{}}]}`,
+		`{"post_type":"message","message_type":"group","message_id":1,"group_id":2,"user_id":3,"self_id":4,"message":[{"type":"text","data":{"text":null}}]}`,
+		`{"post_type":"message","message_type":"group","message_id":1,"group_id":2,"user_id":3,"self_id":4,"message":[{"type":"text","data":{"text":true}}]}`,
+		`{"post_type":"message","message_type":"group","message_id":1,"group_id":2,"user_id":3,"self_id":4,"message":[{"type":"text","data":{"text":42}}]}`,
+		`{"post_type":"message","message_type":"group","message_id":1,"group_id":2,"user_id":3,"self_id":4,"message":[{"type":"text","data":{"text":{}}}]}`,
 	}
 
 	for _, raw := range tests {
@@ -187,7 +216,9 @@ func TestProtocolActionRequestAndResponse(t *testing.T) {
 			"message": []any{
 				map[string]any{
 					"type": "text",
-					"data": map[string]any{"text": `a&amp;b&#91;c&#93;&#44;d`},
+					// Array-format text is already structured data. Escaping it here
+					// would make CQ entities visible in the delivered message.
+					"data": map[string]any{"text": `a&b[c],d`},
 				},
 			},
 		},

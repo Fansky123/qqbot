@@ -92,6 +92,9 @@ func DecodeGroupMessage(raw []byte, selfID string) (GroupMessage, bool, error) {
 	if event.MessageID == "" || event.GroupID == "" || event.UserID == "" || event.SelfID == "" {
 		return GroupMessage{}, false, errors.New("OneBot group message is missing an ID")
 	}
+	if string(event.SelfID) != configuredSelfID {
+		return GroupMessage{}, false, nil
+	}
 	messageJSON := bytes.TrimSpace(event.Message)
 	if len(messageJSON) == 0 || bytes.Equal(messageJSON, []byte("null")) {
 		return GroupMessage{}, false, errors.New("OneBot group message is missing segments")
@@ -112,11 +115,11 @@ func DecodeGroupMessage(raw []byte, selfID string) (GroupMessage, bool, error) {
 		switch segment.Type {
 		case "text":
 			part, ok := segment.Data["text"]
-			var partText string
-			if !ok || json.Unmarshal(part, &partText) != nil {
+			var partText *string
+			if !ok || json.Unmarshal(part, &partText) != nil || partText == nil {
 				return GroupMessage{}, false, errors.New("OneBot text segment is invalid")
 			}
-			text.WriteString(partText)
+			text.WriteString(*partText)
 		case "at":
 			target, ok := segment.Data["qq"]
 			if !ok {
@@ -144,7 +147,7 @@ func SendGroupAction(groupID, text, echo string) (ActionRequest, error) {
 	if err != nil {
 		return ActionRequest{}, errors.New("OneBot group ID is invalid")
 	}
-	encodedText, err := json.Marshal(EscapeCQText(text))
+	encodedText, err := json.Marshal(text)
 	if err != nil {
 		return ActionRequest{}, errors.New("encode OneBot group message failed")
 	}
