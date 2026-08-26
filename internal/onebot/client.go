@@ -1,6 +1,7 @@
 package onebot
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -388,22 +389,33 @@ func (s *clientSession) isPending(echo string) bool {
 
 func (s *clientSession) handleResponse(raw []byte) bool {
 	var envelope struct {
-		Echo json.RawMessage `json:"echo"`
+		PostType json.RawMessage `json:"post_type"`
+		Status   json.RawMessage `json:"status"`
+		RetCode  json.RawMessage `json:"retcode"`
+		Echo     json.RawMessage `json:"echo"`
 	}
-	if json.Unmarshal(raw, &envelope) != nil || len(envelope.Echo) == 0 {
+	if json.Unmarshal(raw, &envelope) != nil || hasPostType(envelope.PostType) || len(envelope.Echo) == 0 {
 		return false
 	}
 	var echo string
 	if json.Unmarshal(envelope.Echo, &echo) != nil || echo == "" {
 		return true
 	}
+	if !s.isPending(echo) {
+		return true
+	}
+	status, retCode, err := decodeActionResult(envelope.Status, envelope.RetCode)
+	if err != nil {
+		s.complete(echo, fmt.Errorf("malformed OneBot action response: %w", err))
+		return true
+	}
 
 	var response ActionResponse
 	if err := json.Unmarshal(raw, &response); err != nil {
-		s.complete(echo, fmt.Errorf("decode OneBot action response: %w", err))
+		s.complete(echo, fmt.Errorf("malformed OneBot action response: %w", err))
 		return true
 	}
-	if response.Status == "ok" && response.RetCode == 0 {
+	if status == "ok" && retCode == 0 {
 		s.complete(echo, nil)
 		return true
 	}
@@ -414,8 +426,37 @@ func (s *clientSession) handleResponse(raw []byte) bool {
 	if detail == "" {
 		detail = "request failed"
 	}
-	s.complete(echo, fmt.Errorf("onebot action failed: status=%q retcode=%d: %s", response.Status, response.RetCode, detail))
+	s.complete(echo, fmt.Errorf("onebot action failed: status=%q retcode=%d: %s", status, retCode, detail))
 	return true
+}
+
+func hasPostType(raw json.RawMessage) bool {
+	if len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return false
+	}
+	var postType string
+	if json.Unmarshal(raw, &postType) == nil {
+		return postType != ""
+	}
+	return true
+}
+
+func decodeActionResult(statusRaw, retCodeRaw json.RawMessage) (string, int, error) {
+	if len(statusRaw) == 0 || bytes.Equal(bytes.TrimSpace(statusRaw), []byte("null")) {
+		return "", 0, errors.New("status is required")
+	}
+	var status string
+	if err := json.Unmarshal(statusRaw, &status); err != nil || status == "" {
+		return "", 0, errors.New("status must be a non-empty string")
+	}
+	if len(retCodeRaw) == 0 || bytes.Equal(bytes.TrimSpace(retCodeRaw), []byte("null")) {
+		return "", 0, errors.New("retcode is required")
+	}
+	var retCode int
+	if err := json.Unmarshal(retCodeRaw, &retCode); err != nil {
+		return "", 0, errors.New("retcode must be an integer")
+	}
+	return status, retCode, nil
 }
 
 func (s *clientSession) shutdown(err error) {

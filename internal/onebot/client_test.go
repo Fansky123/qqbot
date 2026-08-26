@@ -102,7 +102,7 @@ func TestClientCorrelatesConcurrentOutOfOrderResponses(t *testing.T) {
 			actions = append(actions, action)
 		}
 		for i := len(actions) - 1; i >= 0; i-- {
-			if err := wsjson.Write(ctx, conn, ActionResponse{Status: "ok", Echo: actions[i].Echo}); err != nil {
+			if err := wsjson.Write(ctx, conn, ActionResponse{Status: "ok", RetCode: 0, Echo: actions[i].Echo}); err != nil {
 				return
 			}
 		}
@@ -168,6 +168,118 @@ func TestClientReturnsActionFailure(t *testing.T) {
 	}
 }
 
+func TestClientEventEchoDoesNotCompletePendingAction(t *testing.T) {
+	t.Parallel()
+
+	allowResponse := make(chan struct{})
+	server := newWebSocketServer(t, func(ctx context.Context, conn *websocket.Conn, _ *http.Request) {
+		var action ActionRequest
+		if wsjson.Read(ctx, conn, &action) != nil {
+			return
+		}
+		event := map[string]any{
+			"post_type": "message", "message_type": "group", "echo": action.Echo,
+			"message_id": 7, "group_id": 2, "user_id": 3, "self_id": 4,
+			"message": []any{map[string]any{"type": "text", "data": map[string]any{"text": "event-with-echo"}}},
+		}
+		if wsjson.Write(ctx, conn, event) != nil {
+			return
+		}
+		select {
+		case <-allowResponse:
+		case <-ctx.Done():
+			return
+		}
+		_ = wsjson.Write(ctx, conn, ActionResponse{Status: "ok", RetCode: 0, Echo: action.Echo})
+	})
+	defer server.Close()
+
+	client := &Client{URL: webSocketURL(server.URL), Token: "token", SelfID: "4", MessageRunes: 1200}
+	runCtx, stop := context.WithCancel(context.Background())
+	runErr := make(chan error, 1)
+	messages := make(chan GroupMessage, 1)
+	go func() {
+		runErr <- client.Run(runCtx, func(_ context.Context, message GroupMessage) error {
+			messages <- message
+			return nil
+		})
+	}()
+	waitForConnection(t, client)
+
+	sendCtx, cancelSend := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelSend()
+	sendErr := make(chan error, 1)
+	go func() { sendErr <- client.Send(sendCtx, "2", "message") }()
+	select {
+	case message := <-messages:
+		if message.Text != "event-with-echo" {
+			t.Fatalf("event text = %q", message.Text)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("group event with echo was not dispatched")
+	}
+	select {
+	case err := <-sendErr:
+		t.Fatalf("event completed pending action with %v", err)
+	default:
+	}
+	close(allowResponse)
+	if err := receive(t, sendErr); err != nil {
+		t.Fatalf("Send returned %v", err)
+	}
+
+	stop()
+	if err := receive(t, runErr); err != nil {
+		t.Fatalf("Run returned %v", err)
+	}
+}
+
+func TestClientRejectsMalformedMatchingActionResponse(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		response func(string) map[string]any
+	}{
+		{name: "missing retcode", response: func(echo string) map[string]any { return map[string]any{"status": "ok", "echo": echo} }},
+		{name: "null retcode", response: func(echo string) map[string]any { return map[string]any{"status": "ok", "retcode": nil, "echo": echo} }},
+		{name: "string retcode", response: func(echo string) map[string]any { return map[string]any{"status": "ok", "retcode": "0", "echo": echo} }},
+		{name: "float retcode", response: func(echo string) map[string]any { return map[string]any{"status": "ok", "retcode": 0.5, "echo": echo} }},
+		{name: "missing status", response: func(echo string) map[string]any { return map[string]any{"retcode": 0, "echo": echo} }},
+		{name: "null status", response: func(echo string) map[string]any { return map[string]any{"status": nil, "retcode": 0, "echo": echo} }},
+		{name: "numeric status", response: func(echo string) map[string]any { return map[string]any{"status": 1, "retcode": 0, "echo": echo} }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			server := newWebSocketServer(t, func(ctx context.Context, conn *websocket.Conn, _ *http.Request) {
+				var action ActionRequest
+				if wsjson.Read(ctx, conn, &action) != nil {
+					return
+				}
+				_ = wsjson.Write(ctx, conn, test.response(action.Echo))
+			})
+			defer server.Close()
+
+			client, stop, runErr := runTestClient(t, server.URL)
+			waitForConnection(t, client)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			err := client.Send(ctx, "2", "message")
+			if err == nil || !strings.Contains(err.Error(), "malformed OneBot action response") {
+				t.Fatalf("Send error = %v", err)
+			}
+			if got := clientPending(client); got != 0 {
+				t.Fatalf("pending actions = %d, want 0", got)
+			}
+			stop()
+			if err := receive(t, runErr); err != nil {
+				t.Fatalf("Run returned %v", err)
+			}
+		})
+	}
+}
+
 func TestClientHandlerCanSendWithoutBlockingReader(t *testing.T) {
 	t.Parallel()
 
@@ -184,7 +296,7 @@ func TestClientHandlerCanSendWithoutBlockingReader(t *testing.T) {
 		if wsjson.Read(ctx, conn, &action) != nil {
 			return
 		}
-		_ = wsjson.Write(ctx, conn, ActionResponse{Status: "ok", Echo: action.Echo})
+		_ = wsjson.Write(ctx, conn, ActionResponse{Status: "ok", RetCode: 0, Echo: action.Echo})
 		<-ctx.Done()
 	})
 	defer server.Close()
@@ -223,7 +335,7 @@ func TestClientSplitsSequentiallyAndStopsAtFirstFailure(t *testing.T) {
 				return
 			}
 			actions <- action
-			response := ActionResponse{Status: "ok", Echo: action.Echo}
+			response := ActionResponse{Status: "ok", RetCode: 0, Echo: action.Echo}
 			if i == 1 {
 				response.Status = "failed"
 				response.RetCode = 500
@@ -606,7 +718,7 @@ func TestClientIgnoresOrphanResponseAndReturnsMalformedResponse(t *testing.T) {
 	t.Parallel()
 
 	server := newWebSocketServer(t, func(ctx context.Context, conn *websocket.Conn, _ *http.Request) {
-		_ = wsjson.Write(ctx, conn, map[string]any{"status": "ok", "retcode": 0, "echo": "orphan"})
+		_ = wsjson.Write(ctx, conn, map[string]any{"status": "ok", "echo": "orphan"})
 		var action ActionRequest
 		if wsjson.Read(ctx, conn, &action) != nil {
 			return
@@ -620,7 +732,7 @@ func TestClientIgnoresOrphanResponseAndReturnsMalformedResponse(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	err := client.Send(ctx, "2", "message")
-	if err == nil || !strings.Contains(err.Error(), "decode OneBot action response") {
+	if err == nil || !strings.Contains(err.Error(), "malformed OneBot action response") {
 		t.Fatalf("Send error = %v", err)
 	}
 	if got := clientPending(client); got != 0 {
