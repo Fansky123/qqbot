@@ -1029,6 +1029,7 @@ func TestConsultationPersistenceAndCompletion(t *testing.T) {
 	db := openTestStore(t)
 	now := time.UnixMilli(1_787_600_000_000).UTC()
 	consultation := testConsultation(now)
+	consultation.ProjectID = ""
 
 	if err := db.CreateConsultation(ctx, consultation); err != nil {
 		t.Fatal(err)

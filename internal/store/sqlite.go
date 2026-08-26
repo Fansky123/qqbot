@@ -896,7 +896,7 @@ func (s *Store) CompleteConsultation(ctx context.Context, id, leaseToken, reply 
 
 func validateNewConsultation(consultation *model.Consultation) error {
 	if consultation == nil || consultation.ID == "" || consultation.GroupID == "" || consultation.MessageID == "" ||
-		consultation.UserID == "" || consultation.ProjectID == "" || consultation.Question == "" || consultation.LeaseToken == "" ||
+		consultation.UserID == "" || consultation.Question == "" || consultation.LeaseToken == "" ||
 		consultation.LeaseExpiresAt.IsZero() || consultation.CreatedAt.IsZero() || consultation.UpdatedAt.IsZero() ||
 		!consultation.CompletedAt.IsZero() {
 		return errors.New("pending consultation identity, question, lease, and timestamps are required")
