@@ -26,7 +26,7 @@ import (
 	"qqcodex/internal/tasksvc"
 )
 
-type starter func(context.Context, config.Config, string, func(string) string, *slog.Logger) error
+type starter func(context.Context, config.Config, string, func(string) string, *slog.Logger, bool) error
 
 func main() {
 	os.Exit(mainCode())
@@ -47,7 +47,7 @@ func run(ctx context.Context, args []string, getenv func(string) string, logger 
 	if ctx == nil || getenv == nil || logger == nil || start == nil {
 		return errors.New("main dependencies are required")
 	}
-	configPath, err := parseArgs(args)
+	configPath, cleanupExpired, err := parseArgs(args)
 	if err != nil {
 		return err
 	}
@@ -55,24 +55,31 @@ func run(ctx context.Context, args []string, getenv func(string) string, logger 
 	if err != nil {
 		return fmt.Errorf("load configuration: %w", err)
 	}
-	token := getenv(cfg.OneBot.AccessTokenEnv)
-	if token == "" {
-		return errors.New("onebot access token is required")
+	var token string
+	if !cleanupExpired {
+		token = getenv(cfg.OneBot.AccessTokenEnv)
+		if token == "" {
+			return errors.New("onebot access token is required")
+		}
 	}
-	return start(ctx, cfg, token, getenv, logger)
+	return start(ctx, cfg, token, getenv, logger, cleanupExpired)
 }
 
-func parseArgs(args []string) (string, error) {
+func parseArgs(args []string) (string, bool, error) {
 	flags := flag.NewFlagSet("qqcodex", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	configPath := flags.String("config", "", "")
+	cleanupExpired := flags.Bool("cleanup-expired", false, "")
 	if err := flags.Parse(args); err != nil || *configPath == "" || flags.NArg() != 0 {
-		return "", errors.New("usage: qqcodex -config <path>")
+		return "", false, errors.New("usage: qqcodex -config <path> [-cleanup-expired]")
 	}
-	return *configPath, nil
+	return *configPath, *cleanupExpired, nil
 }
 
-func buildAndRun(ctx context.Context, cfg config.Config, token string, getenv func(string) string, logger *slog.Logger) error {
+func buildAndRun(ctx context.Context, cfg config.Config, token string, getenv func(string) string, logger *slog.Logger, cleanupExpired bool) error {
+	if cleanupExpired {
+		return buildAndCleanup(ctx, cfg)
+	}
 	if err := validateStartup(&cfg); err != nil {
 		return err
 	}
@@ -119,9 +126,32 @@ func buildAndRun(ctx context.Context, cfg config.Config, token string, getenv fu
 	service := tasksvc.NewService(registry, db, authorizer, runner, scheduler, client, logs)
 	application := app.App{
 		Store: db, Client: client, Scheduler: scheduler, Service: service, Groups: authorizer,
+		Projects: registry, Worktrees: worktrees, Logs: logs,
 		MessageWorkers: cfg.MessageWorkers, Logger: logger,
 	}
 	return errors.Join(application.Run(ctx), db.Close())
+}
+
+func buildAndCleanup(ctx context.Context, cfg config.Config) error {
+	if err := validateCleanupStartup(&cfg); err != nil {
+		return err
+	}
+	registry, err := config.NewRegistry(cfg)
+	if err != nil {
+		return errors.New("project registry is invalid")
+	}
+	logs, err := tasklog.Open(cfg.LogDir, nil)
+	if err != nil {
+		return errors.New("task log directory is invalid")
+	}
+	db, err := store.Open(cfg.DatabasePath)
+	if err != nil {
+		return errors.New("sqlite store is invalid")
+	}
+	application := app.App{
+		Store: db, Projects: registry, Worktrees: &gitwork.Manager{Root: cfg.WorktreeRoot}, Logs: logs,
+	}
+	return errors.Join(application.CleanupExpired(ctx), db.Close())
 }
 
 func validateStartup(cfg *config.Config) error {
@@ -153,6 +183,30 @@ func validateStartup(cfg *config.Config) error {
 	}
 	for _, project := range cfg.Projects {
 		if err := validateProject(project); err != nil {
+			return fmt.Errorf("project %q is invalid", project.ID)
+		}
+	}
+	if err := validatePathOverlap(cfg); err != nil {
+		return errors.New("configured paths overlap")
+	}
+	return nil
+}
+
+func validateCleanupStartup(cfg *config.Config) error {
+	if cfg == nil {
+		return errors.New("configuration is required")
+	}
+	if err := validateDatabasePath(cfg.DatabasePath); err != nil {
+		return errors.New("database directory is invalid")
+	}
+	if err := ensurePrivateDirectory(cfg.LogDir); err != nil {
+		return errors.New("log directory is invalid")
+	}
+	if err := ensurePrivateDirectory(cfg.WorktreeRoot); err != nil {
+		return errors.New("worktree directory is invalid")
+	}
+	for _, project := range cfg.Projects {
+		if err := validateRepository(project.RepoPath); err != nil {
 			return fmt.Errorf("project %q is invalid", project.ID)
 		}
 	}
@@ -238,18 +292,8 @@ func validateProject(project config.Project) error {
 	if !safeGitRemote(project.Remote) {
 		return errors.New("configured remote is invalid")
 	}
-	info, err := os.Lstat(project.RepoPath)
-	if err != nil {
+	if err := validateRepository(project.RepoPath); err != nil {
 		return err
-	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-		return errors.New("repository must be a real directory")
-	}
-	if _, err := os.Stat(filepath.Join(project.RepoPath, ".git")); err != nil {
-		return errors.New("repository is not a Git worktree")
-	}
-	if _, err := runGit(project.RepoPath, "rev-parse", "--show-toplevel"); err != nil {
-		return errors.New("repository is not a Git worktree")
 	}
 	if _, err := runGit(project.RepoPath, "remote", "get-url", project.Remote); err != nil {
 		return errors.New("configured remote is unavailable")
@@ -277,6 +321,23 @@ func validateProject(project config.Project) error {
 		if _, err := exec.LookPath(check[0]); err != nil {
 			return errors.New("check executable is unavailable")
 		}
+	}
+	return nil
+}
+
+func validateRepository(repoPath string) error {
+	info, err := os.Lstat(repoPath)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return errors.New("repository must be a real directory")
+	}
+	if _, err := os.Stat(filepath.Join(repoPath, ".git")); err != nil {
+		return errors.New("repository is not a Git worktree")
+	}
+	if _, err := runGit(repoPath, "rev-parse", "--show-toplevel"); err != nil {
+		return errors.New("repository is not a Git worktree")
 	}
 	return nil
 }

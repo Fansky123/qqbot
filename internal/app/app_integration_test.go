@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -813,6 +814,177 @@ func TestRunShutdownTimeoutPreservesReadySchedulerFatal(t *testing.T) {
 	assertRuntimeLockRetained(t, path)
 }
 
+func TestCleanupExpiredRemovesOnlyOldFailedAndCancelledLocalArtifacts(t *testing.T) {
+	root := t.TempDir()
+	repo, remote := createGitProject(t, root)
+	worktreeRoot := filepath.Join(root, "worktrees")
+	logRoot := filepath.Join(root, "logs")
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	project := config.Project{
+		ID: "project", Aliases: []string{"p"}, RepoPath: repo, BaseBranch: "main", RCBranch: "rc", Remote: "origin",
+		Checks: [][]string{{"git", "status"}}, DeployAction: "deploy", MaxConcurrent: 1,
+		CodexTimeoutSeconds: 30, LogRetentionDays: 7,
+	}
+	registry, err := config.NewRegistry(config.Config{
+		OneBot:       config.OneBotConfig{URL: "ws://127.0.0.1", AccessTokenEnv: "TOKEN", SelfID: "1", MessageRunes: 100},
+		DatabasePath: filepath.Join(root, "tasks.db"), LogDir: logRoot, WorktreeRoot: worktreeRoot, MessageWorkers: 1,
+		AllowedGroupIDs: []string{"1"}, EmployeeIDs: []string{"2"}, AdminIDs: []string{"2"},
+		Codex: config.CodexConfig{Binary: "unused"}, OpsCommand: []string{"unused"}, Projects: []config.Project{project},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	db := openStore(t, filepath.Join(root, "tasks.db"))
+	defer closeStore(t, db)
+	logs, err := tasklog.Open(logRoot, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktrees := &gitwork.Manager{Root: worktreeRoot}
+	cases := []struct {
+		id      string
+		status  model.Status
+		updated time.Time
+		cleaned bool
+	}{
+		{"T-000000000101", model.StatusFailed, now.Add(-8 * 24 * time.Hour), true},
+		{"T-000000000102", model.StatusCancelled, now.Add(-9 * 24 * time.Hour), true},
+		{"T-000000000103", model.StatusFailed, now.Add(-6 * 24 * time.Hour), false},
+		{"T-000000000104", model.StatusQueued, now.Add(-30 * 24 * time.Hour), false},
+		{"T-000000000105", model.StatusMergeConflict, now.Add(-30 * 24 * time.Hour), false},
+		{"T-000000000106", model.StatusDeployed, now.Add(-30 * 24 * time.Hour), false},
+	}
+	artifacts := make(map[string]gitwork.Prepared, len(cases))
+	for _, tc := range cases {
+		prepared, err := worktrees.Prepare(context.Background(), project, tc.id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		artifacts[tc.id] = prepared
+		task := &model.Task{
+			ID: tc.id, ProjectID: project.ID, GroupID: "1", CreatorID: "2", Requirement: "cleanup",
+			Status: tc.status, Branch: prepared.Branch, Worktree: prepared.Path, BaseCommit: prepared.BaseCommit,
+			GitCommonDir: prepared.GitCommonDir, CreatedAt: tc.updated.Add(-time.Hour), UpdatedAt: tc.updated,
+		}
+		if err := db.CreateTask(context.Background(), task); err != nil {
+			t.Fatal(err)
+		}
+		if err := logs.Append(tc.id, "test", []byte("artifact")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oldFailed := artifacts[cases[0].id]
+	if err := db.AppendAudit(context.Background(), cases[0].id, "cleanup_test", "retained", now.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	runTestCommand(t, repo, "git", "push", "origin", oldFailed.Branch)
+	remoteBefore := gitOutput(t, repo, "ls-remote", "--refs", remote, "refs/heads/"+oldFailed.Branch)
+
+	err = (App{Store: db, Projects: registry, Worktrees: worktrees, Logs: logs, Now: func() time.Time { return now }}).CleanupExpired(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range cases {
+		prepared := artifacts[tc.id]
+		_, worktreeErr := os.Stat(prepared.Path)
+		_, logErr := os.Stat(filepath.Join(logRoot, tc.id+".log"))
+		if tc.cleaned {
+			if !errors.Is(worktreeErr, os.ErrNotExist) || !errors.Is(logErr, os.ErrNotExist) {
+				t.Errorf("cleaned task %s artifacts: worktree=%v log=%v", tc.id, worktreeErr, logErr)
+			}
+		} else if worktreeErr != nil || logErr != nil {
+			t.Errorf("retained task %s artifacts: worktree=%v log=%v", tc.id, worktreeErr, logErr)
+		}
+		if _, err := db.GetTask(context.Background(), tc.id); err != nil {
+			t.Errorf("task row %s was removed: %v", tc.id, err)
+		}
+	}
+	if remoteAfter := gitOutput(t, repo, "ls-remote", "--refs", remote, "refs/heads/"+oldFailed.Branch); remoteAfter != remoteBefore {
+		t.Fatalf("cleanup changed remote task branch: before=%q after=%q", remoteBefore, remoteAfter)
+	}
+	rawDB, err := sql.Open("sqlite", filepath.Join(root, "tasks.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rawDB.Close()
+	var auditCount int
+	if err := rawDB.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM audit_events WHERE task_id = ?`, cases[0].id).Scan(&auditCount); err != nil {
+		t.Fatal(err)
+	}
+	if auditCount != 1 {
+		t.Fatalf("retained audit rows = %d, want 1", auditCount)
+	}
+}
+
+func TestCleanupExpiredKeepsLogOnWorktreeFailureAndRetriesAfterLogFailure(t *testing.T) {
+	root := t.TempDir()
+	repo, _ := createGitProject(t, root)
+	project := config.Project{ID: "project", RepoPath: repo, LogRetentionDays: 7}
+	now := time.Now().UTC()
+	db := openStore(t, filepath.Join(root, "tasks.db"))
+	defer closeStore(t, db)
+	task := &model.Task{
+		ID: "T-000000000201", ProjectID: project.ID, GroupID: "1", CreatorID: "2", Requirement: "cleanup",
+		Status: model.StatusFailed, Worktree: filepath.Join(root, "worktrees", "T-000000000201"),
+		CreatedAt: now.Add(-9 * 24 * time.Hour), UpdatedAt: now.Add(-8 * 24 * time.Hour),
+	}
+	if err := db.CreateTask(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	logCalls := 0
+	app := App{
+		Store: db, Projects: projectLookupFunc(func(string) (config.Project, bool) { return project, true }),
+		Worktrees: worktreeRemoveFunc(func(context.Context, string, string) error { return errors.New("remove failed") }),
+		Logs:      taskLogRemoveFunc(func(string) error { logCalls++; return nil }), Now: func() time.Time { return now },
+	}
+	if err := app.CleanupExpired(context.Background()); err == nil || !strings.Contains(err.Error(), task.ID) {
+		t.Fatalf("CleanupExpired error = %v, want task ID", err)
+	}
+	if logCalls != 0 {
+		t.Fatalf("log removal calls = %d, want 0 after worktree failure", logCalls)
+	}
+
+	worktreeRoot := filepath.Join(root, "retry-worktrees")
+	manager := &gitwork.Manager{Root: worktreeRoot}
+	project.BaseBranch, project.RCBranch, project.Remote = "main", "rc", "origin"
+	prepared, err := manager.Prepare(context.Background(), project, "T-000000000202")
+	if err != nil {
+		t.Fatal(err)
+	}
+	retryTask := *task
+	retryTask.ID = "T-000000000202"
+	retryTask.Worktree = prepared.Path
+	retryDB := openStore(t, filepath.Join(root, "retry.db"))
+	defer closeStore(t, retryDB)
+	if err := retryDB.CreateTask(context.Background(), &retryTask); err != nil {
+		t.Fatal(err)
+	}
+	removeLogCalls := 0
+	retry := App{
+		Store: retryDB, Projects: projectLookupFunc(func(string) (config.Project, bool) { return project, true }), Worktrees: manager,
+		Logs: taskLogRemoveFunc(func(string) error {
+			removeLogCalls++
+			if removeLogCalls == 1 {
+				return errors.New("log unavailable")
+			}
+			return nil
+		}),
+		Now: func() time.Time { return now },
+	}
+	if err := retry.CleanupExpired(context.Background()); err == nil || !strings.Contains(err.Error(), retryTask.ID) {
+		t.Fatalf("first retry cleanup error = %v", err)
+	}
+	if _, err := os.Stat(prepared.Path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("first cleanup retained worktree: %v", err)
+	}
+	if err := retry.CleanupExpired(context.Background()); err != nil {
+		t.Fatalf("second retry cleanup = %v", err)
+	}
+	if removeLogCalls != 2 {
+		t.Fatalf("log removal calls = %d, want 2", removeLogCalls)
+	}
+}
+
 func assertRuntimeLockRetained(t *testing.T, path string) {
 	t.Helper()
 	second := openStore(t, path)
@@ -1146,6 +1318,22 @@ func (f serviceFunc) Handle(ctx context.Context, message tasksvc.Message) error 
 type groupFunc func(string) bool
 
 func (f groupFunc) AllowedGroup(groupID string) bool { return f(groupID) }
+
+type projectLookupFunc func(string) (config.Project, bool)
+
+func (f projectLookupFunc) ProjectByID(projectID string) (config.Project, bool) {
+	return f(projectID)
+}
+
+type worktreeRemoveFunc func(context.Context, string, string) error
+
+func (f worktreeRemoveFunc) Remove(ctx context.Context, repoPath, worktree string) error {
+	return f(ctx, repoPath, worktree)
+}
+
+type taskLogRemoveFunc func(string) error
+
+func (f taskLogRemoveFunc) Remove(taskID string) error { return f(taskID) }
 
 type clientFunc func(context.Context, onebot.Handler) error
 

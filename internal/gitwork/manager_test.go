@@ -95,6 +95,27 @@ func TestManagerPrepareAndRemove(t *testing.T) {
 	}
 }
 
+func TestManagerRemoveIsIdempotentOnlyForSafeMissingContainedPath(t *testing.T) {
+	t.Parallel()
+
+	fixture := newGitFixture(t)
+	manager := Manager{Root: fixture.worktreeRoot}
+	prepared, err := manager.Prepare(context.Background(), fixture.project, firstTaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Remove(context.Background(), fixture.project.RepoPath, prepared.Path); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Remove(context.Background(), fixture.project.RepoPath, prepared.Path); err != nil {
+		t.Fatalf("second Remove() = %v, want idempotent success", err)
+	}
+	missingOutside := filepath.Join(filepath.Dir(fixture.worktreeRoot), "outside", firstTaskID)
+	if err := manager.Remove(context.Background(), fixture.project.RepoPath, missingOutside); err == nil {
+		t.Fatal("Remove() accepted unresolved path outside worktree root")
+	}
+}
+
 func TestManagerRemoveDoesNotOverrideWorktreeLock(t *testing.T) {
 	t.Parallel()
 

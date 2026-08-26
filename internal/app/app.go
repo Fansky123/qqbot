@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"qqcodex/internal/config"
 	"qqcodex/internal/onebot"
 	"qqcodex/internal/store"
 	"qqcodex/internal/tasksvc"
@@ -43,6 +44,18 @@ type GroupAuthorizer interface {
 	AllowedGroup(string) bool
 }
 
+type ProjectLookup interface {
+	ProjectByID(string) (config.Project, bool)
+}
+
+type WorktreeRemover interface {
+	Remove(context.Context, string, string) error
+}
+
+type TaskLogRemover interface {
+	Remove(string) error
+}
+
 // App coordinates the process-wide runtime owner, message workers, and task scheduler.
 type App struct {
 	Store     *store.Store
@@ -51,6 +64,10 @@ type App struct {
 	Service   Service
 	Groups    GroupAuthorizer
 	Logger    *slog.Logger
+	Projects  ProjectLookup
+	Worktrees WorktreeRemover
+	Logs      TaskLogRemover
+	Now       func() time.Time
 
 	MessageWorkers int
 	// ShutdownTimeout bounds graceful draining after parent cancellation.
@@ -126,6 +143,51 @@ func (a App) Run(ctx context.Context) (runErr error) {
 		return fmt.Errorf("recover interrupted tasks: %w", err)
 	}
 	return a.runLoops(ctx)
+}
+
+// CleanupExpired removes expired local artifacts while preserving task records and remote branches.
+func (a App) CleanupExpired(ctx context.Context) (runErr error) {
+	if ctx == nil {
+		return errors.New("application context is required")
+	}
+	if a.Store == nil || a.Projects == nil || a.Worktrees == nil || a.Logs == nil {
+		return errors.New("cleanup dependencies are required")
+	}
+	lock, err := a.Store.AcquireRuntimeLock()
+	if err != nil {
+		return fmt.Errorf("acquire application runtime lock: %w", err)
+	}
+	defer func() { runErr = errors.Join(runErr, lock.Close()) }()
+
+	now := time.Now().UTC()
+	if a.Now != nil {
+		now = a.Now().UTC()
+	}
+	tasks, err := a.Store.ListCleanupCandidates(ctx, now)
+	if err != nil {
+		return fmt.Errorf("list cleanup candidates: %w", err)
+	}
+	var cleanupErr error
+	for _, task := range tasks {
+		project, ok := a.Projects.ProjectByID(task.ProjectID)
+		if !ok || project.LogRetentionDays <= 0 {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("cleanup task %s: project retention is unavailable", task.ID))
+			continue
+		}
+		if !task.UpdatedAt.Before(now.AddDate(0, 0, -project.LogRetentionDays)) {
+			continue
+		}
+		if task.Worktree != "" {
+			if err := a.Worktrees.Remove(ctx, project.RepoPath, task.Worktree); err != nil {
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("cleanup task %s worktree: %w", task.ID, err))
+				continue
+			}
+		}
+		if err := a.Logs.Remove(task.ID); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("cleanup task %s log: %w", task.ID, err))
+		}
+	}
+	return cleanupErr
 }
 
 func (a App) validate(ctx context.Context) error {

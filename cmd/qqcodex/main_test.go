@@ -148,9 +148,12 @@ func TestRunAcceptsOnlyConfigAndReadsConfiguredToken(t *testing.T) {
 			return token
 		}
 		return ""
-	}, discardLogger(), func(_ context.Context, got config.Config, value string, _ func(string) string, _ *slog.Logger) error {
+	}, discardLogger(), func(_ context.Context, got config.Config, value string, _ func(string) string, _ *slog.Logger, cleanupExpired bool) error {
 		called = true
 		gotToken = value
+		if cleanupExpired {
+			t.Fatal("normal run selected cleanup mode")
+		}
 		if got.DatabasePath != cfg.DatabasePath {
 			t.Fatalf("loaded database path = %q, want %q", got.DatabasePath, cfg.DatabasePath)
 		}
@@ -166,12 +169,49 @@ func TestRunAcceptsOnlyConfigAndReadsConfiguredToken(t *testing.T) {
 	for _, args := range [][]string{
 		nil,
 		{"-config", path, "extra"},
-		{"-config", path, "-cleanup-expired"},
 		{"-unknown", path},
 	} {
 		if err := run(context.Background(), args, func(string) string { return token }, discardLogger(), unexpectedStart(t)); err == nil {
 			t.Fatalf("run(%q) succeeded, want flag error", args)
 		}
+	}
+}
+
+func TestRunCleanupDoesNotReadCredentials(t *testing.T) {
+	cfg := validConfig(t)
+	path := filepath.Join(t.TempDir(), "config.json")
+	writeConfig(t, path, cfg)
+
+	called := false
+	err := run(context.Background(), []string{"-config", path, "-cleanup-expired"}, func(name string) string {
+		t.Fatalf("cleanup read credential environment variable %q", name)
+		return ""
+	}, discardLogger(), func(_ context.Context, _ config.Config, token string, _ func(string) string, _ *slog.Logger, cleanupExpired bool) error {
+		called = true
+		if !cleanupExpired || token != "" {
+			t.Fatalf("cleanup=%v token=%q, want cleanup with empty token", cleanupExpired, token)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("cleanup starter was not called")
+	}
+}
+
+func TestBuildAndRunCleanupDoesNotStartRuntimeDependencies(t *testing.T) {
+	cfg, _ := validGitConfig(t)
+	cfg.Codex.Binary = "qqcodex-codex-must-not-run"
+	cfg.OpsCommand = []string{"qqcodex-ops-must-not-run"}
+
+	err := buildAndRun(context.Background(), cfg, "", func(name string) string {
+		t.Fatalf("cleanup read credential environment variable %q", name)
+		return ""
+	}, discardLogger(), true)
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -195,7 +235,7 @@ func TestRunRejectsMissingTokenWithoutLoggingSecrets(t *testing.T) {
 
 func unexpectedStart(t *testing.T) starter {
 	t.Helper()
-	return func(context.Context, config.Config, string, func(string) string, *slog.Logger) error {
+	return func(context.Context, config.Config, string, func(string) string, *slog.Logger, bool) error {
 		t.Fatal("starter must not be called")
 		return nil
 	}

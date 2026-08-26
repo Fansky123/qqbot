@@ -326,13 +326,24 @@ func (m Manager) Remove(ctx context.Context, repoPath, worktree string) error {
 	if err != nil {
 		return err
 	}
-	worktree, err = resolveContained(root, worktree, true)
+	worktree, err = resolveContained(root, worktree, false)
 	if err != nil {
 		return fmt.Errorf("resolve worktree: %w", err)
 	}
 	repo, err := resolveDirectory(repoPath)
 	if err != nil {
 		return fmt.Errorf("resolve repository: %w", err)
+	}
+	exists, err := pathExists(worktree)
+	if err != nil {
+		return fmt.Errorf("inspect worktree: %w", err)
+	}
+	registered, _, err := worktreeState(ctx, repo, worktree, "")
+	if err != nil {
+		return fmt.Errorf("inspect worktree registration: %w", err)
+	}
+	if !exists && !registered {
+		return nil
 	}
 	if _, err := runGit(ctx, repo, "worktree", "remove", "--force", worktree); err != nil {
 		return fmt.Errorf("remove worktree: %w", err)
