@@ -746,6 +746,73 @@ func TestRunFatalStoreCancelsOtherWorkerBeforeSlowLoopsExit(t *testing.T) {
 	}
 }
 
+func TestMessageWorkerFatalCancelsIdleWorkerBeforeQueuedDispatch(t *testing.T) {
+	workerCtx, cancelWorkers := context.WithCancel(context.Background())
+	fatal := newFatalState(cancelWorkers)
+	messages := make(chan tasksvc.Message, 2)
+	queuedProcessed := make(chan struct{})
+	service := serviceFunc(func(_ context.Context, message tasksvc.Message) error {
+		if message.MessageID == "fatal" {
+			return errors.Join(tasksvc.ErrFatalStore, errors.New("store failed"))
+		}
+		close(queuedProcessed)
+		return nil
+	})
+	a := App{Service: service}
+	var workers sync.WaitGroup
+	for range 2 {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			a.messageWorker(workerCtx, discardLogger(), messages, fatal.report)
+		}()
+	}
+	messages <- tasksvc.Message{MessageID: "fatal"}
+	waitClosed(t, fatal.signal, "synchronous fatal report")
+	if workerCtx.Err() == nil {
+		t.Fatal("fatal was signaled before worker cancellation")
+	}
+	// The other worker is idle and the queued message becomes ready only after
+	// fatal reporting has synchronously canceled the shared worker context.
+	messages <- tasksvc.Message{MessageID: "queued"}
+	workersDone := make(chan struct{})
+	go func() {
+		workers.Wait()
+		close(workersDone)
+	}()
+	waitClosed(t, workersDone, "fatal workers")
+	select {
+	case <-queuedProcessed:
+		t.Fatal("idle worker dispatched a queued message after fatal reporting")
+	default:
+	}
+}
+
+func TestRunShutdownTimeoutPreservesReadySchedulerFatal(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tasks.db")
+	db := openStore(t, path)
+	releaseClient := make(chan struct{})
+	err := (App{
+		Store: db,
+		Client: clientFunc(func(context.Context, onebot.Handler) error {
+			<-releaseClient
+			return nil
+		}),
+		Scheduler: schedulerFunc(func(context.Context) error {
+			return errors.Join(tasksvc.ErrFatalStore, errors.New("scheduler store failed"))
+		}),
+		Service: serviceFunc(func(context.Context, tasksvc.Message) error { return nil }),
+		Groups:  groupFunc(func(string) bool { return true }), MessageWorkers: 1, Logger: discardLogger(),
+		ShutdownTimeout: 30 * time.Millisecond,
+	}).Run(context.Background())
+	if !errors.Is(err, tasksvc.ErrFatalStore) || !errors.Is(err, ErrShutdownTimeout) {
+		t.Fatalf("Run error = %v, want fatal store joined with shutdown timeout", err)
+	}
+	close(releaseClient)
+	closeStore(t, db)
+	assertRuntimeLockRetained(t, path)
+}
+
 func assertRuntimeLockRetained(t *testing.T, path string) {
 	t.Helper()
 	second := openStore(t, path)

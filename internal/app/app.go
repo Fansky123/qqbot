@@ -63,6 +63,46 @@ type loopResult struct {
 	err  error
 }
 
+type fatalState struct {
+	mu     sync.Mutex
+	err    error
+	signal chan struct{}
+	cancel context.CancelFunc
+}
+
+func newFatalState(cancel context.CancelFunc) *fatalState {
+	return &fatalState{signal: make(chan struct{}), cancel: cancel}
+}
+
+func (s *fatalState) report(err error) {
+	if err == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.err != nil {
+		return
+	}
+	s.err = err
+	s.cancel()
+	close(s.signal)
+}
+
+func (s *fatalState) get() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.err
+}
+
+func (s *fatalState) timeoutError() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.err != nil {
+		return errors.Join(s.err, ErrShutdownTimeout)
+	}
+	return ErrShutdownTimeout
+}
+
 func (a App) Run(ctx context.Context) (runErr error) {
 	if err := a.validate(ctx); err != nil {
 		return err
@@ -113,17 +153,23 @@ func (a App) runLoops(parent context.Context) error {
 
 	messages := make(chan tasksvc.Message, a.MessageWorkers*2)
 	var workers sync.WaitGroup
-	fatal := make(chan error, 1)
+	fatal := newFatalState(cancelWorkers)
 	for range a.MessageWorkers {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
-			a.messageWorker(workerCtx, logger, messages, fatal)
+			a.messageWorker(workerCtx, logger, messages, fatal.report)
 		}()
 	}
 
 	results := make(chan loopResult, 2)
-	go func() { results <- loopResult{name: "scheduler", err: a.Scheduler.Run(loopCtx)} }()
+	go func() {
+		err := a.Scheduler.Run(loopCtx)
+		if errors.Is(err, tasksvc.ErrFatalStore) {
+			fatal.report(err)
+		}
+		results <- loopResult{name: "scheduler", err: err}
+	}()
 	go func() {
 		err := a.Client.Run(loopCtx, func(handlerCtx context.Context, message onebot.GroupMessage) error {
 			if !a.Groups.AllowedGroup(string(message.GroupID)) {
@@ -142,23 +188,23 @@ func (a App) runLoops(parent context.Context) error {
 				return loopCtx.Err()
 			}
 		})
+		if errors.Is(err, tasksvc.ErrFatalStore) {
+			fatal.report(err)
+		}
 		results <- loopResult{name: "onebot", err: err}
 	}()
 
 	first := loopResult{}
-	var fatalErr error
 	select {
 	case <-parent.Done():
 		cancelLoops()
-	case fatalErr = <-fatal:
+	case <-fatal.signal:
 		cancelLoops()
-		cancelWorkers()
 	case first = <-results:
 		cancelLoops()
 	}
 	if errors.Is(first.err, tasksvc.ErrFatalStore) {
-		fatalErr = first.err
-		cancelWorkers()
+		fatal.report(first.err)
 	}
 	shutdownTimeout := a.ShutdownTimeout
 	if shutdownTimeout <= 0 {
@@ -175,25 +221,13 @@ func (a App) runLoops(parent context.Context) error {
 	}
 	for range remaining {
 		select {
-		case result := <-results:
-			if fatalErr == nil && errors.Is(result.err, tasksvc.ErrFatalStore) {
-				fatalErr = result.err
-				cancelWorkers()
-			}
-		case err := <-fatal:
-			if fatalErr == nil {
-				fatalErr = err
-				cancelWorkers()
-			}
+		case <-results:
 		case <-shutdownC:
 			cancelWorkers()
-			return shutdownTimeoutError(fatalErr)
+			return fatal.timeoutError()
 		}
 	}
 	close(messages)
-	if fatalErr != nil {
-		cancelWorkers()
-	}
 	workersDone := make(chan struct{})
 	go func() {
 		workers.Wait()
@@ -201,26 +235,15 @@ func (a App) runLoops(parent context.Context) error {
 	}()
 	for workersDone != nil {
 		select {
-		case err := <-fatal:
-			if fatalErr == nil {
-				fatalErr = err
-				cancelWorkers()
-			}
 		case <-workersDone:
 			workersDone = nil
 		case <-shutdownC:
 			cancelWorkers()
-			return shutdownTimeoutError(fatalErr)
+			return fatal.timeoutError()
 		}
-	}
-	select {
-	case err := <-fatal:
-		if fatalErr == nil {
-			fatalErr = err
-		}
-	default:
 	}
 
+	fatalErr := fatal.get()
 	if fatalErr != nil {
 		return fatalErr
 	}
@@ -233,14 +256,7 @@ func (a App) runLoops(parent context.Context) error {
 	return fmt.Errorf("%s loop failed: %w", first.name, first.err)
 }
 
-func shutdownTimeoutError(fatalErr error) error {
-	if fatalErr != nil {
-		return errors.Join(fatalErr, ErrShutdownTimeout)
-	}
-	return ErrShutdownTimeout
-}
-
-func (a App) messageWorker(ctx context.Context, logger *slog.Logger, messages <-chan tasksvc.Message, fatal chan<- error) {
+func (a App) messageWorker(ctx context.Context, logger *slog.Logger, messages <-chan tasksvc.Message, reportFatal func(error)) {
 	for {
 		if ctx.Err() != nil {
 			return
@@ -260,10 +276,7 @@ func (a App) messageWorker(ctx context.Context, logger *slog.Logger, messages <-
 		}
 		if err := a.handleMessage(ctx, message); err != nil {
 			if errors.Is(err, tasksvc.ErrFatalStore) {
-				select {
-				case fatal <- err:
-				default:
-				}
+				reportFatal(err)
 				return
 			}
 			if ctx.Err() == nil {
