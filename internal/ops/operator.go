@@ -105,7 +105,7 @@ func (o *Operator) Preflight(ctx context.Context, projectID string, sourceDevice
 	if err != nil || repository != project.RepoPath {
 		return Project{}, errors.New("repository is unavailable")
 	}
-	device, inode, err := directoryIdentity(repository)
+	device, inode, err := gitCommonIdentity(ctx, o.gitBinary, repository, o.gitEnv)
 	if err != nil {
 		return Project{}, err
 	}

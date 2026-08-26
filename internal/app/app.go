@@ -14,9 +14,12 @@ import (
 )
 
 const (
-	notificationAttempts = 3
-	notificationBackoff  = 100 * time.Millisecond
+	notificationAttempts   = 3
+	notificationBackoff    = 100 * time.Millisecond
+	defaultShutdownTimeout = 30 * time.Second
 )
+
+var errShutdownTimeout = errors.New("application shutdown timed out")
 
 type Client interface {
 	Run(context.Context, onebot.Handler) error
@@ -44,6 +47,9 @@ type App struct {
 	Logger    *slog.Logger
 
 	MessageWorkers int
+	// ShutdownTimeout bounds graceful draining after parent cancellation.
+	// A non-positive value uses the default shutdown timeout.
+	ShutdownTimeout time.Duration
 }
 
 type loopResult struct {
@@ -139,6 +145,14 @@ func (a App) runLoops(parent context.Context) error {
 		fatalErr = first.err
 		cancelWorkers()
 	}
+	shutdownTimeout := a.ShutdownTimeout
+	if shutdownTimeout <= 0 {
+		shutdownTimeout = defaultShutdownTimeout
+	}
+	shutdownTimer := time.NewTimer(shutdownTimeout)
+	defer shutdownTimer.Stop()
+	shutdownC := shutdownTimer.C
+	shutdownTimedOut := false
 
 	// Stop intake before closing the queue; the client handler can no longer enqueue after both loops join.
 	remaining := 2
@@ -146,10 +160,23 @@ func (a App) runLoops(parent context.Context) error {
 		remaining--
 	}
 	for range remaining {
-		result := <-results
-		if fatalErr == nil && errors.Is(result.err, tasksvc.ErrFatalStore) {
-			fatalErr = result.err
+		select {
+		case result := <-results:
+			if fatalErr == nil && errors.Is(result.err, tasksvc.ErrFatalStore) {
+				fatalErr = result.err
+				cancelWorkers()
+			}
+		case err := <-fatal:
+			if fatalErr == nil {
+				fatalErr = err
+				cancelWorkers()
+			}
+			<-results
+		case <-shutdownC:
+			shutdownTimedOut = true
 			cancelWorkers()
+			shutdownC = nil
+			<-results
 		}
 	}
 	close(messages)
@@ -170,6 +197,12 @@ func (a App) runLoops(parent context.Context) error {
 			}
 		case <-workersDone:
 			workersDone = nil
+		case <-shutdownC:
+			shutdownTimedOut = true
+			cancelWorkers()
+			shutdownC = nil
+			<-workersDone
+			workersDone = nil
 		}
 	}
 	select {
@@ -181,7 +214,13 @@ func (a App) runLoops(parent context.Context) error {
 	}
 
 	if fatalErr != nil {
+		if shutdownTimedOut {
+			return errors.Join(fatalErr, errShutdownTimeout)
+		}
 		return fatalErr
+	}
+	if shutdownTimedOut {
+		return errShutdownTimeout
 	}
 	if parent.Err() != nil {
 		return nil

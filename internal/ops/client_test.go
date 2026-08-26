@@ -24,7 +24,7 @@ func TestClientBuildsTypedArgvAndParsesResponse(t *testing.T) {
 	record := filepath.Join(t.TempDir(), "argv.json")
 	source, commit := clientTaskSource(t)
 	client := mustNewClient(t, helperCommand(t, record, "success"), map[string]string{"order-api": source})
-	device, inode, err := directoryIdentity(source)
+	device, inode, err := gitCommonIdentity(ctx, client.sourceGit, source, sourceGitEnvironment("/tmp"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,7 +42,7 @@ func TestClientBuildsTypedArgvAndParsesResponse(t *testing.T) {
 			want: []string{
 				"validate", "--project", "order-api",
 				"--config-sha256", ProjectFingerprint(Project{Remote: "origin", BaseBranch: "main", RCBranch: "rc", Checks: [][]string{{"go", "test", "./..."}}}),
-				"--source-device", strconv.FormatUint(device, 10), "--source-inode", strconv.FormatUint(inode, 10),
+				"--source-common-device", strconv.FormatUint(device, 10), "--source-common-inode", strconv.FormatUint(inode, 10),
 			},
 		},
 		{

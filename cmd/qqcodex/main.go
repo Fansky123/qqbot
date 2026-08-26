@@ -254,7 +254,13 @@ func validateProject(project config.Project) error {
 	if _, err := runGit(project.RepoPath, "remote", "get-url", project.Remote); err != nil {
 		return errors.New("configured remote is unavailable")
 	}
+	if project.BaseBranch == project.RCBranch {
+		return errors.New("base and RC branches must differ")
+	}
 	for _, branch := range []string{project.BaseBranch, project.RCBranch} {
+		if !safeBranchName(project.RepoPath, branch) {
+			return errors.New("configured branch name is invalid")
+		}
 		if _, err := runGit(project.RepoPath, "rev-parse", "--verify", "refs/remotes/"+project.Remote+"/"+branch+"^{commit}"); err != nil {
 			return errors.New("configured branch ref is unavailable")
 		}
@@ -273,6 +279,14 @@ func validateProject(project config.Project) error {
 		}
 	}
 	return nil
+}
+
+func safeBranchName(repo, branch string) bool {
+	if branch == "" || strings.HasPrefix(branch, "-") || strings.ContainsRune(branch, 0) {
+		return false
+	}
+	_, err := runGit(repo, "check-ref-format", "--branch", branch)
+	return err == nil
 }
 
 func safeGitRemote(remote string) bool {

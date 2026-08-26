@@ -208,12 +208,10 @@ func TestNewOperatorRevalidatesConfiguration(t *testing.T) {
 }
 
 func TestOperatorPreflightValidatesRepositoryAndReleaseRefs(t *testing.T) {
-	t.Parallel()
-
 	t.Run("valid", func(t *testing.T) {
 		fixture := newOpsFixture(t)
 		source := fixture.clone(t)
-		device, inode, err := directoryIdentity(source)
+		device, inode, err := gitCommonIdentity(context.Background(), fixture.operator.gitBinary, source, fixture.operator.gitEnv)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -228,12 +226,25 @@ func TestOperatorPreflightValidatesRepositoryAndReleaseRefs(t *testing.T) {
 
 	t.Run("same physical repository", func(t *testing.T) {
 		fixture := newOpsFixture(t)
-		device, inode, err := directoryIdentity(fixture.repo)
+		device, inode, err := gitCommonIdentity(context.Background(), fixture.operator.gitBinary, fixture.repo, fixture.operator.gitEnv)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if _, err := fixture.operator.Preflight(context.Background(), fixture.projectID, device, inode); err == nil || err.Error() != "repositories must be physically separate" {
 			t.Fatalf("Preflight same repository error = %v", err)
+		}
+	})
+
+	t.Run("linked worktree with same common directory", func(t *testing.T) {
+		fixture := newOpsFixture(t)
+		worktree := filepath.Join(privateTempDir(t), "linked-worktree")
+		git(t, fixture.repo, "worktree", "add", "--detach", worktree, "origin/main")
+		device, inode, err := gitCommonIdentity(context.Background(), fixture.operator.gitBinary, worktree, fixture.operator.gitEnv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.operator.Preflight(context.Background(), fixture.projectID, device, inode); err == nil || err.Error() != "repositories must be physically separate" {
+			t.Fatalf("Preflight linked worktree error = %v", err)
 		}
 	})
 

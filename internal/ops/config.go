@@ -252,6 +252,39 @@ func directoryIdentity(path string) (uint64, uint64, error) {
 	return uint64(stat.Dev), uint64(stat.Ino), nil
 }
 
+func gitCommonDirectory(ctx context.Context, gitBinary, repository string, env []string) (string, error) {
+	output, err := runProcess(ctx, repository, []string{
+		gitBinary,
+		"-c", "core.hooksPath=/dev/null",
+		"-c", "core.fsmonitor=false",
+		"-C", repository,
+		"rev-parse", "--path-format=absolute", "--git-common-dir",
+	}, env)
+	if err != nil {
+		return "", errors.New("git common directory is unavailable")
+	}
+	path := strings.TrimSpace(output)
+	if path == "" {
+		return "", errors.New("git common directory is unavailable")
+	}
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(repository, path)
+	}
+	canonical, err := canonicalDirectory(path)
+	if err != nil {
+		return "", errors.New("git common directory is unavailable")
+	}
+	return canonical, nil
+}
+
+func gitCommonIdentity(ctx context.Context, gitBinary, repository string, env []string) (uint64, uint64, error) {
+	common, err := gitCommonDirectory(ctx, gitBinary, repository, env)
+	if err != nil {
+		return 0, 0, err
+	}
+	return directoryIdentity(common)
+}
+
 func trustedExecutable(path string, repositories []string, allowCurrentUID bool) (string, error) {
 	if !filepath.IsAbs(path) {
 		return "", errors.New("path must be absolute")

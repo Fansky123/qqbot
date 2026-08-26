@@ -109,7 +109,7 @@ func (c *Client) Preflight(ctx context.Context, projectID, remote, baseBranch, r
 	if !ok {
 		return errors.New("unknown source project")
 	}
-	device, inode, err := directoryIdentity(source)
+	device, inode, err := gitCommonIdentity(ctx, c.sourceGit, source, sourceGitEnvironment("/tmp"))
 	if err != nil {
 		return err
 	}
@@ -117,8 +117,8 @@ func (c *Client) Preflight(ctx context.Context, projectID, remote, baseBranch, r
 	_, err = c.call(ctx, "", nil,
 		"validate", "--project", projectID,
 		"--config-sha256", fingerprint,
-		"--source-device", strconv.FormatUint(device, 10),
-		"--source-inode", strconv.FormatUint(inode, 10),
+		"--source-common-device", strconv.FormatUint(device, 10),
+		"--source-common-inode", strconv.FormatUint(inode, 10),
 	)
 	return err
 }
@@ -407,7 +407,7 @@ func validateClientInputs(args []string) error {
 		}
 	case "validate":
 		if len(args) != 9 || args[3] != "--config-sha256" || len(args[4]) != sha256.Size*2 ||
-			args[5] != "--source-device" || args[7] != "--source-inode" {
+			args[5] != "--source-common-device" || args[7] != "--source-common-inode" {
 			return errors.New("invalid validate request")
 		}
 		if _, err := hex.DecodeString(args[4]); err != nil {

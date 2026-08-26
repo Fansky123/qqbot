@@ -564,6 +564,42 @@ func TestRunTreatsParentCancellationAsNormalWhenLoopResultWinsSelect(t *testing.
 	}
 }
 
+func TestRunShutdownTimeoutCancelsInFlightWorker(t *testing.T) {
+	db := openStore(t, filepath.Join(t.TempDir(), "tasks.db"))
+	defer closeStore(t, db)
+	accepted := make(chan struct{}, 1)
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	client := emittingClient{messages: []onebot.GroupMessage{{GroupID: "100", UserID: "200", MessageID: "1"}}, accepted: accepted}
+	service := serviceFunc(func(ctx context.Context, _ tasksvc.Message) error {
+		close(started)
+		<-ctx.Done()
+		close(canceled)
+		return ctx.Err()
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- (App{
+			Store: db, Client: client, Scheduler: blockingScheduler{}, Service: service,
+			Groups: groupFunc(func(string) bool { return true }), MessageWorkers: 1, Logger: discardLogger(),
+			ShutdownTimeout: 40 * time.Millisecond,
+		}).Run(ctx)
+	}()
+	waitClosed(t, accepted, "accepted message")
+	waitClosed(t, started, "worker start")
+	startedShutdown := time.Now()
+	cancel()
+	err := waitError(t, done, "bounded shutdown")
+	if !errors.Is(err, errShutdownTimeout) {
+		t.Fatalf("Run error = %v, want shutdown timeout", err)
+	}
+	if elapsed := time.Since(startedShutdown); elapsed > 500*time.Millisecond {
+		t.Fatalf("bounded shutdown took %s", elapsed)
+	}
+	waitClosed(t, canceled, "worker cancellation")
+}
+
 type fakeOneBot struct {
 	server   *httptest.Server
 	selfID   string

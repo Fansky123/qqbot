@@ -28,19 +28,21 @@ func TestFailedIncludesStableCommitErrorCode(t *testing.T) {
 
 func TestParseValidate(t *testing.T) {
 	fingerprint := strings.Repeat("a", 64)
-	args := []string{"--project", "order-api", "--config-sha256", fingerprint, "--source-device", "8", "--source-inode", "12345"}
+	args := []string{"--project", "order-api", "--config-sha256", fingerprint, "--source-common-device", "8", "--source-common-inode", "12345"}
 	request, err := parseValidate(args)
 	if err != nil || request.project != "order-api" || request.fingerprint != fingerprint || request.sourceDevice != 8 || request.sourceInode != 12345 {
 		t.Fatalf("parseValidate = %#v, %v", request, err)
 	}
-	if _, err := parseValidate([]string{"--project", "", "--config-sha256", fingerprint, "--source-device", "8", "--source-inode", "9"}); err == nil {
+	if _, err := parseValidate([]string{"--project", "", "--config-sha256", fingerprint, "--source-common-device", "8", "--source-common-inode", "9"}); err == nil {
 		t.Fatal("parseValidate accepted empty project")
 	}
 	for _, malformed := range []string{"", "+1", "-1", "01", " 1", "1 ", "18446744073709551616"} {
-		bad := append([]string(nil), args...)
-		bad[5] = malformed
-		if _, err := parseValidate(bad); err == nil {
-			t.Fatalf("parseValidate accepted malformed device %q", malformed)
+		for _, index := range []int{5, 7} {
+			bad := append([]string(nil), args...)
+			bad[index] = malformed
+			if _, err := parseValidate(bad); err == nil {
+				t.Fatalf("parseValidate accepted malformed identity %q", malformed)
+			}
 		}
 	}
 }

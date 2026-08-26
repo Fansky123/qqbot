@@ -105,8 +105,8 @@ func parseValidate(args []string) (validateRequest, error) {
 	flags := newActionFlags("validate")
 	project := flags.String("project", "", "")
 	fingerprint := flags.String("config-sha256", "", "")
-	sourceDevice := flags.String("source-device", "", "")
-	sourceInode := flags.String("source-inode", "", "")
+	sourceDevice := flags.String("source-common-device", "", "")
+	sourceInode := flags.String("source-common-inode", "", "")
 	if err := parseAction(flags, args); err != nil || *project == "" || len(*fingerprint) != 64 {
 		return validateRequest{}, errors.New("invalid validate command")
 	}

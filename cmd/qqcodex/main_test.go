@@ -116,6 +116,25 @@ func TestValidateStartupAcceptsValidGitConfig(t *testing.T) {
 	}
 }
 
+func TestValidateStartupRejectsUnsafeOrDuplicateBranches(t *testing.T) {
+	for _, branch := range []string{"", "-bad", "feature..bad", "feature~bad"} {
+		t.Run("base "+branch, func(t *testing.T) {
+			cfg, _ := validGitConfig(t)
+			cfg.Projects[0].BaseBranch = branch
+			if err := validateStartup(&cfg); err == nil {
+				t.Fatalf("accepted unsafe base branch %q", branch)
+			}
+		})
+	}
+	t.Run("same branches", func(t *testing.T) {
+		cfg, _ := validGitConfig(t)
+		cfg.Projects[0].RCBranch = cfg.Projects[0].BaseBranch
+		if err := validateStartup(&cfg); err == nil {
+			t.Fatal("accepted identical base and RC branches")
+		}
+	})
+}
+
 func TestRunAcceptsOnlyConfigAndReadsConfiguredToken(t *testing.T) {
 	cfg := validConfig(t)
 	path := filepath.Join(t.TempDir(), "config.json")
