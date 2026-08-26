@@ -3,6 +3,7 @@ package ops
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,22 @@ import (
 	"strings"
 	"syscall"
 )
+
+type projectFingerprint struct {
+	Remote     string     `json:"remote"`
+	BaseBranch string     `json:"base_branch"`
+	RCBranch   string     `json:"rc_branch"`
+	Checks     [][]string `json:"checks"`
+}
+
+// ProjectFingerprint binds non-secret release metadata without exposing ops paths.
+func ProjectFingerprint(project Project) string {
+	data, _ := json.Marshal(projectFingerprint{
+		Remote: project.Remote, BaseBranch: project.BaseBranch, RCBranch: project.RCBranch, Checks: project.Checks,
+	})
+	digest := sha256.Sum256(data)
+	return fmt.Sprintf("%x", digest)
+}
 
 var (
 	projectIDPattern  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`)

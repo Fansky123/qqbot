@@ -31,6 +31,13 @@ func TestClientBuildsTypedArgvAndParsesResponse(t *testing.T) {
 		want []string
 	}{
 		{
+			name: "validate",
+			call: func() (string, error) {
+				return "", client.Preflight(ctx, "order-api", "origin", "main", "rc", [][]string{{"go", "test", "./..."}})
+			},
+			want: []string{"validate", "--project", "order-api", "--config-sha256", ProjectFingerprint(Project{Remote: "origin", BaseBranch: "main", RCBranch: "rc", Checks: [][]string{{"go", "test", "./..."}}})},
+		},
+		{
 			name: "sync",
 			call: func() (string, error) {
 				return "", client.Sync(ctx, "order-api")

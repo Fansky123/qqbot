@@ -207,6 +207,48 @@ func TestNewOperatorRevalidatesConfiguration(t *testing.T) {
 	}
 }
 
+func TestOperatorPreflightValidatesRepositoryAndReleaseRefs(t *testing.T) {
+	t.Parallel()
+
+	t.Run("valid", func(t *testing.T) {
+		fixture := newOpsFixture(t)
+		project, err := fixture.operator.Preflight(context.Background(), fixture.projectID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ProjectFingerprint(project) != ProjectFingerprint(fixture.config.Projects[fixture.projectID]) {
+			t.Fatal("Preflight returned unexpected project metadata")
+		}
+	})
+
+	t.Run("non Git repository", func(t *testing.T) {
+		fixture := newOpsFixture(t)
+		project := fixture.config.Projects[fixture.projectID]
+		project.RepoPath = privateTempDir(t)
+		fixture.config.Projects[fixture.projectID] = project
+		operator := mustNewOperator(t, fixture.config)
+		if _, err := operator.Preflight(context.Background(), fixture.projectID); err == nil {
+			t.Fatal("Preflight accepted non-Git repository")
+		}
+	})
+
+	t.Run("unsafe local config", func(t *testing.T) {
+		fixture := newOpsFixture(t)
+		git(t, fixture.repo, "config", "remote.origin.pushurl", "ext::sh -c false")
+		if _, err := fixture.operator.Preflight(context.Background(), fixture.projectID); err == nil {
+			t.Fatal("Preflight accepted unsafe local Git config")
+		}
+	})
+
+	t.Run("missing release ref", func(t *testing.T) {
+		fixture := newOpsFixture(t)
+		git(t, fixture.repo, "update-ref", "-d", "refs/remotes/origin/rc")
+		if _, err := fixture.operator.Preflight(context.Background(), fixture.projectID); err == nil {
+			t.Fatal("Preflight accepted missing RC ref")
+		}
+	})
+}
+
 func TestOperatorSyncFetchesBaseAndRC(t *testing.T) {
 	t.Parallel()
 

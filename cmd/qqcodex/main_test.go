@@ -8,12 +8,113 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"qqcodex/internal/config"
+	"qqcodex/internal/ops"
 )
+
+func TestValidateStartupDoesNotChangeExistingPrivateDirectoryMode(t *testing.T) {
+	cfg := validConfig(t)
+	if err := os.Mkdir(cfg.LogDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(cfg.WorktreeRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(cfg.LogDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateStartup(&cfg); err == nil {
+		t.Fatal("validateStartup accepted group-readable log directory")
+	}
+	after, err := os.Stat(cfg.LogDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Mode().Perm() != after.Mode().Perm() {
+		t.Fatalf("existing log mode changed from %o to %o", before.Mode().Perm(), after.Mode().Perm())
+	}
+}
+
+func TestValidateStartupRejectsRootAndSymlinkAndOverlap(t *testing.T) {
+	cases := []struct {
+		name string
+		edit func(*config.Config, string)
+	}{
+		{"root log", func(cfg *config.Config, _ string) { cfg.LogDir = "/" }},
+		{"symlink log", func(cfg *config.Config, root string) {
+			cfg.LogDir = filepath.Join(root, "log-link")
+			if err := os.Symlink(filepath.Join(root, "real-log"), cfg.LogDir); err != nil {
+				panic(err)
+			}
+		}},
+		{"database parent overlaps repository", func(cfg *config.Config, _ string) {
+			cfg.DatabasePath = filepath.Join(cfg.Projects[0].RepoPath, "tasks.db")
+		}},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := validConfig(t)
+			root := filepath.Dir(cfg.DatabasePath)
+			if test.name == "symlink log" {
+				if err := os.Mkdir(filepath.Join(root, "real-log"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			test.edit(&cfg, root)
+			if err := validateStartup(&cfg); err == nil {
+				t.Fatal("validateStartup accepted unsafe path")
+			}
+		})
+	}
+}
+
+func TestValidateStartupRejectsNonGitMissingRefCheckAndOpsMismatch(t *testing.T) {
+	t.Run("non git repository", func(t *testing.T) {
+		cfg := validConfig(t)
+		if err := os.Mkdir(cfg.LogDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(cfg.WorktreeRoot, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := validateStartup(&cfg); err == nil {
+			t.Fatal("accepted non-Git repository")
+		}
+	})
+
+	t.Run("missing executable check", func(t *testing.T) {
+		cfg, opsPath := validGitConfig(t)
+		cfg.Projects[0].Checks = [][]string{{"qqcodex-check-does-not-exist"}}
+		cfg.OpsCommand = []string{"/bin/true", "-config", opsPath}
+		if err := validateStartup(&cfg); err == nil {
+			t.Fatal("accepted missing check executable")
+		}
+	})
+
+	t.Run("missing base ref", func(t *testing.T) {
+		cfg, opsPath := validGitConfig(t)
+		cfg.OpsCommand = []string{"/bin/true", "-config", opsPath}
+		cfg.Projects[0].BaseBranch = "does-not-exist"
+		if err := validateStartup(&cfg); err == nil {
+			t.Fatal("accepted missing base ref")
+		}
+	})
+
+}
+
+func TestValidateStartupAcceptsValidGitConfig(t *testing.T) {
+	cfg, _ := validGitConfig(t)
+	cfg.OpsCommand[2] = filepath.Join(t.TempDir(), "worker-must-not-read-ops.json")
+	if err := validateStartup(&cfg); err != nil {
+		t.Fatalf("validateStartup(valid) = %v", err)
+	}
+}
 
 func TestRunAcceptsOnlyConfigAndReadsConfiguredToken(t *testing.T) {
 	cfg := validConfig(t)
@@ -110,6 +211,71 @@ func writeConfig(t *testing.T, path string, cfg config.Config) {
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func validGitConfig(t *testing.T) (config.Config, string) {
+	t.Helper()
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	remote := filepath.Join(root, "remote.git")
+	if err := runCmd(root, "git", "init", "--bare", remote); err != nil {
+		t.Fatal(err)
+	}
+	seed := filepath.Join(root, "seed")
+	if err := runCmd(root, "git", "init", "-b", "main", seed); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"config", "user.name", "qqcodex-test"}, {"config", "user.email", "test@example.invalid"}} {
+		if err := runCmd(seed, "git", args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(seed, "README"), []byte("base\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"add", "README"}, {"commit", "-m", "base"}, {"remote", "add", "origin", remote}, {"push", "-u", "origin", "main"}, {"branch", "rc"}, {"push", "origin", "rc"}} {
+		if err := runCmd(seed, "git", args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := runCmd(root, "git", "clone", remote, repo); err != nil {
+		t.Fatal(err)
+	}
+	if err := runCmd(repo, "git", "fetch", "origin", "main", "rc"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runCmd(repo, "git", "switch", "-c", "main", "origin/main"); err != nil {
+		t.Fatal(err)
+	}
+	state := filepath.Join(root, "state")
+	for _, dir := range []string{state, filepath.Join(root, "logs"), filepath.Join(root, "worktrees")} {
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	opsPath := filepath.Join(root, "ops.json")
+	opsCfg := ops.Config{GitBinary: "/usr/bin/git", Projects: map[string]ops.Project{
+		"project": {RepoPath: repo, Remote: "origin", RemoteURL: remote, AllowLocalRemote: true, BaseBranch: "main", RCBranch: "rc", CheckRunner: []string{"/bin/true"}, Checks: [][]string{{"/bin/sh", "-c", "true"}}, DeployAction: []string{"/bin/true"}},
+	}}
+	data, err := json.Marshal(opsCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(opsPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return config.Config{
+		OneBot:       config.OneBotConfig{URL: "ws://127.0.0.1:3001", AccessTokenEnv: "TOKEN", SelfID: "10000", MessageRunes: 1200},
+		DatabasePath: filepath.Join(state, "tasks.db"), LogDir: filepath.Join(root, "logs"), WorktreeRoot: filepath.Join(root, "worktrees"), MessageWorkers: 1,
+		Codex: config.CodexConfig{Binary: "/bin/sh"}, OpsCommand: []string{"/bin/true", "-config", opsPath},
+		Projects: []config.Project{{ID: "project", Aliases: []string{"p"}, RepoPath: repo, BaseBranch: "main", RCBranch: "rc", Remote: "origin", Checks: [][]string{{"/bin/sh", "-c", "true"}}, DeployAction: "deploy", MaxConcurrent: 1, CodexTimeoutSeconds: 30, LogRetentionDays: 7}},
+	}, opsPath
+}
+
+func runCmd(dir, name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	cmd.Dir = dir
+	return cmd.Run()
 }
 
 func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }

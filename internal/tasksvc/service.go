@@ -35,8 +35,10 @@ var notificationBearer = regexp.MustCompile(`(?i)\bBearer\s+[^\s,;]+`)
 var (
 	// ErrNotificationDelivery marks a processed command whose deterministic reply can be retried.
 	ErrNotificationDelivery = errors.New("task notification delivery failed")
-	errUnauthorized         = errors.New("user is not authorized for this group")
-	errTaskAccess           = errors.New("user is not authorized for this task")
+	// ErrFatalStore marks a persistence or local task-log failure that must stop the application.
+	ErrFatalStore   = errors.New("fatal task store failure")
+	errUnauthorized = errors.New("user is not authorized for this group")
+	errTaskAccess   = errors.New("user is not authorized for this task")
 )
 
 // Service translates authenticated group commands into durable task transitions.
@@ -108,7 +110,7 @@ func (s *Service) Handle(ctx context.Context, message Message) error {
 
 	processed, err := s.db.MessageProcessed(ctx, key)
 	if err != nil {
-		return err
+		return fatalStore(err)
 	}
 	if processed {
 		return s.replayNotification(ctx, message, parsed)
@@ -179,7 +181,7 @@ func (s *Service) create(ctx context.Context, message Message, parsed command.Co
 				return s.notifyExisting(ctx, message.GroupID, existing.ID)
 			}
 		} else {
-			return err
+			return fatalStore(err)
 		}
 	}
 
@@ -243,7 +245,7 @@ func (s *Service) claimDraftAfterLease(ctx context.Context, task *model.Task, le
 	for {
 		current, err := s.db.GetTask(ctx, task.ID)
 		if err != nil {
-			return nil, false, err
+			return nil, false, fatalStore(err)
 		}
 		if current.Status != model.StatusDraft {
 			return current, false, nil
@@ -255,7 +257,7 @@ func (s *Service) claimDraftAfterLease(ctx context.Context, task *model.Task, le
 			if err := s.db.SaveTask(ctx, current, version); errors.Is(err, store.ErrConflict) {
 				continue
 			} else if err != nil {
-				return nil, false, err
+				return nil, false, fatalStore(err)
 			}
 			return current, true, nil
 		}
@@ -375,7 +377,7 @@ func (s *Service) log(ctx context.Context, message Message, parsed command.Comma
 	}
 	text, err := s.logs.Summary(task.ID, maxNotificationRunes-80)
 	if err != nil {
-		return err
+		return fatalStore(err)
 	}
 	if err := s.commitRecords(ctx, message, key, task.ID, "log", "log viewed"); err != nil {
 		return err
@@ -397,7 +399,10 @@ func (s *Service) loadOperable(ctx context.Context, message Message, id string) 
 func (s *Service) loadTask(ctx context.Context, message Message, id string) (*model.Task, error) {
 	task, err := s.db.GetTask(ctx, id)
 	if err != nil {
-		return nil, err
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, err
+		}
+		return nil, fatalStore(err)
 	}
 	if task.GroupID != message.GroupID {
 		return nil, errTaskAccess
@@ -417,25 +422,25 @@ func (s *Service) transition(task *model.Task, next model.Status) error {
 func (s *Service) commitMutation(ctx context.Context, message Message, key string, task *model.Task, version int64, kind, detail string) error {
 	now := time.Now().UTC()
 	input := model.Input{TaskID: task.ID, Kind: kind, UserID: message.UserID, GroupID: message.GroupID, MessageID: message.MessageID, Body: message.Text, CreatedAt: now}
-	return s.db.CommitTaskMutation(ctx, task, version, input, kind, bound(detail), key, now)
+	return fatalStore(s.db.CommitTaskMutation(ctx, task, version, input, kind, bound(detail), key, now))
 }
 
 func (s *Service) commitSupplementMutation(ctx context.Context, message Message, key string, task *model.Task, version int64, detail string) error {
 	now := time.Now().UTC()
 	input := model.Input{TaskID: task.ID, Kind: "supplement", UserID: message.UserID, GroupID: message.GroupID, MessageID: message.MessageID, Body: message.Text, CreatedAt: now}
-	return s.db.CommitTaskMutationInvalidatingApprovals(ctx, task, version, input, "supplement", bound(detail), key, now, "merge", "superseded_by_new_commit")
+	return fatalStore(s.db.CommitTaskMutationInvalidatingApprovals(ctx, task, version, input, "supplement", bound(detail), key, now, "merge", "superseded_by_new_commit"))
 }
 
 func (s *Service) commitRecords(ctx context.Context, message Message, key, taskID, kind, detail string) error {
 	now := time.Now().UTC()
 	input := model.Input{TaskID: taskID, Kind: kind, UserID: message.UserID, GroupID: message.GroupID, MessageID: message.MessageID, Body: message.Text, CreatedAt: now}
-	return s.db.CommitRecords(ctx, input, kind, bound(detail), key, now)
+	return fatalStore(s.db.CommitRecords(ctx, input, kind, bound(detail), key, now))
 }
 
 func (s *Service) notifyExisting(ctx context.Context, groupID, id string) error {
 	task, err := s.db.GetTask(ctx, id)
 	if err != nil {
-		return err
+		return fatalStore(err)
 	}
 	return s.send(ctx, groupID, "任务 #"+task.ID+" 已存在，当前状态："+string(task.Status))
 }
@@ -470,7 +475,7 @@ func (s *Service) replayNotification(ctx context.Context, message Message, parse
 	case command.KindLog:
 		text, err := s.logs.Summary(task.ID, maxNotificationRunes-80)
 		if err != nil {
-			return err
+			return fatalStore(err)
 		}
 		return s.send(ctx, message.GroupID, "任务 #"+task.ID+" 日志摘要：\n"+text)
 	case command.KindApproveMerge:
@@ -485,7 +490,7 @@ func (s *Service) replayNotification(ctx context.Context, message Message, parse
 func (s *Service) replayApproval(ctx context.Context, message Message, task *model.Task, kind, label string) error {
 	approval, err := s.db.ApprovalByMessage(ctx, message.GroupID, message.MessageID)
 	if err != nil {
-		return err
+		return fatalStore(err)
 	}
 	if approval.TaskID != task.ID || approval.Kind != kind || approval.UserID != message.UserID || approval.GroupID != message.GroupID {
 		return errTaskAccess
@@ -555,6 +560,13 @@ func (s *Service) send(ctx context.Context, groupID, text string) error {
 		return errors.Join(ErrNotificationDelivery, err)
 	}
 	return nil
+}
+
+func fatalStore(err error) error {
+	if err == nil {
+		return nil
+	}
+	return errors.Join(ErrFatalStore, err)
 }
 
 func (s *Service) boundNotification(text string) string {

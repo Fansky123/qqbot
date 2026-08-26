@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -42,6 +43,18 @@ func run(ctx context.Context, args []string) (response, int) {
 	}
 
 	switch action {
+	case "validate":
+		expected, err := parseValidate(actionArgs)
+		if err != nil {
+			return failed(err), 1
+		}
+		project, err := operator.Preflight(ctx, expected.project)
+		if err != nil {
+			return failed(errors.New("project preflight failed")), 1
+		}
+		if err := validateExpectedProject(project, expected); err != nil {
+			return failed(err), 1
+		}
 	case "sync":
 		project, err := parseSync(actionArgs)
 		if err == nil {
@@ -80,6 +93,30 @@ func run(ctx context.Context, args []string) (response, int) {
 		return failed(errors.New("unknown action")), 2
 	}
 	return response{OK: true}, 0
+}
+
+type validateRequest struct {
+	project, fingerprint string
+}
+
+func parseValidate(args []string) (validateRequest, error) {
+	flags := newActionFlags("validate")
+	project := flags.String("project", "", "")
+	fingerprint := flags.String("config-sha256", "", "")
+	if err := parseAction(flags, args); err != nil || *project == "" || len(*fingerprint) != 64 {
+		return validateRequest{}, errors.New("invalid validate command")
+	}
+	if _, err := hex.DecodeString(*fingerprint); err != nil {
+		return validateRequest{}, errors.New("invalid validate command")
+	}
+	return validateRequest{project: *project, fingerprint: *fingerprint}, nil
+}
+
+func validateExpectedProject(project ops.Project, expected validateRequest) error {
+	if ops.ProjectFingerprint(project) != expected.fingerprint {
+		return errors.New("project configuration mismatch")
+	}
+	return nil
 }
 
 func parseGlobal(args []string) (string, string, []string, error) {

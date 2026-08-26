@@ -399,6 +399,171 @@ func TestRunTreatsEarlyOneBotReturnAsFatal(t *testing.T) {
 	waitClosed(t, schedulerStopped, "scheduler cancellation")
 }
 
+func TestRunDrainsAcceptedMessagesAfterCancellation(t *testing.T) {
+	db := openStore(t, filepath.Join(t.TempDir(), "tasks.db"))
+	defer closeStore(t, db)
+	const total = 8
+	accepted := make(chan struct{}, total)
+	client := emittingClient{messages: make([]onebot.GroupMessage, total), accepted: accepted}
+	for i := range client.messages {
+		client.messages[i] = onebot.GroupMessage{GroupID: "100", UserID: "200", MessageID: onebot.ID(fmt.Sprint(i + 1))}
+	}
+	var mu sync.Mutex
+	seen := make(map[string]int)
+	service := serviceFunc(func(_ context.Context, message tasksvc.Message) error {
+		mu.Lock()
+		seen[message.MessageID]++
+		mu.Unlock()
+		return nil
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- (App{
+			Store: db, Client: client, Scheduler: blockingScheduler{}, Service: service,
+			Groups: groupFunc(func(string) bool { return true }), MessageWorkers: 1, Logger: discardLogger(),
+		}).Run(ctx)
+	}()
+	for range total {
+		waitClosed(t, accepted, "accepted message")
+	}
+	cancel()
+	if err := waitError(t, done, "drained app shutdown"); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != total {
+		t.Fatalf("processed IDs = %d, want %d (%v)", len(seen), total, seen)
+	}
+	for id, count := range seen {
+		if count != 1 {
+			t.Fatalf("message %s processed %d times", id, count)
+		}
+	}
+}
+
+func TestRunStopsOnFatalStoreError(t *testing.T) {
+	db := openStore(t, filepath.Join(t.TempDir(), "tasks.db"))
+	defer closeStore(t, db)
+	called := make(chan struct{})
+	clientStopped := make(chan struct{})
+	service := serviceFunc(func(context.Context, tasksvc.Message) error {
+		close(called)
+		return errors.Join(tasksvc.ErrFatalStore, errors.New("database failed"))
+	})
+	err := (App{
+		Store: db,
+		Client: clientFunc(func(ctx context.Context, handler onebot.Handler) error {
+			if err := handler(ctx, onebot.GroupMessage{GroupID: "100", UserID: "200", MessageID: "1"}); err != nil {
+				return err
+			}
+			<-ctx.Done()
+			close(clientStopped)
+			return nil
+		}),
+		Scheduler: blockingScheduler{}, Service: service, Groups: groupFunc(func(string) bool { return true }),
+		MessageWorkers: 1, Logger: discardLogger(),
+	}).Run(context.Background())
+	waitClosed(t, called, "fatal service error")
+	if err == nil || !errors.Is(err, tasksvc.ErrFatalStore) {
+		t.Fatalf("Run error = %v, want ErrFatalStore", err)
+	}
+	waitClosed(t, clientStopped, "fatal client cancellation")
+}
+
+func TestRunReturnsFatalStoreDiscoveredWhileDrainingAfterCancellation(t *testing.T) {
+	db := openStore(t, filepath.Join(t.TempDir(), "tasks.db"))
+	defer closeStore(t, db)
+	accepted := make(chan struct{}, 2)
+	releaseFirst := make(chan struct{})
+	var calls atomic.Int32
+	service := serviceFunc(func(context.Context, tasksvc.Message) error {
+		if calls.Add(1) == 1 {
+			<-releaseFirst
+			return nil
+		}
+		return errors.Join(tasksvc.ErrFatalStore, errors.New("drain storage failed"))
+	})
+	client := emittingClient{
+		messages: []onebot.GroupMessage{
+			{GroupID: "100", UserID: "200", MessageID: "1"},
+			{GroupID: "100", UserID: "200", MessageID: "2"},
+		},
+		accepted: accepted,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- (App{
+			Store: db, Client: client, Scheduler: blockingScheduler{}, Service: service,
+			Groups: groupFunc(func(string) bool { return true }), MessageWorkers: 1, Logger: discardLogger(),
+		}).Run(ctx)
+	}()
+	waitClosed(t, accepted, "first accepted message")
+	waitClosed(t, accepted, "second accepted message")
+	cancel()
+	close(releaseFirst)
+	err := waitError(t, done, "fatal drain shutdown")
+	if !errors.Is(err, tasksvc.ErrFatalStore) {
+		t.Fatalf("Run error = %v, want drain ErrFatalStore", err)
+	}
+}
+
+func TestRunReturnsFatalStoreFromJoinedScheduler(t *testing.T) {
+	db := openStore(t, filepath.Join(t.TempDir(), "tasks.db"))
+	defer closeStore(t, db)
+	err := (App{
+		Store: db,
+		Client: clientFunc(func(context.Context, onebot.Handler) error {
+			return nil
+		}),
+		Scheduler: schedulerFunc(func(ctx context.Context) error {
+			<-ctx.Done()
+			return errors.Join(tasksvc.ErrFatalStore, errors.New("scheduler store failed"))
+		}),
+		Service: serviceFunc(func(context.Context, tasksvc.Message) error { return nil }),
+		Groups:  groupFunc(func(string) bool { return true }), MessageWorkers: 1, Logger: discardLogger(),
+	}).Run(context.Background())
+	if !errors.Is(err, tasksvc.ErrFatalStore) {
+		t.Fatalf("Run error = %v, want joined scheduler ErrFatalStore", err)
+	}
+}
+
+func TestRunTreatsParentCancellationAsNormalWhenLoopResultWinsSelect(t *testing.T) {
+	db := openStore(t, filepath.Join(t.TempDir(), "tasks.db"))
+	defer closeStore(t, db)
+	returnClient := make(chan struct{})
+	schedulerCanceled := make(chan struct{})
+	releaseScheduler := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- (App{
+			Store: db,
+			Client: clientFunc(func(context.Context, onebot.Handler) error {
+				<-returnClient
+				return nil
+			}),
+			Scheduler: schedulerFunc(func(ctx context.Context) error {
+				<-ctx.Done()
+				close(schedulerCanceled)
+				<-releaseScheduler
+				return nil
+			}),
+			Service: serviceFunc(func(context.Context, tasksvc.Message) error { return nil }),
+			Groups:  groupFunc(func(string) bool { return true }), MessageWorkers: 1, Logger: discardLogger(),
+		}).Run(ctx)
+	}()
+	close(returnClient)
+	waitClosed(t, schedulerCanceled, "scheduler loop cancellation")
+	cancel()
+	close(releaseScheduler)
+	if err := waitError(t, done, "parent cancellation race"); err != nil {
+		t.Fatalf("Run after parent cancellation = %v, want nil", err)
+	}
+}
+
 type fakeOneBot struct {
 	server   *httptest.Server
 	selfID   string
@@ -765,12 +930,18 @@ func (s *countingScheduler) Run(ctx context.Context) error {
 	return nil
 }
 
-type emittingClient struct{ messages []onebot.GroupMessage }
+type emittingClient struct {
+	messages []onebot.GroupMessage
+	accepted chan<- struct{}
+}
 
 func (c emittingClient) Run(ctx context.Context, handler onebot.Handler) error {
 	for _, message := range c.messages {
 		if err := handler(ctx, message); err != nil {
 			return err
+		}
+		if c.accepted != nil {
+			c.accepted <- struct{}{}
 		}
 	}
 	<-ctx.Done()

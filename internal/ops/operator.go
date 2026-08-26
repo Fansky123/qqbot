@@ -95,6 +95,24 @@ func NewOperator(cfg Config) (*Operator, error) {
 	}, nil
 }
 
+// Preflight verifies the helper-owned repository without contacting its remote.
+func (o *Operator) Preflight(ctx context.Context, projectID string) (Project, error) {
+	project, err := o.project(projectID)
+	if err != nil {
+		return Project{}, err
+	}
+	if err := o.guardRepository(ctx, project); err != nil {
+		return Project{}, err
+	}
+	for _, branch := range []string{project.BaseBranch, project.RCBranch} {
+		ref := "refs/remotes/" + project.Remote + "/" + branch
+		if _, err := o.resolveCommit(ctx, project.RepoPath, ref); err != nil {
+			return Project{}, errors.New("trusted release ref is unavailable")
+		}
+	}
+	return project, nil
+}
+
 func (o *Operator) Sync(ctx context.Context, projectID string) error {
 	project, err := o.project(projectID)
 	if err != nil {

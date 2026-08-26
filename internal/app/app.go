@@ -82,8 +82,10 @@ func (a App) validate(ctx context.Context) error {
 }
 
 func (a App) runLoops(parent context.Context) error {
-	ctx, cancel := context.WithCancel(parent)
-	defer cancel()
+	loopCtx, cancelLoops := context.WithCancel(parent)
+	defer cancelLoops()
+	workerCtx, cancelWorkers := context.WithCancel(context.WithoutCancel(parent))
+	defer cancelWorkers()
 	logger := a.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -91,18 +93,19 @@ func (a App) runLoops(parent context.Context) error {
 
 	messages := make(chan tasksvc.Message, a.MessageWorkers*2)
 	var workers sync.WaitGroup
+	fatal := make(chan error, 1)
 	for range a.MessageWorkers {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
-			a.messageWorker(ctx, logger, messages)
+			a.messageWorker(workerCtx, logger, messages, fatal)
 		}()
 	}
 
 	results := make(chan loopResult, 2)
-	go func() { results <- loopResult{name: "scheduler", err: a.Scheduler.Run(ctx)} }()
+	go func() { results <- loopResult{name: "scheduler", err: a.Scheduler.Run(loopCtx)} }()
 	go func() {
-		err := a.Client.Run(ctx, func(handlerCtx context.Context, message onebot.GroupMessage) error {
+		err := a.Client.Run(loopCtx, func(handlerCtx context.Context, message onebot.GroupMessage) error {
 			if !a.Groups.AllowedGroup(string(message.GroupID)) {
 				return nil
 			}
@@ -115,34 +118,72 @@ func (a App) runLoops(parent context.Context) error {
 				return nil
 			case <-handlerCtx.Done():
 				return handlerCtx.Err()
-			case <-ctx.Done():
-				return ctx.Err()
+			case <-loopCtx.Done():
+				return loopCtx.Err()
 			}
 		})
 		results <- loopResult{name: "onebot", err: err}
 	}()
 
 	first := loopResult{}
-	parentCanceled := false
+	var fatalErr error
 	select {
 	case <-parent.Done():
-		parentCanceled = true
+		cancelLoops()
+	case fatalErr = <-fatal:
+		cancelLoops()
 	case first = <-results:
+		cancelLoops()
 	}
-	cancel()
+	if errors.Is(first.err, tasksvc.ErrFatalStore) {
+		fatalErr = first.err
+		cancelWorkers()
+	}
 
-	// Client handlers can no longer enqueue after the client loop has joined.
+	// Stop intake before closing the queue; the client handler can no longer enqueue after both loops join.
 	remaining := 2
 	if first.name != "" {
 		remaining--
 	}
 	for range remaining {
-		<-results
+		result := <-results
+		if fatalErr == nil && errors.Is(result.err, tasksvc.ErrFatalStore) {
+			fatalErr = result.err
+			cancelWorkers()
+		}
 	}
 	close(messages)
-	workers.Wait()
+	if fatalErr != nil {
+		cancelWorkers()
+	}
+	workersDone := make(chan struct{})
+	go func() {
+		workers.Wait()
+		close(workersDone)
+	}()
+	for workersDone != nil {
+		select {
+		case err := <-fatal:
+			if fatalErr == nil {
+				fatalErr = err
+				cancelWorkers()
+			}
+		case <-workersDone:
+			workersDone = nil
+		}
+	}
+	select {
+	case err := <-fatal:
+		if fatalErr == nil {
+			fatalErr = err
+		}
+	default:
+	}
 
-	if parentCanceled {
+	if fatalErr != nil {
+		return fatalErr
+	}
+	if parent.Err() != nil {
 		return nil
 	}
 	if first.err == nil {
@@ -151,16 +192,27 @@ func (a App) runLoops(parent context.Context) error {
 	return fmt.Errorf("%s loop failed: %w", first.name, first.err)
 }
 
-func (a App) messageWorker(ctx context.Context, logger *slog.Logger, messages <-chan tasksvc.Message) {
+func (a App) messageWorker(ctx context.Context, logger *slog.Logger, messages <-chan tasksvc.Message, fatal chan<- error) {
 	for {
+		var message tasksvc.Message
+		var ok bool
 		select {
 		case <-ctx.Done():
 			return
-		case message, ok := <-messages:
+		case message, ok = <-messages:
 			if !ok {
 				return
 			}
-			if err := a.handleMessage(ctx, message); err != nil && ctx.Err() == nil {
+		}
+		if err := a.handleMessage(ctx, message); err != nil {
+			if errors.Is(err, tasksvc.ErrFatalStore) {
+				select {
+				case fatal <- err:
+				default:
+				}
+				return
+			}
+			if ctx.Err() == nil {
 				logger.Warn("message handling failed",
 					"class", messageErrorClass(err),
 					"group_id", message.GroupID,

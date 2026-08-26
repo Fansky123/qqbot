@@ -119,8 +119,11 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	ticker := time.NewTicker(s.poll)
 	defer ticker.Stop()
 	for {
-		if err := s.scan(ctx); err != nil && ctx.Err() == nil {
-			s.logger.Error("scheduler scan failed", "error", s.safeText(err.Error()))
+		if err := s.scan(ctx); err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return fmt.Errorf("%w: scheduler scan failed", ErrFatalStore)
 		}
 		select {
 		case <-ctx.Done():

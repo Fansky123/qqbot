@@ -3,6 +3,8 @@ package ops
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -94,6 +96,13 @@ func newClient(command []string, sourceRepos map[string]string, allowCurrentUID 
 
 func (c *Client) Sync(ctx context.Context, projectID string) error {
 	_, err := c.call(ctx, "", nil, "sync", "--project", projectID)
+	return err
+}
+
+// Preflight asks the privileged helper to validate one expected release configuration.
+func (c *Client) Preflight(ctx context.Context, projectID, remote, baseBranch, rcBranch string, checks [][]string) error {
+	fingerprint := ProjectFingerprint(Project{Remote: remote, BaseBranch: baseBranch, RCBranch: rcBranch, Checks: checks})
+	_, err := c.call(ctx, "", nil, "validate", "--project", projectID, "--config-sha256", fingerprint)
 	return err
 }
 
@@ -295,7 +304,7 @@ func (c *Client) call(ctx context.Context, wantCommit string, stdin io.Reader, a
 	argv := append(append([]string(nil), c.command...), args...)
 	stdout, stderr, runErr := runClientProcess(ctx, argv, stdin)
 	taskID := ""
-	if args[0] != "sync" {
+	if args[0] != "sync" && args[0] != "validate" {
 		taskID = args[4]
 	}
 	logErr := appendTaskLog(c.log, taskID, "ops.stderr", stderr)
@@ -378,6 +387,13 @@ func validateClientInputs(args []string) error {
 	case "sync":
 		if len(args) != 3 {
 			return errors.New("invalid sync request")
+		}
+	case "validate":
+		if len(args) != 5 || args[3] != "--config-sha256" || len(args[4]) != sha256.Size*2 {
+			return errors.New("invalid validate request")
+		}
+		if _, err := hex.DecodeString(args[4]); err != nil {
+			return errors.New("invalid validate request")
 		}
 	case "push":
 		if len(args) != 9 || args[3] != "--task" || args[5] != "--branch" || args[7] != "--commit" {

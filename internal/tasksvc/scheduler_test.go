@@ -1686,6 +1686,23 @@ func runScheduler(scheduler *Scheduler, ctx context.Context) <-chan error {
 	return done
 }
 
+func TestSchedulerReturnsFatalStoreWhenScanFails(t *testing.T) {
+	fixture := newSchedulerFixture(t, 1)
+	scheduler := fixture.scheduler(t)
+	if err := fixture.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	done := runScheduler(scheduler, context.Background())
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrFatalStore) {
+			t.Fatalf("Scheduler.Run error = %v, want ErrFatalStore", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("scheduler did not exit after store failure")
+	}
+}
+
 func waitRun(t *testing.T, done <-chan error) {
 	t.Helper()
 	select {

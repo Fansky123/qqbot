@@ -118,6 +118,37 @@ func (l fakeLogs) Summary(_ string, maxRunes int) (string, error) {
 
 func (l fakeLogs) RedactText(text string) string { return strings.ToValidUTF8(text, "\uFFFD") }
 
+type failingLogs struct{ err error }
+
+func (l failingLogs) Summary(string, int) (string, error) { return "", l.err }
+func (l failingLogs) RedactText(text string) string       { return text }
+
+func TestServiceWrapsTaskLogFailureAsFatalStore(t *testing.T) {
+	svc, db, _, _ := testServiceWithLogs(t, &fakePlanner{result: planResult()}, failingLogs{err: errors.New("log read failed")})
+	ctx := context.Background()
+	create := msg("m-fatal", "u1", "[orders] fatal log read")
+	if err := svc.Handle(ctx, create); err != nil {
+		t.Fatal(err)
+	}
+	id := TaskID(create.GroupID, create.MessageID)
+	err := svc.Handle(ctx, msg("m-log", "u1", "日志 #"+id))
+	if !errors.Is(err, ErrFatalStore) {
+		t.Fatalf("log error = %v, want ErrFatalStore", err)
+	}
+	_ = db
+}
+
+func TestServiceWrapsSQLiteFailureAsFatalStore(t *testing.T) {
+	svc, db, _, _ := testService(t, &fakePlanner{result: planResult()})
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	err := svc.Handle(context.Background(), msg("m-db-fatal", "u1", "[orders] database failure"))
+	if !errors.Is(err, ErrFatalStore) {
+		t.Fatalf("database error = %v, want ErrFatalStore", err)
+	}
+}
+
 func testService(t *testing.T, planner Planner) (*Service, *store.Store, *fakeScheduler, *fakeNotifier) {
 	return testServiceWithLogs(t, planner, fakeLogs{"OPENAI_API_KEY=raw-secret NAPCAT_ACCESS_TOKEN=raw-token " + strings.Repeat("secret ", 1000)})
 }

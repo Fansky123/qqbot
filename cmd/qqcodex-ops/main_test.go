@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 
 	"qqcodex/internal/ops"
@@ -22,5 +23,30 @@ func TestFailedIncludesStableCommitErrorCode(t *testing.T) {
 		if got.CurrentCommit != ops.ChangedCommit(test.err) {
 			t.Fatalf("failed(%v) commit = %q", test.err, got.CurrentCommit)
 		}
+	}
+}
+
+func TestParseValidate(t *testing.T) {
+	fingerprint := strings.Repeat("a", 64)
+	request, err := parseValidate([]string{"--project", "order-api", "--config-sha256", fingerprint})
+	if err != nil || request.project != "order-api" || request.fingerprint != fingerprint {
+		t.Fatalf("parseValidate = %#v, %v", request, err)
+	}
+	if _, err := parseValidate([]string{"--project", "", "--config-sha256", fingerprint}); err == nil {
+		t.Fatal("parseValidate accepted empty project")
+	}
+}
+
+func TestValidateExpectedProjectRejectsReleaseConfigMismatch(t *testing.T) {
+	project := ops.Project{Remote: "origin", BaseBranch: "main", RCBranch: "rc", Checks: [][]string{{"go", "test", "./..."}}}
+	expected := validateRequest{project: "order-api", fingerprint: ops.ProjectFingerprint(project)}
+	if err := validateExpectedProject(project, expected); err != nil {
+		t.Fatal(err)
+	}
+	changed := project
+	changed.RCBranch = "other-rc"
+	expected.fingerprint = ops.ProjectFingerprint(changed)
+	if err := validateExpectedProject(project, expected); err == nil {
+		t.Fatal("accepted mismatched release configuration")
 	}
 }

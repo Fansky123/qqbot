@@ -56,7 +56,7 @@ func (s *Service) approve(ctx context.Context, message Message, parsed command.C
 		detail += " with deploy key " + task.DeployKey
 	}
 	if err := s.db.CommitApprovalMutation(ctx, task, version, approval, input, kind+"_approval", bound(detail), key, now); err != nil {
-		return err
+		return fatalStore(err)
 	}
 	s.scheduler.Wake()
 	return s.send(ctx, message.GroupID, "任务 #"+task.ID+" 已"+label+"，绑定提交："+boundCommit)
