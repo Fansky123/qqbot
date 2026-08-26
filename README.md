@@ -76,7 +76,7 @@ git -C /srv/qqcodex-ops/repos/order-api fetch origin main rc
 
 ### 4. 构建与启动
 
-需要 Linux、Git、Go 1.26 或更高版本，以及可执行的 `codex` CLI：
+需要 Linux、Git、Go 1.26 或更高版本、可执行的 `codex` CLI，以及由 root 管理的 `/usr/bin/bwrap`。正常启动会校验 bubblewrap 的所有者、权限和路径，并运行一次有界能力探针；缺少该隔离边界时 worker 会拒绝启动。`-cleanup-expired` 不调用 Codex，因此不依赖 bubblewrap。
 
 ```bash
 go build -o bin/qqcodex ./cmd/qqcodex
@@ -96,17 +96,19 @@ export CODEX_API_KEY='company-codex-api-key'
 ./bin/qqcodex -config ./configs/qqcodex.local.json
 ```
 
-启动会先校验 Codex、数据库和目录安全性、worker Git 仓库与远端引用、检查命令、ops 项目元数据、ops 仓库引用，以及两个 Git common directory 不相同。任一预检失败时不会启动 OneBot 或 scheduler。
+启动会先校验 Codex、bubblewrap、数据库和目录安全性、worker Git 仓库与远端引用、检查命令、ops 项目元数据、ops 仓库引用，以及两个 Git common directory 不相同。任一预检失败时不会启动 OneBot 或 scheduler。
 
 直接把 `bin/qqcodex-ops` 写进 `ops_command` 只适合本地功能验证，不能提供 OS 级凭据隔离。真实 RC 必须使用下文所述的受限 wrapper 或等价服务边界。
 
-## 群命令
+## 群消息
 
-任务编号格式为 `T-` 加 12 位大写十六进制字符。机器人不提供自由形式 shell 命令，也没有 `help` 管理命令。
+范范同时支持单条咨询和受控任务。咨询编号使用 `Q-` 加 12 位大写十六进制字符，仅用于本地去重和日志；任务编号使用 `T-` 加 12 位大写十六进制字符。机器人不提供自由形式 shell 命令，也没有 `help` 管理命令。
 
 | 操作 | 群消息 | 权限与条件 |
 | --- | --- | --- |
-| 创建 | `@机器人 [orders] 修复重复提交并补测试` | 指定群内的白名单员工；必须 @ 机器人；`orders` 是项目 alias |
+| 通用咨询 | `@范范 这个错误如何排查？` | 指定群内的白名单员工；必须 @ 范范；只使用独立空白咨询目录 |
+| 项目咨询 | `@范范 问 [qqbot] 这个锁为什么会死锁？` | 指定群内的白名单员工；必须 @ 范范；项目仓库只读 |
+| 创建 | `@范范 [orders] 修复重复提交并补测试` | 指定群内的白名单员工；必须 @ 范范；`orders` 是项目 alias |
 | 确认 | `确认 #T-012345ABCDEF` | 仅任务发起人；只允许 `awaiting_confirmation` |
 | 补充 | `补充 #T-012345ABCDEF 增加兼容旧数据的迁移` | 发起人或管理员；只允许 `blocked` 或 `awaiting_merge_approval` |
 | 取消 | `取消 #T-012345ABCDEF` | 发起人或管理员；仅在状态机允许且尚未合并时 |
@@ -115,7 +117,11 @@ export CODEX_API_KEY='company-codex-api-key'
 | 批准合并 | `批准合并 #T-012345ABCDEF` | 仅管理员；只允许 `awaiting_merge_approval` |
 | 批准部署 | `批准部署 #T-012345ABCDEF` | 仅管理员；允许 `awaiting_deploy_approval`，或对 `deploy_failed` 发起一次新重试 |
 
-命令必须完全匹配上述中文和空格格式。非指定群在进入任务服务前被过滤；非白名单用户、跨群任务访问、员工审批和非发起人确认都会被拒绝。
+咨询每条消息独立处理，只返回答案，不继承上一条消息或群聊历史，也不创建任务。咨询调用使用临时会话、禁用 Web 搜索，并在操作系统隔离中只读挂载通用咨询目录或所选项目仓库；它不能写文件、运行任务 Git/ops/合并/部署流程或取得真实 API key。最终回复会先脱敏、截断并持久化，OneBot 重放同一 message ID 时只重发已保存回复。
+
+`consultation.workspace` 必须是独立的绝对路径，不能与数据库目录、日志、worktree 或项目仓库重叠；已有父目录和最终目录都应由 worker 用户持有并使用私有权限。`consultation.timeout_seconds` 是每条咨询的 Codex 超时。通用咨询只读取该空白目录，项目咨询仅以 `问 [项目别名]` 的形式选择配置中的项目。没有 `问` 的 `[项目别名] 内容` 始终创建任务，不由模型猜测意图。
+
+命令必须完全匹配上述中文和空格格式。非指定群在进入任务或咨询服务前被过滤；非白名单用户、跨群任务访问、员工审批和非发起人确认都会被拒绝。
 
 ## 状态与审批
 
