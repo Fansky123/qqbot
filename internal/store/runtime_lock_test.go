@@ -9,8 +9,182 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"qqcodex/internal/model"
 )
+
+func TestRuntimeLockUsesCanonicalDatabaseIdentity(t *testing.T) {
+	tests := []struct {
+		name  string
+		paths func(*testing.T) (string, string)
+	}{
+		{"final symlink", func(t *testing.T) (string, string) {
+			root := t.TempDir()
+			realPath := filepath.Join(root, "tasks.db")
+			createSQLiteStore(t, realPath)
+			alias := filepath.Join(root, "tasks-alias.db")
+			if err := os.Symlink(realPath, alias); err != nil {
+				t.Fatal(err)
+			}
+			return realPath, alias
+		}},
+		{"symlink parent", func(t *testing.T) (string, string) {
+			root := t.TempDir()
+			realParent := filepath.Join(root, "real")
+			if err := os.Mkdir(realParent, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			aliasParent := filepath.Join(root, "alias")
+			if err := os.Symlink(realParent, aliasParent); err != nil {
+				t.Fatal(err)
+			}
+			return filepath.Join(realParent, "tasks.db"), filepath.Join(aliasParent, "tasks.db")
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			realPath, aliasPath := test.paths(t)
+			first, err := Open(realPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = first.Close() })
+			lock, err := first.AcquireRuntimeLock()
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = lock.Close() })
+			second, err := Open(aliasPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = second.Close() })
+			if second.path != first.path {
+				t.Fatalf("canonical database paths differ: %q != %q", second.path, first.path)
+			}
+			if secondLock, err := second.AcquireRuntimeLock(); !errors.Is(err, ErrRuntimeLocked) {
+				if secondLock != nil {
+					_ = secondLock.Close()
+				}
+				t.Fatalf("alias AcquireRuntimeLock() error = %v, want ErrRuntimeLocked", err)
+			}
+		})
+	}
+}
+
+func TestOpenRejectsUnsafeDatabaseFileWithoutLeakingPath(t *testing.T) {
+	tests := []struct {
+		name    string
+		prepare func(*testing.T, string)
+	}{
+		{"hardlink", func(t *testing.T, path string) {
+			target := path + ".target"
+			createSQLiteStore(t, target)
+			if err := os.Link(target, path); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"directory", func(t *testing.T, path string) {
+			if err := os.Mkdir(path, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"fifo", func(t *testing.T, path string) {
+			if err := unix.Mkfifo(path, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			const secret = "VERY_SECRET_DB_PATH"
+			path := filepath.Join(t.TempDir(), secret+"-tasks.db")
+			test.prepare(t, path)
+			db, err := Open(path)
+			if db != nil {
+				_ = db.Close()
+			}
+			if err == nil {
+				t.Fatal("Open() accepted unsafe database file")
+			}
+			if strings.Contains(err.Error(), secret) {
+				t.Fatalf("Open() error leaked database path: %q", err)
+			}
+		})
+	}
+}
+
+func TestOpenCanonicalizesSymlinkParentBeforeCreatingDatabase(t *testing.T) {
+	root := t.TempDir()
+	realParent := filepath.Join(root, "real")
+	if err := os.Mkdir(realParent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	aliasParent := filepath.Join(root, "alias")
+	if err := os.Symlink(realParent, aliasParent); err != nil {
+		t.Fatal(err)
+	}
+	db, err := Open(filepath.Join(aliasParent, "new.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	want := filepath.Join(realParent, "new.db")
+	if db.path != want {
+		t.Fatalf("canonical database path = %q, want %q", db.path, want)
+	}
+	if _, err := os.Stat(want); err != nil {
+		t.Fatalf("created canonical database: %v", err)
+	}
+}
+
+func TestRuntimeLockPinsCanonicalDatabaseParent(t *testing.T) {
+	root := t.TempDir()
+	parent := filepath.Join(root, "database")
+	if err := os.Mkdir(parent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	first, err := Open(filepath.Join(parent, "tasks.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = first.Close() })
+	moved := filepath.Join(root, "moved")
+	if err := os.Rename(parent, moved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(parent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	firstLock, err := first.AcquireRuntimeLock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = firstLock.Close() })
+	second, err := Open(filepath.Join(moved, "tasks.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = second.Close() })
+	if secondLock, err := second.AcquireRuntimeLock(); !errors.Is(err, ErrRuntimeLocked) {
+		if secondLock != nil {
+			_ = secondLock.Close()
+		}
+		t.Fatalf("renamed-parent AcquireRuntimeLock() error = %v, want ErrRuntimeLocked", err)
+	}
+}
+
+func createSQLiteStore(t *testing.T, path string) {
+	t.Helper()
+	db, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestAcquireRuntimeLockRejectsUnsafeLockFile(t *testing.T) {
 	tests := []struct {

@@ -26,7 +26,7 @@ type RuntimeLock struct {
 }
 
 func (s *Store) AcquireRuntimeLock() (*RuntimeLock, error) {
-	fd, err := unix.Open(s.path+runtimeLockSuffix, unix.O_CREAT|unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600)
+	fd, err := unix.Openat(s.dirFD, s.lockName, unix.O_CREAT|unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open runtime lock: %w", err)
 	}

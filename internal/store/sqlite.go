@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"os"
 	"path/filepath"
 	"time"
 
+	"golang.org/x/sys/unix"
 	_ "modernc.org/sqlite"
 
 	"qqcodex/internal/model"
@@ -31,34 +33,43 @@ const taskColumns = `
 	version, created_at, updated_at`
 
 type Store struct {
-	db   *sql.DB
-	path string
+	db       *sql.DB
+	path     string
+	dirFD    int
+	lockName string
 }
 
 func Open(path string) (*Store, error) {
-	absolutePath, err := filepath.Abs(path)
+	canonicalPath, dirFD, identityFD, err := prepareDatabaseFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("resolve sqlite store path: %w", err)
+		return nil, err
 	}
+	keepDirFD := false
+	defer func() {
+		if !keepDirFD {
+			_ = unix.Close(dirFD)
+		}
+	}()
+	defer func() { _ = unix.Close(identityFD) }()
 	query := make(url.Values)
 	query.Set("_foreign_keys", "on")
 	query.Set("_busy_timeout", "5000")
 	dsn := (&url.URL{
 		Scheme:   "file",
-		Path:     filepath.ToSlash(absolutePath),
+		Path:     filepath.ToSlash(canonicalPath),
 		RawQuery: query.Encode(),
 	}).String()
 
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
-		return nil, fmt.Errorf("open sqlite store: %w", err)
+		return nil, errors.New("open sqlite store failed")
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 
 	if _, err := db.Exec(schema); err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("initialize sqlite store: %w", err)
+		return nil, errors.New("initialize sqlite store failed")
 	}
 	if err := ensureTaskTextColumn(db, "git_common_dir", "Git common directory"); err != nil {
 		_ = db.Close()
@@ -68,7 +79,80 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	return &Store{db: db, path: absolutePath}, nil
+	canonicalPath, err = verifyDatabaseFile(canonicalPath, dirFD, identityFD)
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	keepDirFD = true
+	return &Store{db: db, path: canonicalPath, dirFD: dirFD, lockName: filepath.Base(canonicalPath) + runtimeLockSuffix}, nil
+}
+
+func prepareDatabaseFile(path string) (string, int, int, error) {
+	absolutePath, err := filepath.Abs(path)
+	if err != nil {
+		return "", -1, -1, errors.New("resolve sqlite store path failed")
+	}
+	canonicalPath, err := filepath.EvalSymlinks(absolutePath)
+	if os.IsNotExist(err) {
+		parent, parentErr := filepath.EvalSymlinks(filepath.Dir(absolutePath))
+		if parentErr != nil {
+			return "", -1, -1, errors.New("resolve sqlite store parent failed")
+		}
+		canonicalPath = filepath.Join(parent, filepath.Base(absolutePath))
+	} else if err != nil {
+		return "", -1, -1, errors.New("resolve sqlite store path failed")
+	}
+	dirFD, err := unix.Open(filepath.Dir(canonicalPath), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return "", -1, -1, errors.New("open sqlite store parent failed")
+	}
+	fd, err := unix.Openat(dirFD, filepath.Base(canonicalPath), unix.O_CREAT|unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600)
+	if err != nil {
+		_ = unix.Close(dirFD)
+		return "", -1, -1, errors.New("open sqlite store file failed")
+	}
+	if _, err := inspectDatabaseFile(fd); err != nil {
+		_ = unix.Close(fd)
+		_ = unix.Close(dirFD)
+		return "", -1, -1, err
+	}
+	return canonicalPath, dirFD, fd, nil
+}
+
+func verifyDatabaseFile(path string, dirFD, identityFD int) (string, error) {
+	canonicalPath, err := filepath.EvalSymlinks(path)
+	if err != nil || canonicalPath != path {
+		return "", errors.New("sqlite store identity changed")
+	}
+	currentFD, err := unix.Openat(dirFD, filepath.Base(canonicalPath), unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return "", errors.New("verify sqlite store file failed")
+	}
+	defer func() { _ = unix.Close(currentFD) }()
+	identity, err := inspectDatabaseFile(identityFD)
+	if err != nil {
+		return "", err
+	}
+	current, err := inspectDatabaseFile(currentFD)
+	if err != nil {
+		return "", err
+	}
+	if identity.Dev != current.Dev || identity.Ino != current.Ino {
+		return "", errors.New("sqlite store identity changed")
+	}
+	return canonicalPath, nil
+}
+
+func inspectDatabaseFile(fd int) (unix.Stat_t, error) {
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		return unix.Stat_t{}, errors.New("inspect sqlite store file failed")
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 {
+		return unix.Stat_t{}, errors.New("unsafe sqlite store file")
+	}
+	return stat, nil
 }
 
 func ensureTaskTextColumn(db *sql.DB, column, description string) error {
@@ -108,8 +192,10 @@ func ensureTaskTextColumn(db *sql.DB, column, description string) error {
 }
 
 func (s *Store) Close() error {
-	if err := s.db.Close(); err != nil {
-		return fmt.Errorf("close sqlite store: %w", err)
+	dbErr := s.db.Close()
+	dirErr := unix.Close(s.dirFD)
+	if dbErr != nil || dirErr != nil {
+		return fmt.Errorf("close sqlite store: %w", errors.Join(dbErr, dirErr))
 	}
 	return nil
 }
