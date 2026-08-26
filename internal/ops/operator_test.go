@@ -608,11 +608,13 @@ func TestOperatorMergeRCFailureLeavesRemoteUnchanged(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name    string
-		prepare func(*testing.T, *opsFixture) string
+		name      string
+		prepare   func(*testing.T, *opsFixture) string
+		wantTyped error
 	}{
 		{
-			name: "approved commit differs from remote task",
+			name:      "approved commit differs from remote task",
+			wantTyped: ErrTaskCommitChanged,
 			prepare: func(t *testing.T, fixture *opsFixture) string {
 				branch, commit := fixture.createTaskCommit(t, testTaskID, "feature.txt", "feature\n")
 				if err := pushTaskBundle(t, fixture.operator, fixture.projectID, fixture.repo, testTaskID, branch, commit, nil); err != nil {
@@ -636,7 +638,8 @@ func TestOperatorMergeRCFailureLeavesRemoteUnchanged(t *testing.T) {
 			},
 		},
 		{
-			name: "merge conflict",
+			name:      "merge conflict",
+			wantTyped: ErrMergeConflict,
 			prepare: func(t *testing.T, fixture *opsFixture) string {
 				git(t, fixture.repo, "switch", "-c", "codex/"+testTaskID, "origin/main")
 				writeFile(t, filepath.Join(fixture.repo, "shared.txt"), "task\n")
@@ -664,8 +667,12 @@ func TestOperatorMergeRCFailureLeavesRemoteUnchanged(t *testing.T) {
 			fixture := newOpsFixture(t)
 			approved := tt.prepare(t, &fixture)
 			oldRC := fixture.remoteRef(t, "rc")
-			if _, err := fixture.operator.MergeRC(context.Background(), fixture.projectID, testTaskID, approved); err == nil {
+			_, mergeErr := fixture.operator.MergeRC(context.Background(), fixture.projectID, testTaskID, approved)
+			if mergeErr == nil {
 				t.Fatal("MergeRC() error = nil, want failure")
+			}
+			if tt.wantTyped != nil && !errors.Is(mergeErr, tt.wantTyped) {
+				t.Fatalf("MergeRC() error = %v, want %v", mergeErr, tt.wantTyped)
 			}
 			if got := fixture.remoteRef(t, "rc"); got != oldRC {
 				t.Fatalf("failed merge changed remote RC to %q, want %q", got, oldRC)
@@ -675,6 +682,23 @@ func TestOperatorMergeRCFailureLeavesRemoteUnchanged(t *testing.T) {
 				t.Fatalf("temporary worktree remains registered:\n%s", listed)
 			}
 		})
+	}
+}
+
+func TestOperatorDeployRCTypesRemoteCommitChange(t *testing.T) {
+	t.Parallel()
+	fixture := newOpsFixture(t)
+	oldRC := fixture.rcCommit
+	other := fixture.clone(t)
+	git(t, other, "switch", "rc")
+	writeFile(t, filepath.Join(other, "changed.txt"), "changed\n")
+	git(t, other, "add", "changed.txt")
+	git(t, other, "commit", "-m", "change rc")
+	git(t, other, "push", "origin", "HEAD:rc")
+
+	err := fixture.operator.DeployRC(context.Background(), fixture.projectID, testTaskID, oldRC)
+	if !errors.Is(err, ErrRCCommitChanged) {
+		t.Fatalf("DeployRC() error = %v, want ErrRCCommitChanged", err)
 	}
 }
 

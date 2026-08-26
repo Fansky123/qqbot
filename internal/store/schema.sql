@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     git_common_dir TEXT NOT NULL,
     task_commit TEXT NOT NULL,
     rc_commit TEXT NOT NULL,
+    deploy_key TEXT NOT NULL,
     session_id TEXT NOT NULL,
     summary TEXT NOT NULL,
     failure TEXT NOT NULL,
@@ -74,4 +75,13 @@ CREATE TABLE IF NOT EXISTS scheduler_leases (
     task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
     owner TEXT NOT NULL,
     expires_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS approval_execution_locks (
+    project_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    group_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    acquired_at INTEGER NOT NULL
 );

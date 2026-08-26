@@ -27,7 +27,7 @@ var schema string
 
 const taskColumns = `
 	id, project_id, group_id, creator_id, requirement, plan, status, branch,
-	worktree, base_commit, git_common_dir, task_commit, rc_commit, session_id, summary, failure,
+	worktree, base_commit, git_common_dir, task_commit, rc_commit, deploy_key, session_id, summary, failure,
 	version, created_at, updated_at`
 
 type Store struct {
@@ -59,14 +59,21 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("initialize sqlite store: %w", err)
 	}
-	if err := ensureGitCommonDirColumn(db); err != nil {
+	if err := ensureTaskTextColumn(db, "git_common_dir", "Git common directory"); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := ensureTaskTextColumn(db, "deploy_key", "deploy key"); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
 	return &Store{db: db}, nil
 }
 
-func ensureGitCommonDirColumn(db *sql.DB) error {
+func ensureTaskTextColumn(db *sql.DB, column, description string) error {
+	if column != "git_common_dir" && column != "deploy_key" {
+		return errors.New("unsupported task schema column")
+	}
 	rows, err := db.Query("PRAGMA table_info(tasks)")
 	if err != nil {
 		return fmt.Errorf("inspect task schema: %w", err)
@@ -80,7 +87,7 @@ func ensureGitCommonDirColumn(db *sql.DB) error {
 			_ = rows.Close()
 			return fmt.Errorf("inspect task schema column: %w", err)
 		}
-		if name == "git_common_dir" {
+		if name == column {
 			found = true
 		}
 	}
@@ -93,8 +100,8 @@ func ensureGitCommonDirColumn(db *sql.DB) error {
 	if found {
 		return nil
 	}
-	if _, err := db.Exec("ALTER TABLE tasks ADD COLUMN git_common_dir TEXT NOT NULL DEFAULT ''"); err != nil {
-		return fmt.Errorf("migrate task Git common directory: %w", err)
+	if _, err := db.Exec("ALTER TABLE tasks ADD COLUMN " + column + " TEXT NOT NULL DEFAULT ''"); err != nil {
+		return fmt.Errorf("migrate task %s: %w", description, err)
 	}
 	return nil
 }
@@ -110,12 +117,12 @@ func (s *Store) CreateTask(ctx context.Context, task *model.Task) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO tasks (
 			id, project_id, group_id, creator_id, requirement, plan, status, branch,
-			worktree, base_commit, git_common_dir, task_commit, rc_commit, session_id, summary, failure,
+				worktree, base_commit, git_common_dir, task_commit, rc_commit, deploy_key, session_id, summary, failure,
 			version, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
 		task.ID, task.ProjectID, task.GroupID, task.CreatorID, task.Requirement,
 		task.Plan, task.Status, task.Branch, task.Worktree, task.BaseCommit,
-		task.GitCommonDir, task.TaskCommit, task.RCCommit, task.SessionID, task.Summary, task.Failure,
+		task.GitCommonDir, task.TaskCommit, task.RCCommit, task.DeployKey, task.SessionID, task.Summary, task.Failure,
 		task.CreatedAt.UnixMilli(), task.UpdatedAt.UnixMilli(),
 	)
 	if err != nil {
@@ -213,12 +220,12 @@ func updateTask(ctx context.Context, execer taskMutationExecer, task *model.Task
 		UPDATE tasks
 		SET project_id = ?, group_id = ?, creator_id = ?, requirement = ?, plan = ?,
 			status = ?, branch = ?, worktree = ?, base_commit = ?, task_commit = ?,
-			git_common_dir = ?, rc_commit = ?, session_id = ?, summary = ?, failure = ?, updated_at = ?,
+			git_common_dir = ?, rc_commit = ?, deploy_key = ?, session_id = ?, summary = ?, failure = ?, updated_at = ?,
 			version = version + 1
 		WHERE id = ? AND version = ?`,
 		task.ProjectID, task.GroupID, task.CreatorID, task.Requirement, task.Plan,
 		task.Status, task.Branch, task.Worktree, task.BaseCommit, task.TaskCommit,
-		task.GitCommonDir, task.RCCommit, task.SessionID, task.Summary, task.Failure,
+		task.GitCommonDir, task.RCCommit, task.DeployKey, task.SessionID, task.Summary, task.Failure,
 		task.UpdatedAt.UnixMilli(), task.ID, expectedVersion,
 	)
 	if err != nil {
@@ -395,6 +402,281 @@ func (s *Store) AddApproval(ctx context.Context, approval model.Approval) error 
 	return nil
 }
 
+// LatestApproval returns the newest approval of one kind for a task.
+func (s *Store) LatestApproval(ctx context.Context, taskID, kind string) (*model.Approval, error) {
+	var approval model.Approval
+	var createdAt int64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT task_id, kind, user_id, group_id, message_id, bound_commit, result, created_at
+		FROM approvals
+		WHERE task_id = ? AND kind = ?
+		ORDER BY id DESC
+		LIMIT 1`, taskID, kind).Scan(
+		&approval.TaskID, &approval.Kind, &approval.UserID, &approval.GroupID,
+		&approval.MessageID, &approval.BoundCommit, &approval.Result, &createdAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("latest %q approval for task %q: %w", kind, taskID, ErrNotFound)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("latest %q approval for task %q: %w", kind, taskID, err)
+	}
+	approval.CreatedAt = time.UnixMilli(createdAt).UTC()
+	return &approval, nil
+}
+
+// ApprovalByMessage returns the immutable approval created by one group message.
+func (s *Store) ApprovalByMessage(ctx context.Context, groupID, messageID string) (*model.Approval, error) {
+	var approval model.Approval
+	var createdAt int64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT task_id, kind, user_id, group_id, message_id, bound_commit, result, created_at
+		FROM approvals
+		WHERE group_id = ? AND message_id = ?`, groupID, messageID).Scan(
+		&approval.TaskID, &approval.Kind, &approval.UserID, &approval.GroupID,
+		&approval.MessageID, &approval.BoundCommit, &approval.Result, &createdAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("approval for message %q/%q: %w", groupID, messageID, ErrNotFound)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("approval for message %q/%q: %w", groupID, messageID, err)
+	}
+	approval.CreatedAt = time.UnixMilli(createdAt).UTC()
+	return &approval, nil
+}
+
+// CommitApprovalMutation atomically records an immutable approval and its command transition.
+func (s *Store) CommitApprovalMutation(ctx context.Context, task *model.Task, expectedVersion int64, approval model.Approval, input model.Input, auditKind, auditDetail, messageKey string, at time.Time) error {
+	if err := validateApprovalTask(task, approval); err != nil {
+		return err
+	}
+	if input.TaskID != approval.TaskID || input.UserID != approval.UserID || input.GroupID != approval.GroupID || input.MessageID != approval.MessageID || messageKey != approval.GroupID+"\x00"+approval.MessageID {
+		return errors.New("approval command identity does not match immutable approval")
+	}
+	if auditKind == "" || auditDetail == "" {
+		return errors.New("approval audit kind and detail are required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin approval mutation for %q: %w", task.ID, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := claimMessageTx(ctx, tx, messageKey, at); err != nil {
+		return err
+	}
+	result, err := updateTask(ctx, tx, task, expectedVersion)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("save approved task %q rows affected: %w", task.ID, err)
+	}
+	if rows != 1 {
+		return fmt.Errorf("save approved task %q at version %d: %w", task.ID, expectedVersion, ErrConflict)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE approvals SET result = 'superseded'
+		WHERE task_id = ? AND kind = ? AND result = 'approved'`, task.ID, approval.Kind); err != nil {
+		return fmt.Errorf("supersede prior %q approval for task %q: %w", approval.Kind, task.ID, err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO approvals (
+			task_id, kind, user_id, group_id, message_id, bound_commit, result, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		approval.TaskID, approval.Kind, approval.UserID, approval.GroupID,
+		approval.MessageID, approval.BoundCommit, approval.Result, approval.CreatedAt.UnixMilli(),
+	); err != nil {
+		return fmt.Errorf("add approval for task %q: %w", approval.TaskID, err)
+	}
+	if err := appendRecordsTx(ctx, tx, input, task.ID, auditKind, auditDetail, at); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit approval mutation for %q: %w", task.ID, err)
+	}
+	task.Version = expectedVersion + 1
+	return nil
+}
+
+// ClaimApproval atomically changes the newest exact approved record to executing.
+func (s *Store) ClaimApproval(ctx context.Context, taskID, kind string, status model.Status, boundCommit string, at time.Time) (*model.Approval, error) {
+	commitColumn, err := approvalCommitColumn(kind)
+	if err != nil {
+		return nil, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin %q approval claim for task %q: %w", kind, taskID, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var id, createdAt int64
+	var approval model.Approval
+	err = tx.QueryRowContext(ctx, `
+		SELECT id, task_id, kind, user_id, group_id, message_id, bound_commit, result, created_at
+		FROM approvals
+		WHERE task_id = ? AND kind = ? AND result = 'approved'
+		ORDER BY id DESC
+		LIMIT 1`, taskID, kind).Scan(
+		&id, &approval.TaskID, &approval.Kind, &approval.UserID, &approval.GroupID,
+		&approval.MessageID, &approval.BoundCommit, &approval.Result, &createdAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("claim %q approval for task %q: %w", kind, taskID, ErrNotFound)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load %q approval for task %q: %w", kind, taskID, err)
+	}
+	if approval.BoundCommit != boundCommit {
+		return nil, fmt.Errorf("claim %q approval for task %q: %w", kind, taskID, ErrNotFound)
+	}
+	locked, err := tx.ExecContext(ctx, `
+		INSERT INTO approval_execution_locks (project_id, task_id, kind, group_id, message_id, acquired_at)
+		SELECT project_id, id, ?, ?, ?, ?
+		FROM tasks
+		WHERE id = ? AND status = ? AND `+commitColumn+` = ?
+		ON CONFLICT(project_id) DO NOTHING`,
+		kind, approval.GroupID, approval.MessageID, at.UnixMilli(), taskID, status, boundCommit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("lock project for %q approval task %q: %w", kind, taskID, err)
+	}
+	lockedRows, err := locked.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("lock project for %q approval task %q rows affected: %w", kind, taskID, err)
+	}
+	if lockedRows != 1 {
+		return nil, fmt.Errorf("lock project for %q approval task %q: %w", kind, taskID, ErrNotFound)
+	}
+	query := `UPDATE approvals SET result = 'executing'
+		WHERE id = ? AND result = 'approved'
+		AND EXISTS (
+			SELECT 1 FROM tasks
+			WHERE id = ? AND status = ? AND ` + commitColumn + ` = ?
+		)`
+	result, err := tx.ExecContext(ctx, query, id, taskID, status, boundCommit)
+	if err != nil {
+		return nil, fmt.Errorf("claim %q approval for task %q: %w", kind, taskID, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("claim %q approval for task %q rows affected: %w", kind, taskID, err)
+	}
+	if rows != 1 {
+		return nil, fmt.Errorf("claim %q approval for task %q: %w", kind, taskID, ErrNotFound)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO audit_events (task_id, kind, detail, created_at)
+		VALUES (?, 'approval_execution', ?, ?)`, taskID, kind+" approval claimed", at.UnixMilli()); err != nil {
+		return nil, fmt.Errorf("audit %q approval claim for task %q: %w", kind, taskID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit %q approval claim for task %q: %w", kind, taskID, err)
+	}
+	approval.Result = "executing"
+	approval.CreatedAt = time.UnixMilli(createdAt).UTC()
+	return &approval, nil
+}
+
+// CompleteApproval atomically persists the task result and consumes its executing approval.
+func (s *Store) CompleteApproval(ctx context.Context, task *model.Task, expectedVersion int64, approval model.Approval, resultValue, auditKind, auditDetail string, at time.Time) error {
+	if task == nil || task.ID == "" || approval.TaskID != task.ID || approval.GroupID == "" || approval.MessageID == "" || approval.BoundCommit == "" || approval.Result != "executing" || resultValue == "" {
+		return errors.New("completed approval task, commit, and result are required")
+	}
+	if _, err := approvalCommitColumn(approval.Kind); err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin %q approval completion for task %q: %w", approval.Kind, task.ID, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	updated, err := updateTask(ctx, tx, task, expectedVersion)
+	if err != nil {
+		return err
+	}
+	rows, err := updated.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("save %q approval result for task %q rows affected: %w", approval.Kind, task.ID, err)
+	}
+	if rows != 1 {
+		return fmt.Errorf("save %q approval result for task %q: %w", approval.Kind, task.ID, ErrConflict)
+	}
+	completed, err := tx.ExecContext(ctx, `
+		UPDATE approvals SET result = ?
+		WHERE task_id = ? AND kind = ? AND group_id = ? AND message_id = ?
+		  AND bound_commit = ? AND result = 'executing'`,
+		resultValue, task.ID, approval.Kind, approval.GroupID, approval.MessageID, approval.BoundCommit,
+	)
+	if err != nil {
+		return fmt.Errorf("complete %q approval for task %q: %w", approval.Kind, task.ID, err)
+	}
+	rows, err = completed.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("complete %q approval for task %q rows affected: %w", approval.Kind, task.ID, err)
+	}
+	if rows != 1 {
+		return fmt.Errorf("complete %q approval for task %q: %w", approval.Kind, task.ID, ErrConflict)
+	}
+	released, err := tx.ExecContext(ctx, `
+		DELETE FROM approval_execution_locks
+		WHERE task_id = ? AND kind = ? AND group_id = ? AND message_id = ?`,
+		task.ID, approval.Kind, approval.GroupID, approval.MessageID,
+	)
+	if err != nil {
+		return fmt.Errorf("release project for %q approval task %q: %w", approval.Kind, task.ID, err)
+	}
+	rows, err = released.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("release project for %q approval task %q rows affected: %w", approval.Kind, task.ID, err)
+	}
+	if rows != 1 {
+		return fmt.Errorf("release project for %q approval task %q: %w", approval.Kind, task.ID, ErrConflict)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO audit_events (task_id, kind, detail, created_at)
+		VALUES (?, ?, ?, ?)`, task.ID, auditKind, auditDetail, at.UnixMilli()); err != nil {
+		return fmt.Errorf("audit %q approval completion for task %q: %w", approval.Kind, task.ID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit %q approval completion for task %q: %w", approval.Kind, task.ID, err)
+	}
+	task.Version = expectedVersion + 1
+	return nil
+}
+
+func validateApprovalTask(task *model.Task, approval model.Approval) error {
+	if task == nil || task.ID == "" || approval.TaskID != task.ID || approval.Result != "approved" || approval.BoundCommit == "" {
+		return errors.New("approved task and immutable approval are required")
+	}
+	switch approval.Kind {
+	case "merge":
+		if task.Status != model.StatusMerging || task.TaskCommit != approval.BoundCommit {
+			return errors.New("merge approval does not match task state")
+		}
+	case "deploy":
+		if task.Status != model.StatusDeploying || task.RCCommit != approval.BoundCommit || task.DeployKey == "" {
+			return errors.New("deploy approval does not match task state")
+		}
+	default:
+		return errors.New("invalid approval kind")
+	}
+	return nil
+}
+
+func approvalCommitColumn(kind string) (string, error) {
+	switch kind {
+	case "merge":
+		return "task_commit", nil
+	case "deploy":
+		return "rc_commit", nil
+	default:
+		return "", errors.New("invalid approval kind")
+	}
+}
+
 func (s *Store) InvalidateApprovals(ctx context.Context, taskID, kind, result string) error {
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE approvals
@@ -538,6 +820,13 @@ func (s *Store) RecoverInterrupted(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("recover interrupted tasks: %w", err)
 	}
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM approval_execution_locks
+		WHERE task_id IN (
+			SELECT id FROM tasks WHERE status NOT IN (?, ?)
+		)`, model.StatusMerging, model.StatusDeploying); err != nil {
+		return fmt.Errorf("release interrupted approval locks: %w", err)
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit interrupted task recovery: %w", err)
 	}
@@ -554,8 +843,8 @@ func scanTask(scanner taskScanner) (*model.Task, error) {
 	err := scanner.Scan(
 		&task.ID, &task.ProjectID, &task.GroupID, &task.CreatorID,
 		&task.Requirement, &task.Plan, &task.Status, &task.Branch, &task.Worktree,
-		&task.BaseCommit, &task.GitCommonDir, &task.TaskCommit, &task.RCCommit, &task.SessionID,
-		&task.Summary, &task.Failure, &task.Version, &createdAt, &updatedAt,
+		&task.BaseCommit, &task.GitCommonDir, &task.TaskCommit, &task.RCCommit, &task.DeployKey,
+		&task.SessionID, &task.Summary, &task.Failure, &task.Version, &createdAt, &updatedAt,
 	)
 	if err != nil {
 		return nil, err

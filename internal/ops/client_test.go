@@ -103,6 +103,29 @@ func TestClientRejectsInvalidOrMultipleJSONResponses(t *testing.T) {
 	}
 }
 
+func TestClientPreservesTypedRemoteCommitFailures(t *testing.T) {
+	for _, test := range []struct {
+		mode          string
+		want          error
+		changedCommit string
+	}{
+		{"task-commit-changed", ErrTaskCommitChanged, strings.Repeat("b", 40)},
+		{"rc-commit-changed", ErrRCCommitChanged, strings.Repeat("b", 40)},
+		{"merge-conflict", ErrMergeConflict, ""},
+	} {
+		t.Run(test.mode, func(t *testing.T) {
+			client := mustNewClient(t, helperCommand(t, filepath.Join(t.TempDir(), "argv.json"), test.mode), nil)
+			err := client.DeployRC(context.Background(), "order-api", testTaskID, strings.Repeat("a", 40))
+			if !errors.Is(err, test.want) {
+				t.Fatalf("typed helper error = %v, want %v", err, test.want)
+			}
+			if got := ChangedCommit(err); got != test.changedCommit {
+				t.Fatalf("changed commit = %q", got)
+			}
+		})
+	}
+}
+
 func TestClientDoesNotPassCodexCredential(t *testing.T) {
 	client := mustNewClient(t, helperCommand(t, filepath.Join(t.TempDir(), "argv.json"), "check-env"), nil)
 	t.Setenv("CODEX_API_KEY", "must-not-cross-boundary")
@@ -323,6 +346,15 @@ func TestOpsClientHelper(t *testing.T) {
 	case "large-stderr":
 		_, _ = os.Stderr.Write(bytes.Repeat([]byte{'s'}, (1<<20)+1024))
 		_, _ = os.Stdout.WriteString(`{"ok":false,"error":"public failure"}`)
+		os.Exit(1)
+	case "task-commit-changed":
+		_, _ = os.Stdout.WriteString(`{"ok":false,"error":"public failure","error_code":"task_commit_changed","current_commit":"` + strings.Repeat("b", 40) + `"}`)
+		os.Exit(1)
+	case "rc-commit-changed":
+		_, _ = os.Stdout.WriteString(`{"ok":false,"error":"public failure","error_code":"rc_commit_changed","current_commit":"` + strings.Repeat("b", 40) + `"}`)
+		os.Exit(1)
+	case "merge-conflict":
+		_, _ = os.Stdout.WriteString(`{"ok":false,"error":"public failure","error_code":"merge_conflict"}`)
 		os.Exit(1)
 	default:
 		os.Exit(121)

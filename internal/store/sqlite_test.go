@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -147,6 +148,7 @@ func TestTaskPersistenceAndOptimisticSave(t *testing.T) {
 	saved.GitCommonDir = "/tmp/repo-updated/.git"
 	saved.TaskCommit = "task-commit-2"
 	saved.RCCommit = "rc-2"
+	saved.DeployKey = "deploy-key-2"
 	saved.SessionID = "session-2"
 	saved.Summary = "updated summary"
 	saved.Failure = "updated failure"
@@ -369,6 +371,198 @@ func TestWorkflowRecordsAndMessageDeduplication(t *testing.T) {
 	}
 }
 
+func TestApprovalMutationClaimAndCompletionAreAtomic(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	db := openTestStore(t)
+	now := time.UnixMilli(1_787_600_123_000).UTC()
+	task := testTask("task-approval", model.StatusAwaitingMergeApproval, now)
+	task.TaskCommit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	if err := db.CreateTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	approval := model.Approval{
+		TaskID: task.ID, Kind: "merge", UserID: "admin", GroupID: "group-1",
+		MessageID: "approval-message", BoundCommit: task.TaskCommit, Result: "approved", CreatedAt: now,
+	}
+	input := model.Input{
+		TaskID: task.ID, Kind: "approve_merge", UserID: "admin", GroupID: "group-1",
+		MessageID: approval.MessageID, Body: "approve", CreatedAt: now,
+	}
+	version := task.Version
+	task.Status = model.StatusMerging
+	task.UpdatedAt = now.Add(time.Second)
+	if err := db.CommitApprovalMutation(ctx, task, version, approval, input, "merge_approval", "approved exact task commit", "group-1\x00approval-message", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CommitApprovalMutation(ctx, task, version, approval, input, "merge_approval", "approved exact task commit", "group-1\x00approval-message", now); !errors.Is(err, ErrAlreadyProcessed) {
+		t.Fatalf("duplicate approval mutation error = %v, want ErrAlreadyProcessed", err)
+	}
+
+	stored, err := db.LatestApproval(ctx, task.ID, "merge")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(stored, &approval) {
+		t.Fatalf("stored approval = %#v, want %#v", stored, approval)
+	}
+	claimed, err := db.ClaimApproval(ctx, task.ID, "merge", model.StatusMerging, task.TaskCommit, now.Add(2*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed.MessageID != approval.MessageID || claimed.Result != "executing" {
+		t.Fatalf("claimed approval = %#v", claimed)
+	}
+	if _, err := db.ClaimApproval(ctx, task.ID, "merge", model.StatusMerging, task.TaskCommit, now.Add(3*time.Second)); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("second claim error = %v, want ErrNotFound", err)
+	}
+
+	current, err := db.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current.RCCommit = "cccccccccccccccccccccccccccccccccccccccc"
+	current.Status = model.StatusMerged
+	current.UpdatedAt = now.Add(4 * time.Second)
+	if err := db.CompleteApproval(ctx, current, current.Version, *claimed, "completed", "scheduler_transition", "merging -> merged", current.UpdatedAt); err != nil {
+		t.Fatal(err)
+	}
+	stored, err = db.LatestApproval(ctx, task.ID, "merge")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Result != "completed" {
+		t.Fatalf("completed approval result = %q", stored.Result)
+	}
+}
+
+func TestCompleteApprovalTargetsOneRetryWithSameCommit(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	db := openTestStore(t)
+	now := time.Now().UTC()
+	task := testTask("task-deploy-retry", model.StatusDeploying, now)
+	task.RCCommit = "cccccccccccccccccccccccccccccccccccccccc"
+	if err := db.CreateTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	old := model.Approval{TaskID: task.ID, Kind: "deploy", UserID: "admin", GroupID: "group", MessageID: "old", BoundCommit: task.RCCommit, Result: "executing", CreatedAt: now}
+	current := model.Approval{TaskID: task.ID, Kind: "deploy", UserID: "admin", GroupID: "group", MessageID: "current", BoundCommit: task.RCCommit, Result: "approved", CreatedAt: now.Add(time.Second)}
+	for _, approval := range []model.Approval{old, current} {
+		if err := db.AddApproval(ctx, approval); err != nil {
+			t.Fatal(err)
+		}
+	}
+	claimed, err := db.ClaimApproval(ctx, task.ID, "deploy", model.StatusDeploying, task.RCCommit, now.Add(2*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	task.Status = model.StatusDeployed
+	task.UpdatedAt = now.Add(3 * time.Second)
+	if err := db.CompleteApproval(ctx, task, task.Version, *claimed, "completed", "scheduler_transition", "deploying -> deployed", task.UpdatedAt); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := db.db.QueryContext(ctx, "SELECT message_id, result FROM approvals WHERE task_id = ? ORDER BY id", task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"old": "executing", "current": "completed"}
+	for rows.Next() {
+		var messageID, result string
+		if err := rows.Scan(&messageID, &result); err != nil {
+			t.Fatal(err)
+		}
+		if result != want[messageID] {
+			t.Errorf("approval %q result = %q, want %q", messageID, result, want[messageID])
+		}
+		delete(want, messageID)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing approval results: %v", want)
+	}
+}
+
+func TestClaimApprovalRequiresExactTaskStateAndCommit(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	db := openTestStore(t)
+	now := time.Now().UTC()
+	task := testTask("task-exact-approval", model.StatusMerging, now)
+	task.TaskCommit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	if err := db.CreateTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AddApproval(ctx, model.Approval{
+		TaskID: task.ID, Kind: "merge", UserID: "admin", GroupID: "group",
+		MessageID: "exact-approval", BoundCommit: task.TaskCommit, Result: "approved", CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		status model.Status
+		commit string
+	}{
+		{model.StatusDeploying, task.TaskCommit},
+		{model.StatusMerging, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+	} {
+		if _, err := db.ClaimApproval(ctx, task.ID, "merge", test.status, test.commit, now); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("claim status=%s commit=%s error=%v, want ErrNotFound", test.status, test.commit, err)
+		}
+	}
+	approval, err := db.LatestApproval(ctx, task.ID, "merge")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if approval.Result != "approved" {
+		t.Fatalf("rejected claim changed result to %q", approval.Result)
+	}
+}
+
+func TestApprovalClaimsSerializeOneProject(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	db := openTestStore(t)
+	now := time.Now().UTC()
+	tasks := []*model.Task{
+		testTask("project-operation-1", model.StatusMerging, now),
+		testTask("project-operation-2", model.StatusMerging, now.Add(time.Second)),
+	}
+	for i, task := range tasks {
+		task.TaskCommit = strings.Repeat(string(rune('a'+i)), 40)
+		if err := db.CreateTask(ctx, task); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.AddApproval(ctx, model.Approval{
+			TaskID: task.ID, Kind: "merge", UserID: "admin", GroupID: "group",
+			MessageID: "project-approval-" + task.ID, BoundCommit: task.TaskCommit, Result: "approved", CreatedAt: task.CreatedAt,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, err := db.ClaimApproval(ctx, tasks[0].ID, "merge", model.StatusMerging, tasks[0].TaskCommit, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ClaimApproval(ctx, tasks[1].ID, "merge", model.StatusMerging, tasks[1].TaskCommit, now); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("concurrent project claim error = %v, want ErrNotFound", err)
+	}
+	tasks[0].Status = model.StatusMergeConflict
+	if err := db.CompleteApproval(ctx, tasks[0], tasks[0].Version, *first, "failed", "scheduler_transition", "merging -> merge_conflict", now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ClaimApproval(ctx, tasks[1].ID, "merge", model.StatusMerging, tasks[1].TaskCommit, now); err != nil {
+		t.Fatalf("project claim after completion: %v", err)
+	}
+}
+
 func TestListCleanupCandidates(t *testing.T) {
 	t.Parallel()
 
@@ -507,6 +701,47 @@ func TestRecoverInterrupted(t *testing.T) {
 	}
 	if got.Status != model.StatusChecking || got.Failure != "existing failure" || got.Version != 7 || !got.UpdatedAt.Equal(originalTime) {
 		t.Fatalf("validated checking task changed: status=%s failure=%q version=%d updated=%v", got.Status, got.Failure, got.Version, got.UpdatedAt)
+	}
+}
+
+func TestRecoverInterruptedReleasesApprovalProjectLock(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	db := openTestStore(t)
+	now := time.Now().UTC()
+	interrupted := testTask("interrupted-deploy", model.StatusDeploying, now)
+	interrupted.RCCommit = strings.Repeat("c", 40)
+	interrupted.DeployKey = "persisted-key"
+	if err := db.CreateTask(ctx, interrupted); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AddApproval(ctx, model.Approval{TaskID: interrupted.ID, Kind: "deploy", UserID: "admin", GroupID: "group", MessageID: "interrupted", BoundCommit: interrupted.RCCommit, Result: "approved", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ClaimApproval(ctx, interrupted.ID, "deploy", model.StatusDeploying, interrupted.RCCommit, now); err != nil {
+		t.Fatal(err)
+	}
+	var lockCount int
+	if err := db.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM approval_execution_locks").Scan(&lockCount); err != nil || lockCount != 1 {
+		t.Fatalf("approval lock count = %d, %v", lockCount, err)
+	}
+	if err := db.RecoverInterrupted(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := db.GetTask(ctx, interrupted.ID); err != nil || got.Status != model.StatusDeployFailed {
+		t.Fatalf("recovered deploy = %#v, %v", got, err)
+	}
+	queued := testTask("next-merge", model.StatusMerging, now.Add(time.Second))
+	queued.TaskCommit = strings.Repeat("b", 40)
+	if err := db.CreateTask(ctx, queued); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AddApproval(ctx, model.Approval{TaskID: queued.ID, Kind: "merge", UserID: "admin", GroupID: "group", MessageID: "next", BoundCommit: queued.TaskCommit, Result: "approved", CreatedAt: now.Add(time.Second)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ClaimApproval(ctx, queued.ID, "merge", model.StatusMerging, queued.TaskCommit, now); err != nil {
+		t.Fatalf("claim after recovery: %v", err)
 	}
 }
 
@@ -680,6 +915,9 @@ func TestOpenMigratesLegacyTasksWithGitCommonDir(t *testing.T) {
 	}
 	if task.GitCommonDir != "" {
 		t.Fatalf("legacy GitCommonDir = %q, want empty", task.GitCommonDir)
+	}
+	if task.DeployKey != "" {
+		t.Fatalf("legacy DeployKey = %q, want empty", task.DeployKey)
 	}
 }
 

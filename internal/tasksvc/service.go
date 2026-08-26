@@ -129,9 +129,9 @@ func (s *Service) Handle(ctx context.Context, message Message) error {
 	case command.KindLog:
 		handleErr = s.log(ctx, message, parsed, key)
 	case command.KindApproveMerge:
-		handleErr = errors.New("merge approval is not available yet")
+		handleErr = s.approveMerge(ctx, message, parsed, key)
 	case command.KindApproveDeploy:
-		handleErr = errors.New("deploy approval is not available yet")
+		handleErr = s.approveDeploy(ctx, message, parsed, key)
 	default:
 		handleErr = errors.New("unsupported command")
 	}
@@ -473,9 +473,24 @@ func (s *Service) replayNotification(ctx context.Context, message Message, parse
 			return err
 		}
 		return s.send(ctx, message.GroupID, "任务 #"+task.ID+" 日志摘要：\n"+text)
+	case command.KindApproveMerge:
+		return s.replayApproval(ctx, message, task, "merge", "批准合并")
+	case command.KindApproveDeploy:
+		return s.replayApproval(ctx, message, task, "deploy", "批准部署")
 	default:
 		return nil
 	}
+}
+
+func (s *Service) replayApproval(ctx context.Context, message Message, task *model.Task, kind, label string) error {
+	approval, err := s.db.ApprovalByMessage(ctx, message.GroupID, message.MessageID)
+	if err != nil {
+		return err
+	}
+	if approval.TaskID != task.ID || approval.Kind != kind || approval.UserID != message.UserID || approval.GroupID != message.GroupID {
+		return errTaskAccess
+	}
+	return s.send(ctx, message.GroupID, "任务 #"+task.ID+" 已"+label+"，绑定提交："+approval.BoundCommit)
 }
 
 func validatePlan(plan codex.Plan) error {

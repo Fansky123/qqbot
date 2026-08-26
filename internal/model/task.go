@@ -38,6 +38,7 @@ type Task struct {
 	GitCommonDir string
 	TaskCommit   string
 	RCCommit     string
+	DeployKey    string
 	SessionID    string
 	Summary      string
 	Failure      string
@@ -121,8 +122,9 @@ var transitions = map[Status]map[Status]bool{
 		StatusDeploying: true,
 	},
 	StatusDeploying: {
-		StatusDeployed:     true,
-		StatusDeployFailed: true,
+		StatusAwaitingDeployApproval: true,
+		StatusDeployed:               true,
+		StatusDeployFailed:           true,
 	},
 	StatusDeployFailed: {
 		StatusDeploying: true,

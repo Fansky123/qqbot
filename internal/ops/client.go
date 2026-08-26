@@ -34,9 +34,11 @@ type LogSink interface {
 }
 
 type helperResponse struct {
-	OK       *bool  `json:"ok"`
-	Error    string `json:"error,omitempty"`
-	RCCommit string `json:"rc_commit,omitempty"`
+	OK            *bool  `json:"ok"`
+	Error         string `json:"error,omitempty"`
+	ErrorCode     string `json:"error_code,omitempty"`
+	CurrentCommit string `json:"current_commit,omitempty"`
+	RCCommit      string `json:"rc_commit,omitempty"`
 }
 
 func NewClient(command []string, sourceRepos map[string]string, log LogSink) (*Client, error) {
@@ -320,7 +322,7 @@ func (c *Client) call(ctx context.Context, wantCommit string, stdin io.Reader, a
 		if runErr != nil {
 			return finish("", errors.New("ops helper reported success with a non-zero exit status"))
 		}
-		if response.Error != "" {
+		if response.Error != "" || response.ErrorCode != "" || response.CurrentCommit != "" {
 			return finish("", errors.New("ops helper success response contains an error"))
 		}
 		if wantCommit == "merge" {
@@ -337,7 +339,32 @@ func (c *Client) call(ctx context.Context, wantCommit string, stdin io.Reader, a
 	if runErr == nil || response.Error == "" || response.RCCommit != "" {
 		return finish("", errors.New("ops helper returned an invalid failure response"))
 	}
-	return finish("", errors.New(response.Error))
+	var responseErr error
+	switch response.ErrorCode {
+	case "":
+		if response.CurrentCommit != "" {
+			return finish("", errors.New("ops helper returned an invalid failure response"))
+		}
+		responseErr = errors.New(response.Error)
+	case ErrorCodeTaskCommitChanged:
+		if !commitPattern.MatchString(response.CurrentCommit) {
+			return finish("", errors.New("ops helper returned an invalid changed commit"))
+		}
+		responseErr = fmt.Errorf("%w: %s", NewTaskCommitChanged(response.CurrentCommit), response.Error)
+	case ErrorCodeRCCommitChanged:
+		if !commitPattern.MatchString(response.CurrentCommit) {
+			return finish("", errors.New("ops helper returned an invalid changed commit"))
+		}
+		responseErr = fmt.Errorf("%w: %s", NewRCCommitChanged(response.CurrentCommit), response.Error)
+	case ErrorCodeMergeConflict:
+		if response.CurrentCommit != "" {
+			return finish("", errors.New("ops helper returned an invalid merge conflict"))
+		}
+		responseErr = fmt.Errorf("%w: %s", ErrMergeConflict, response.Error)
+	default:
+		return finish("", errors.New("ops helper returned an invalid failure code"))
+	}
+	return finish("", responseErr)
 }
 
 func validateClientInputs(args []string) error {

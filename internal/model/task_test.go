@@ -59,11 +59,12 @@ func TestCanTransition(t *testing.T) {
 		{StatusMerging, StatusFailed},
 		{StatusMerged, StatusAwaitingDeployApproval},
 		{StatusAwaitingDeployApproval, StatusDeploying},
+		{StatusDeploying, StatusAwaitingDeployApproval},
 		{StatusDeploying, StatusDeployed},
 		{StatusDeploying, StatusDeployFailed},
 		{StatusDeployFailed, StatusDeploying},
 	}
-	if got, want := len(allowed), 33; got != want {
+	if got, want := len(allowed), 34; got != want {
 		t.Fatalf("got %d allowed transitions, want %d", got, want)
 	}
 	expected := make(map[struct{ from, to Status }]bool, len(allowed))

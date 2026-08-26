@@ -12,9 +12,11 @@ import (
 )
 
 type response struct {
-	OK       bool   `json:"ok"`
-	Error    string `json:"error,omitempty"`
-	RCCommit string `json:"rc_commit,omitempty"`
+	OK            bool   `json:"ok"`
+	Error         string `json:"error,omitempty"`
+	ErrorCode     string `json:"error_code,omitempty"`
+	CurrentCommit string `json:"current_commit,omitempty"`
+	RCCommit      string `json:"rc_commit,omitempty"`
 }
 
 func main() {
@@ -148,5 +150,5 @@ func parseAction(flags *flag.FlagSet, args []string) error {
 }
 
 func failed(err error) response {
-	return response{OK: false, Error: err.Error()}
+	return response{OK: false, Error: err.Error(), ErrorCode: ops.ErrorCode(err), CurrentCommit: ops.ChangedCommit(err)}
 }

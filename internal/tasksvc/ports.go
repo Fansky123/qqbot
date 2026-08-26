@@ -31,6 +31,8 @@ type Worktrees interface {
 type Operator interface {
 	Sync(context.Context, string) error
 	PushTask(context.Context, string, string, string, string) error
+	MergeRC(context.Context, string, string, string) (string, error)
+	DeployRC(context.Context, string, string, string) error
 }
 
 // TaskLogs provides a redacted check-output writer and exact-value redaction.

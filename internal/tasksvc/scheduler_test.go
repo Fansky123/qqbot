@@ -19,13 +19,15 @@ import (
 	"qqcodex/internal/config"
 	"qqcodex/internal/gitwork"
 	"qqcodex/internal/model"
+	"qqcodex/internal/ops"
 	"qqcodex/internal/store"
 	"qqcodex/internal/tasklog"
 )
 
 const (
-	schedulerBaseCommit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	schedulerTaskCommit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	schedulerBaseCommit  = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	schedulerTaskCommit  = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	schedulerNewRCCommit = "dddddddddddddddddddddddddddddddddddddddd"
 )
 
 type schedulerFixture struct {
@@ -257,15 +259,24 @@ func (w *schedulerWorktrees) ValidateCommit(_ context.Context, prepared gitwork.
 }
 
 type schedulerOperator struct {
-	mu        sync.Mutex
-	meta      *metadataProbe
-	events    *schedulerEvents
-	syncErr   map[string]error
-	pushErr   map[string]error
-	pushCalls map[string]int
-	pushBlock map[string]<-chan struct{}
-	pushStart chan string
-	afterPush func(string)
+	mu          sync.Mutex
+	meta        *metadataProbe
+	events      *schedulerEvents
+	syncErr     map[string]error
+	pushErr     map[string]error
+	pushCalls   map[string]int
+	pushBlock   map[string]<-chan struct{}
+	pushStart   chan string
+	afterPush   func(string)
+	mergeErr    map[string]error
+	mergeRC     map[string]string
+	mergeCall   map[string]int
+	mergeBlock  map[string]<-chan struct{}
+	mergeStart  chan string
+	deployErr   map[string]error
+	deployCall  map[string]int
+	deployBlock map[string]<-chan struct{}
+	deployStart chan string
 }
 
 func (o *schedulerOperator) Sync(_ context.Context, projectID string) error {
@@ -308,6 +319,62 @@ func (o *schedulerOperator) pushes(taskID string) int {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return o.pushCalls[taskID]
+}
+
+func (o *schedulerOperator) MergeRC(ctx context.Context, projectID, taskID, commit string) (string, error) {
+	o.mu.Lock()
+	o.mergeCall[taskID]++
+	block := o.mergeBlock[taskID]
+	start := o.mergeStart
+	err := o.mergeErr[taskID]
+	rcCommit := o.mergeRC[taskID]
+	o.mu.Unlock()
+	if projectID == "" || commit != schedulerTaskCommit {
+		return "", errors.New("unexpected merge input")
+	}
+	if start != nil {
+		start <- taskID
+	}
+	if block != nil {
+		select {
+		case <-block:
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+	if err != nil {
+		return "", err
+	}
+	return rcCommit, nil
+}
+
+func (o *schedulerOperator) DeployRC(ctx context.Context, projectID, taskID, commit string) error {
+	o.mu.Lock()
+	o.deployCall[taskID]++
+	block := o.deployBlock[taskID]
+	start := o.deployStart
+	err := o.deployErr[taskID]
+	o.mu.Unlock()
+	if projectID == "" || commit != approvalRCCommit {
+		return errors.New("unexpected deploy input")
+	}
+	if start != nil {
+		start <- taskID
+	}
+	if block != nil {
+		select {
+		case <-block:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return err
+}
+
+func (o *schedulerOperator) approvalCalls(taskID string) (merge, deploy int) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.mergeCall[taskID], o.deployCall[taskID]
 }
 
 type schedulerNotifier struct {
@@ -1101,6 +1168,404 @@ func TestSchedulerRunShutdownCancelsAndWaitsForWorkers(t *testing.T) {
 	}
 }
 
+func TestMergeApprovalSchedulerPersistsExactRCCommit(t *testing.T) {
+	fixture := newSchedulerFixture(t, 1)
+	taskID := "T-000000001111"
+	fixture.createApprovedTask(t, taskID, model.StatusMerging, "merge", schedulerTaskCommit)
+	fixture.operator.mergeRC[taskID] = approvalRCCommit
+
+	cancel, done := fixture.run(t)
+	waitTaskStatus(t, fixture.db, taskID, model.StatusAwaitingDeployApproval)
+	cancel()
+	waitRun(t, done)
+
+	task := mustTask(t, fixture.db, taskID)
+	if task.RCCommit != approvalRCCommit {
+		t.Fatalf("RC commit = %q, want %q", task.RCCommit, approvalRCCommit)
+	}
+	if task.DeployKey != "" {
+		t.Fatalf("merge persisted deploy key before approval: %q", task.DeployKey)
+	}
+	approval, err := fixture.db.LatestApproval(context.Background(), taskID, "merge")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if approval.BoundCommit != schedulerTaskCommit || approval.Result != "completed" {
+		t.Fatalf("merge approval = %#v", approval)
+	}
+	mergeCalls, deployCalls := fixture.operator.approvalCalls(taskID)
+	if mergeCalls != 1 || deployCalls != 0 {
+		t.Fatalf("approval calls merge=%d deploy=%d", mergeCalls, deployCalls)
+	}
+	messages := strings.Join(fixture.notifier.all(), "\n")
+	if !strings.Contains(messages, approvalRCCommit) || !strings.Contains(messages, "批准部署 #"+taskID) {
+		t.Fatalf("merge notification = %q", messages)
+	}
+}
+
+func TestMergeApprovalCommitMismatchNeverPushesRC(t *testing.T) {
+	fixture := newSchedulerFixture(t, 1)
+	taskID := "T-000000001112"
+	fixture.createApprovedTask(t, taskID, model.StatusMerging, "merge", schedulerTaskCommit)
+	fixture.operator.mergeErr[taskID] = ops.ErrTaskCommitChanged
+
+	cancel, done := fixture.run(t)
+	waitTaskStatus(t, fixture.db, taskID, model.StatusMergeConflict)
+	cancel()
+	waitRun(t, done)
+
+	approval, err := fixture.db.LatestApproval(context.Background(), taskID, "merge")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if approval.Result != "commit_changed" {
+		t.Fatalf("merge mismatch approval result = %q", approval.Result)
+	}
+	if task := mustTask(t, fixture.db, taskID); task.RCCommit != "" {
+		t.Fatalf("merge mismatch persisted RC commit %q", task.RCCommit)
+	}
+	mergeCalls, _ := fixture.operator.approvalCalls(taskID)
+	if mergeCalls != 1 {
+		t.Fatalf("merge mismatch calls = %d", mergeCalls)
+	}
+}
+
+func TestMergeApprovalClassifiesConflictAndHelperFailure(t *testing.T) {
+	tests := []struct {
+		name       string
+		err        error
+		wantStatus model.Status
+		wantResult string
+	}{
+		{"merge conflict", ops.ErrMergeConflict, model.StatusMergeConflict, "merge_conflict"},
+		{"helper failure", errors.New("helper unavailable"), model.StatusFailed, "failed"},
+	}
+	for i, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newSchedulerFixture(t, 1)
+			taskID := fmt.Sprintf("T-00000000112%d", i)
+			fixture.createApprovedTask(t, taskID, model.StatusMerging, "merge", schedulerTaskCommit)
+			fixture.operator.mergeErr[taskID] = test.err
+			cancel, done := fixture.run(t)
+			waitTaskStatus(t, fixture.db, taskID, test.wantStatus)
+			cancel()
+			waitRun(t, done)
+			approval, err := fixture.db.LatestApproval(context.Background(), taskID, "merge")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if approval.Result != test.wantResult {
+				t.Fatalf("approval result = %q, want %q", approval.Result, test.wantResult)
+			}
+		})
+	}
+}
+
+func TestSchedulerReconcilesMergedWithoutRepeatingExternalMerge(t *testing.T) {
+	fixture := newSchedulerFixture(t, 1)
+	taskID := "T-000000001129"
+	fixture.createTask(t, taskID, "p1")
+	task := mustTask(t, fixture.db, taskID)
+	task.Status = model.StatusMerged
+	task.TaskCommit = schedulerTaskCommit
+	task.RCCommit = approvalRCCommit
+	if err := fixture.db.SaveTask(context.Background(), task, task.Version); err != nil {
+		t.Fatal(err)
+	}
+	cancel, done := fixture.run(t)
+	waitTaskStatus(t, fixture.db, taskID, model.StatusAwaitingDeployApproval)
+	cancel()
+	waitRun(t, done)
+	mergeCalls, deployCalls := fixture.operator.approvalCalls(taskID)
+	if mergeCalls != 0 || deployCalls != 0 {
+		t.Fatalf("merged reconciliation calls merge=%d deploy=%d", mergeCalls, deployCalls)
+	}
+}
+
+func TestDeployApprovalSchedulerSuccessFailureAndNewRetry(t *testing.T) {
+	fixture := newSchedulerFixture(t, 1)
+	taskID := "T-000000001113"
+	fixture.createApprovedTask(t, taskID, model.StatusDeploying, "deploy", approvalRCCommit)
+	fixture.operator.deployErr[taskID] = errors.New("deployment unavailable")
+
+	cancel, done := fixture.run(t)
+	waitTaskStatus(t, fixture.db, taskID, model.StatusDeployFailed)
+	cancel()
+	waitRun(t, done)
+	approval, err := fixture.db.LatestApproval(context.Background(), taskID, "deploy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if approval.Result != "failed" {
+		t.Fatalf("failed deploy approval result = %q", approval.Result)
+	}
+	if got := mustTask(t, fixture.db, taskID).DeployKey; got != ops.DeployKey("p1", taskID, approvalRCCommit) {
+		t.Fatalf("persisted deploy key = %q", got)
+	}
+
+	current := mustTask(t, fixture.db, taskID)
+	version := current.Version
+	current.Status = model.StatusDeploying
+	current.Failure = ""
+	current.UpdatedAt = time.Now().UTC()
+	retry := model.Approval{TaskID: taskID, Kind: "deploy", UserID: "admin", GroupID: "group", MessageID: "retry-deploy", BoundCommit: approvalRCCommit, Result: "approved", CreatedAt: current.UpdatedAt}
+	input := model.Input{TaskID: taskID, Kind: "approve_deploy", UserID: "admin", GroupID: "group", MessageID: retry.MessageID, Body: "retry", CreatedAt: current.UpdatedAt}
+	if err := fixture.db.CommitApprovalMutation(context.Background(), current, version, retry, input, "deploy_approval", "retry", "group\x00retry-deploy", current.UpdatedAt); err != nil {
+		t.Fatal(err)
+	}
+	fixture.operator.mu.Lock()
+	delete(fixture.operator.deployErr, taskID)
+	fixture.operator.mu.Unlock()
+
+	cancel, done = fixture.run(t)
+	waitTaskStatus(t, fixture.db, taskID, model.StatusDeployed)
+	cancel()
+	waitRun(t, done)
+	_, deployCalls := fixture.operator.approvalCalls(taskID)
+	if deployCalls != 2 {
+		t.Fatalf("deploy calls = %d, want one per admin approval", deployCalls)
+	}
+}
+
+func TestDeployApprovalRemoteRCChangeRequiresNewApproval(t *testing.T) {
+	fixture := newSchedulerFixture(t, 1)
+	taskID := "T-000000001114"
+	fixture.createApprovedTask(t, taskID, model.StatusDeploying, "deploy", approvalRCCommit)
+	fixture.operator.deployErr[taskID] = ops.NewRCCommitChanged(schedulerNewRCCommit)
+
+	cancel, done := fixture.run(t)
+	waitTaskStatus(t, fixture.db, taskID, model.StatusAwaitingDeployApproval)
+	cancel()
+	waitRun(t, done)
+
+	approval, err := fixture.db.LatestApproval(context.Background(), taskID, "deploy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if approval.Result != "commit_changed" {
+		t.Fatalf("RC mismatch approval result = %q", approval.Result)
+	}
+	changed := mustTask(t, fixture.db, taskID)
+	if changed.RCCommit != schedulerNewRCCommit || changed.DeployKey != "" {
+		t.Fatalf("RC mismatch task = %#v", changed)
+	}
+	_, deployCalls := fixture.operator.approvalCalls(taskID)
+	if deployCalls != 1 {
+		t.Fatalf("RC mismatch deploy calls = %d", deployCalls)
+	}
+	time.Sleep(30 * time.Millisecond)
+	_, deployCalls = fixture.operator.approvalCalls(taskID)
+	if deployCalls != 1 {
+		t.Fatalf("RC mismatch automatically retried: %d", deployCalls)
+	}
+}
+
+func TestDeployApprovalIsNeverAutomaticallyReplayedAfterInterruption(t *testing.T) {
+	fixture := newSchedulerFixture(t, 1)
+	taskID := "T-000000001116"
+	fixture.createApprovedTask(t, taskID, model.StatusDeploying, "deploy", approvalRCCommit)
+	fixture.operator.deployBlock[taskID] = make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runScheduler(fixture.scheduler(t), ctx)
+	select {
+	case <-fixture.operator.deployStart:
+	case <-time.After(3 * time.Second):
+		cancel()
+		waitRun(t, done)
+		t.Fatal("deploy did not start")
+	}
+	cancel()
+	waitRun(t, done)
+	if got := mustTask(t, fixture.db, taskID); got.Status != model.StatusDeploying {
+		t.Fatalf("interrupted deploy task = %#v", got)
+	}
+	approval, err := fixture.db.LatestApproval(context.Background(), taskID, "deploy")
+	if err != nil || approval.Result != "executing" {
+		t.Fatalf("interrupted deploy approval = %#v, %v", approval, err)
+	}
+
+	secondCtx, secondCancel := context.WithCancel(context.Background())
+	secondDone := runScheduler(fixture.scheduler(t), secondCtx)
+	time.Sleep(50 * time.Millisecond)
+	secondCancel()
+	waitRun(t, secondDone)
+	_, deployCalls := fixture.operator.approvalCalls(taskID)
+	if deployCalls != 1 {
+		t.Fatalf("interrupted deploy automatically replayed %d times", deployCalls)
+	}
+}
+
+func TestApprovalExecutionIsClaimedAcrossSchedulers(t *testing.T) {
+	fixture := newSchedulerFixture(t, 1)
+	taskID := "T-000000001115"
+	fixture.createApprovedTask(t, taskID, model.StatusMerging, "merge", schedulerTaskCommit)
+	fixture.operator.mergeRC[taskID] = approvalRCCommit
+	secondDB, err := store.Open(fixture.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = secondDB.Close() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	firstDone := runScheduler(fixture.scheduler(t), ctx)
+	second := NewScheduler(fixture.registry, secondDB, fixture.runner, fixture.worktrees, fixture.operator, fixture.notifier, fixture.logs, slog.Default(), 5*time.Millisecond)
+	secondDone := runScheduler(second, ctx)
+	waitTaskStatus(t, fixture.db, taskID, model.StatusAwaitingDeployApproval)
+	cancel()
+	waitRun(t, firstDone)
+	waitRun(t, secondDone)
+	mergeCalls, _ := fixture.operator.approvalCalls(taskID)
+	if mergeCalls != 1 {
+		t.Fatalf("cross-scheduler merge calls = %d", mergeCalls)
+	}
+}
+
+func TestApprovalValidationFailuresDoNotCallOperatorAndNotify(t *testing.T) {
+	tests := []struct {
+		name       string
+		kind       string
+		status     model.Status
+		mutate     func(*model.Task)
+		wantStatus model.Status
+	}{
+		{
+			name: "unknown merge project", kind: "merge", status: model.StatusMerging, wantStatus: model.StatusFailed,
+			mutate: func(task *model.Task) { task.ProjectID = "missing" },
+		},
+		{
+			name: "invalid deploy key", kind: "deploy", status: model.StatusDeploying, wantStatus: model.StatusDeployFailed,
+			mutate: func(task *model.Task) { task.DeployKey = "wrong" },
+		},
+	}
+	for i, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newSchedulerFixture(t, 1)
+			taskID := fmt.Sprintf("T-00000000113%d", i)
+			commit := schedulerTaskCommit
+			if test.kind == "deploy" {
+				commit = approvalRCCommit
+			}
+			fixture.createApprovedTask(t, taskID, test.status, test.kind, commit)
+			task := mustTask(t, fixture.db, taskID)
+			test.mutate(task)
+			if err := fixture.db.SaveTask(context.Background(), task, task.Version); err != nil {
+				t.Fatal(err)
+			}
+			cancel, done := fixture.run(t)
+			waitTaskStatus(t, fixture.db, taskID, test.wantStatus)
+			cancel()
+			waitRun(t, done)
+			mergeCalls, deployCalls := fixture.operator.approvalCalls(taskID)
+			if mergeCalls != 0 || deployCalls != 0 {
+				t.Fatalf("validation failure calls merge=%d deploy=%d", mergeCalls, deployCalls)
+			}
+			if len(fixture.notifier.all()) == 0 {
+				t.Fatal("validation failure did not notify")
+			}
+		})
+	}
+}
+
+func TestApprovalOperationsWaitForSameProjectGitMutation(t *testing.T) {
+	for _, kind := range []string{"merge", "deploy"} {
+		t.Run(kind, func(t *testing.T) {
+			fixture := newSchedulerFixture(t, 2)
+			pushID := "T-000000001140"
+			fixture.createTask(t, pushID, "p1")
+			pushing := mustTask(t, fixture.db, pushID)
+			pushing.Status = model.StatusChecking
+			pushing.Worktree = filepath.Join("/worktrees", pushID)
+			pushing.Branch = "codex/" + pushID
+			pushing.BaseCommit = schedulerBaseCommit
+			pushing.GitCommonDir = filepath.Join("/git", pushID)
+			pushing.SessionID = "existing-session"
+			pushing.TaskCommit = schedulerTaskCommit
+			if err := fixture.db.SaveTask(context.Background(), pushing, pushing.Version); err != nil {
+				t.Fatal(err)
+			}
+			pushRelease := make(chan struct{})
+			fixture.operator.pushBlock[pushID] = pushRelease
+
+			approvalID := "T-000000001141"
+			status, commit := model.StatusMerging, schedulerTaskCommit
+			if kind == "deploy" {
+				status, commit = model.StatusDeploying, approvalRCCommit
+			}
+			fixture.createApprovedTask(t, approvalID, status, kind, commit)
+			fixture.operator.mergeRC[approvalID] = approvalRCCommit
+
+			cancel, done := fixture.run(t)
+			select {
+			case <-fixture.operator.pushStart:
+			case <-time.After(3 * time.Second):
+				cancel()
+				waitRun(t, done)
+				t.Fatal("task push did not start")
+			}
+			operationStart := fixture.operator.mergeStart
+			if kind == "deploy" {
+				operationStart = fixture.operator.deployStart
+			}
+			select {
+			case taskID := <-operationStart:
+				t.Fatalf("%s started during same-project push: %s", kind, taskID)
+			case <-time.After(100 * time.Millisecond):
+			}
+			close(pushRelease)
+			select {
+			case <-operationStart:
+			case <-time.After(3 * time.Second):
+				cancel()
+				waitRun(t, done)
+				t.Fatalf("%s did not start after push", kind)
+			}
+			want := model.StatusAwaitingDeployApproval
+			if kind == "deploy" {
+				want = model.StatusDeployed
+			}
+			waitTaskStatus(t, fixture.db, approvalID, want)
+			cancel()
+			waitRun(t, done)
+		})
+	}
+}
+
+func TestMergeApprovalsForDifferentProjectsRunInParallel(t *testing.T) {
+	fixture := newSchedulerFixture(t, 1)
+	taskIDs := []string{"T-000000001150", "T-000000001151"}
+	projects := []string{"p1", "p2"}
+	releases := make([]chan struct{}, len(taskIDs))
+	for i, taskID := range taskIDs {
+		fixture.createApprovedProjectTask(t, taskID, projects[i], model.StatusMerging, "merge", schedulerTaskCommit)
+		fixture.operator.mergeRC[taskID] = approvalRCCommit
+		releases[i] = make(chan struct{})
+		fixture.operator.mergeBlock[taskID] = releases[i]
+	}
+	cancel, done := fixture.run(t)
+	started := map[string]bool{}
+	for len(started) < len(taskIDs) {
+		select {
+		case taskID := <-fixture.operator.mergeStart:
+			started[taskID] = true
+		case <-time.After(3 * time.Second):
+			cancel()
+			for _, release := range releases {
+				close(release)
+			}
+			waitRun(t, done)
+			t.Fatalf("parallel merges started = %v", started)
+		}
+	}
+	for _, release := range releases {
+		close(release)
+	}
+	for _, taskID := range taskIDs {
+		waitTaskStatus(t, fixture.db, taskID, model.StatusAwaitingDeployApproval)
+	}
+	cancel()
+	waitRun(t, done)
+}
+
 func newSchedulerFixture(t *testing.T, p1Concurrency int) *schedulerFixture {
 	t.Helper()
 	root := t.TempDir()
@@ -1145,7 +1610,9 @@ func newSchedulerFixture(t *testing.T, p1Concurrency int) *schedulerFixture {
 		},
 		operator: &schedulerOperator{
 			meta: meta, events: events, syncErr: make(map[string]error), pushErr: make(map[string]error), pushCalls: make(map[string]int),
-			pushBlock: make(map[string]<-chan struct{}), pushStart: make(chan string, 32),
+			pushBlock: make(map[string]<-chan struct{}), pushStart: make(chan string, 32), mergeErr: make(map[string]error),
+			mergeRC: make(map[string]string), mergeCall: make(map[string]int), mergeBlock: make(map[string]<-chan struct{}), mergeStart: make(chan string, 32),
+			deployErr: make(map[string]error), deployCall: make(map[string]int), deployBlock: make(map[string]<-chan struct{}), deployStart: make(chan string, 32),
 		},
 		notifier: &schedulerNotifier{events: events},
 		logs:     &schedulerLogs{secret: "company-secret-value", streams: make(map[string]string)},
@@ -1165,6 +1632,33 @@ func (f *schedulerFixture) createTask(t *testing.T, taskID, projectID string) {
 		t.Fatal(err)
 	}
 	f.runner.projects[taskID] = projectID
+}
+
+func (f *schedulerFixture) createApprovedTask(t *testing.T, taskID string, status model.Status, kind, commit string) {
+	t.Helper()
+	f.createApprovedProjectTask(t, taskID, "p1", status, kind, commit)
+}
+
+func (f *schedulerFixture) createApprovedProjectTask(t *testing.T, taskID, projectID string, status model.Status, kind, commit string) {
+	t.Helper()
+	f.createTask(t, taskID, projectID)
+	task := mustTask(t, f.db, taskID)
+	task.Status = status
+	task.TaskCommit = schedulerTaskCommit
+	if kind == "deploy" {
+		task.RCCommit = commit
+		task.DeployKey = ops.DeployKey(task.ProjectID, task.ID, commit)
+	}
+	if err := f.db.SaveTask(context.Background(), task, task.Version); err != nil {
+		t.Fatal(err)
+	}
+	approval := model.Approval{
+		TaskID: taskID, Kind: kind, UserID: "admin", GroupID: "group", MessageID: kind + "-" + taskID,
+		BoundCommit: commit, Result: "approved", CreatedAt: time.Now().UTC(),
+	}
+	if err := f.db.AddApproval(context.Background(), approval); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func (f *schedulerFixture) scheduler(t *testing.T) *Scheduler {

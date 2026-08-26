@@ -20,9 +20,56 @@ import (
 )
 
 var (
-	taskIDPattern = regexp.MustCompile(`^T-[A-F0-9]{12}$`)
-	commitPattern = regexp.MustCompile(`^(?:[0-9a-f]{40}|[0-9a-f]{64})$`)
+	taskIDPattern        = regexp.MustCompile(`^T-[A-F0-9]{12}$`)
+	commitPattern        = regexp.MustCompile(`^(?:[0-9a-f]{40}|[0-9a-f]{64})$`)
+	ErrTaskCommitChanged = errors.New("remote task commit changed")
+	ErrRCCommitChanged   = errors.New("remote RC commit changed")
+	ErrMergeConflict     = errors.New("RC merge conflict")
 )
+
+const (
+	ErrorCodeTaskCommitChanged = "task_commit_changed"
+	ErrorCodeRCCommitChanged   = "rc_commit_changed"
+	ErrorCodeMergeConflict     = "merge_conflict"
+)
+
+type commitChangedError struct {
+	cause   error
+	current string
+}
+
+func (e commitChangedError) Error() string { return e.cause.Error() }
+func (e commitChangedError) Unwrap() error { return e.cause }
+
+func NewTaskCommitChanged(current string) error {
+	return commitChangedError{cause: ErrTaskCommitChanged, current: current}
+}
+
+func NewRCCommitChanged(current string) error {
+	return commitChangedError{cause: ErrRCCommitChanged, current: current}
+}
+
+func ChangedCommit(err error) string {
+	var changed commitChangedError
+	if errors.As(err, &changed) {
+		return changed.current
+	}
+	return ""
+}
+
+// ErrorCode returns the stable helper protocol code for errors requiring a new approval.
+func ErrorCode(err error) string {
+	switch {
+	case errors.Is(err, ErrTaskCommitChanged):
+		return ErrorCodeTaskCommitChanged
+	case errors.Is(err, ErrRCCommitChanged):
+		return ErrorCodeRCCommitChanged
+	case errors.Is(err, ErrMergeConflict):
+		return ErrorCodeMergeConflict
+	default:
+		return ""
+	}
+}
 
 const (
 	maxCommandOutput = 1 << 20
@@ -252,7 +299,7 @@ func (o *Operator) MergeRC(ctx context.Context, projectID, taskID, taskCommit st
 		return "", err
 	}
 	if remoteTask != taskCommit {
-		return "", errors.New("remote task commit changed")
+		return "", NewTaskCommitChanged(remoteTask)
 	}
 
 	worktree, err := reserveWorktreePath()
@@ -271,7 +318,7 @@ func (o *Operator) MergeRC(ctx context.Context, projectID, taskID, taskCommit st
 	}
 	added = true
 	if _, err := o.runGit(ctx, worktree, "merge", "--no-ff", "--no-edit", taskCommit); err != nil {
-		return "", errors.New("RC merge failed")
+		return "", ErrMergeConflict
 	}
 	merged, err := o.resolveCommit(ctx, worktree, "HEAD")
 	if err != nil {
@@ -335,7 +382,7 @@ func (o *Operator) DeployRC(ctx context.Context, projectID, taskID, rcCommit str
 		if cleanup != nil {
 			err = cleanup()
 		}
-		return errors.Join(errors.New("remote RC changed"), err)
+		return errors.Join(NewRCCommitChanged(remoteRC), err)
 	}
 	if cleanup == nil {
 		return errors.New("remote RC is unavailable")
@@ -748,7 +795,11 @@ func gitEnvironment() []string {
 	return env
 }
 
-func deployKey(projectID, taskID, rcCommit string) string {
+func DeployKey(projectID, taskID, rcCommit string) string {
 	sum := sha256.Sum256([]byte(projectID + "\x00" + taskID + "\x00" + rcCommit))
 	return hex.EncodeToString(sum[:])
+}
+
+func deployKey(projectID, taskID, rcCommit string) string {
+	return DeployKey(projectID, taskID, rcCommit)
 }

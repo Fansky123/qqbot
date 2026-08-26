@@ -18,6 +18,7 @@ import (
 	"qqcodex/internal/config"
 	"qqcodex/internal/gitwork"
 	"qqcodex/internal/model"
+	"qqcodex/internal/ops"
 	"qqcodex/internal/store"
 )
 
@@ -62,14 +63,9 @@ type Scheduler struct {
 }
 
 type projectScheduler struct {
-	slots chan struct{}
-	gitMu sync.Mutex
-
-	// Task 11 uses these independently so a long deploy never blocks task work.
-	//lint:ignore U1000 reserved for merge orchestration in Task 11
-	mergeMu sync.Mutex
-	//lint:ignore U1000 reserved for deploy orchestration in Task 11
-	deployMu sync.Mutex
+	slots     chan struct{}
+	gitMu     sync.Mutex
+	releaseMu sync.Mutex
 }
 
 func NewScheduler(
@@ -260,13 +256,247 @@ func (s *Scheduler) scan(ctx context.Context) error {
 		})
 	}
 
-	// Task 11 attaches serialized handlers to these durable queues.
-	for _, status := range []model.Status{model.StatusMerging, model.StatusDeploying} {
-		if _, err := s.db.ListByStatus(ctx, status, schedulerScanLimit); err != nil {
-			return err
+	if err := s.scanApprovals(ctx, model.StatusMerging, "merge"); err != nil {
+		return err
+	}
+	if err := s.scanApprovals(ctx, model.StatusDeploying, "deploy"); err != nil {
+		return err
+	}
+	merged, err := s.db.ListByStatus(ctx, model.StatusMerged, schedulerScanLimit)
+	if err != nil {
+		return err
+	}
+	for _, task := range merged {
+		if s.isActive(task.ID) {
+			continue
+		}
+		if s.transition(ctx, task, model.StatusAwaitingDeployApproval, false) {
+			s.notify(ctx, task.GroupID, deployApprovalNotification(task))
 		}
 	}
 	return nil
+}
+
+func (s *Scheduler) scanApprovals(ctx context.Context, status model.Status, kind string) error {
+	tasks, err := s.db.ListByStatus(ctx, status, schedulerScanLimit)
+	if err != nil {
+		return err
+	}
+	for _, task := range tasks {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		project, available := s.registry.ProjectByID(task.ProjectID)
+		if !available {
+			project = config.Project{ID: task.ProjectID, MaxConcurrent: 1}
+		}
+		state := s.projectState(project)
+		s.startApprovalWorker(ctx, task.ID, func(workerCtx context.Context) {
+			state.releaseMu.Lock()
+			defer state.releaseMu.Unlock()
+			s.runApproval(workerCtx, task.ID, kind, project, state, available)
+		})
+	}
+	return nil
+}
+
+func (s *Scheduler) startApprovalWorker(parent context.Context, taskID string, work func(context.Context)) {
+	ctx, cancel := context.WithCancel(parent)
+	s.activeMu.Lock()
+	if s.active[taskID] != nil {
+		s.activeMu.Unlock()
+		cancel()
+		return
+	}
+	s.active[taskID] = cancel
+	s.activeMu.Unlock()
+	s.workers.Add(1)
+	go func() {
+		defer s.workers.Done()
+		defer cancel()
+		defer func() {
+			s.activeMu.Lock()
+			delete(s.active, taskID)
+			s.activeMu.Unlock()
+		}()
+		work(ctx)
+	}()
+}
+
+func (s *Scheduler) runApproval(ctx context.Context, taskID, kind string, project config.Project, state *projectScheduler, available bool) {
+	status := model.StatusMerging
+	if kind == "deploy" {
+		status = model.StatusDeploying
+	}
+	task, stopped := s.activeTask(ctx, taskID, status)
+	if stopped {
+		return
+	}
+	boundCommit := task.TaskCommit
+	if kind == "deploy" {
+		boundCommit = task.RCCommit
+	}
+	approval, err := s.db.ClaimApproval(ctx, taskID, kind, status, boundCommit, time.Now().UTC())
+	if errors.Is(err, store.ErrNotFound) {
+		return
+	}
+	if err != nil {
+		if ctx.Err() == nil {
+			s.logger.Error("claim scheduled approval failed", "task_id", taskID, "kind", kind, "error", s.safeText(err.Error()))
+		}
+		return
+	}
+	if !schedulerCommitPattern.MatchString(boundCommit) {
+		s.failApproval(ctx, task, *approval, approvalFailureStatus(kind), "failed", errors.New("approved commit is invalid"))
+		return
+	}
+	if !available {
+		s.failApproval(ctx, task, *approval, approvalFailureStatus(kind), "failed", errors.New("configured project is unavailable"))
+		return
+	}
+	if kind == "deploy" && task.DeployKey != ops.DeployKey(project.ID, task.ID, approval.BoundCommit) {
+		s.failApproval(ctx, task, *approval, model.StatusDeployFailed, "failed", errors.New("persisted deploy key does not match approved RC commit"))
+		return
+	}
+	if kind == "merge" {
+		s.runMerge(ctx, task, *approval, project, state)
+		return
+	}
+	s.runDeploy(ctx, task, *approval, project, state)
+}
+
+func (s *Scheduler) runMerge(ctx context.Context, task *model.Task, approval model.Approval, project config.Project, state *projectScheduler) {
+	state.gitMu.Lock()
+	current, stopped := s.activeTask(ctx, task.ID, model.StatusMerging)
+	if stopped {
+		state.gitMu.Unlock()
+		return
+	}
+	if current.TaskCommit != approval.BoundCommit {
+		state.gitMu.Unlock()
+		s.failApproval(ctx, current, approval, model.StatusMergeConflict, "commit_changed", errors.New("task commit changed after approval claim"))
+		return
+	}
+	task = current
+	rcCommit, err := s.operator.MergeRC(ctx, project.ID, task.ID, approval.BoundCommit)
+	state.gitMu.Unlock()
+	if err != nil {
+		result := "failed"
+		next := model.StatusFailed
+		if errors.Is(err, ops.ErrTaskCommitChanged) {
+			result = "commit_changed"
+			next = model.StatusMergeConflict
+		} else if errors.Is(err, ops.ErrMergeConflict) {
+			result = "merge_conflict"
+			next = model.StatusMergeConflict
+		}
+		s.failApproval(ctx, task, approval, next, result, err)
+		return
+	}
+	if !schedulerCommitPattern.MatchString(rcCommit) {
+		s.failApproval(ctx, task, approval, model.StatusFailed, "failed", errors.New("operator returned an invalid RC commit"))
+		return
+	}
+	task.RCCommit = rcCommit
+	task.DeployKey = ""
+	if !s.finishApproval(ctx, task, approval, model.StatusMerged, "completed", nil) {
+		return
+	}
+	if !s.transition(ctx, task, model.StatusAwaitingDeployApproval, false) {
+		return
+	}
+	s.notify(ctx, task.GroupID, deployApprovalNotification(task))
+}
+
+func (s *Scheduler) runDeploy(ctx context.Context, task *model.Task, approval model.Approval, project config.Project, state *projectScheduler) {
+	state.gitMu.Lock()
+	current, stopped := s.activeTask(ctx, task.ID, model.StatusDeploying)
+	if stopped {
+		state.gitMu.Unlock()
+		return
+	}
+	if current.RCCommit != approval.BoundCommit || current.DeployKey != ops.DeployKey(project.ID, task.ID, approval.BoundCommit) {
+		state.gitMu.Unlock()
+		s.failApproval(ctx, current, approval, model.StatusDeployFailed, "failed", errors.New("deploy target changed after approval claim"))
+		return
+	}
+	task = current
+	err := s.operator.DeployRC(ctx, project.ID, task.ID, approval.BoundCommit)
+	state.gitMu.Unlock()
+	if err == nil {
+		if s.finishApproval(ctx, task, approval, model.StatusDeployed, "completed", nil) {
+			s.notify(ctx, task.GroupID, "任务 #"+task.ID+" 已部署 RC 提交："+approval.BoundCommit)
+		}
+		return
+	}
+	if errors.Is(err, ops.ErrRCCommitChanged) {
+		currentCommit := ops.ChangedCommit(err)
+		if !schedulerCommitPattern.MatchString(currentCommit) {
+			if s.finishApproval(ctx, task, approval, model.StatusDeployFailed, "failed", errors.New("operator returned an invalid changed RC commit")) {
+				s.notify(ctx, task.GroupID, deployRetryNotification(task, "RC 部署失败：远端提交无效"))
+			}
+			return
+		}
+		task.RCCommit = currentCommit
+		task.DeployKey = ""
+		if s.finishApproval(ctx, task, approval, model.StatusAwaitingDeployApproval, "commit_changed", err) {
+			s.notify(ctx, task.GroupID, deployRetryNotification(task, "RC 提交已变化，需要重新批准"))
+		}
+		return
+	}
+	if s.finishApproval(ctx, task, approval, model.StatusDeployFailed, "failed", err) {
+		s.notify(ctx, task.GroupID, deployRetryNotification(task, "RC 部署失败："+bound(s.safeText(err.Error()))))
+	}
+}
+
+func (s *Scheduler) finishApproval(ctx context.Context, task *model.Task, approval model.Approval, next model.Status, result string, cause error) bool {
+	if ctx.Err() != nil || !model.CanTransition(task.Status, next) {
+		return false
+	}
+	previous := task.Status
+	version := task.Version
+	task.Status = next
+	task.Failure = ""
+	if cause != nil {
+		task.Failure = bound(s.safeText(cause.Error()))
+	}
+	task.UpdatedAt = time.Now().UTC()
+	if err := s.db.CompleteApproval(ctx, task, version, approval, result, "scheduler_transition", transitionDetail(previous, next), task.UpdatedAt); err != nil {
+		if ctx.Err() == nil {
+			s.logger.Error("persist approval result failed", "task_id", task.ID, "kind", approval.Kind, "error", s.safeText(err.Error()))
+		}
+		return false
+	}
+	return true
+}
+
+func (s *Scheduler) failApproval(ctx context.Context, task *model.Task, approval model.Approval, next model.Status, result string, cause error) {
+	if !s.finishApproval(ctx, task, approval, next, result, cause) {
+		return
+	}
+	if approval.Kind == "deploy" {
+		s.notify(ctx, task.GroupID, deployRetryNotification(task, "RC 部署失败："+bound(s.safeText(cause.Error()))))
+		return
+	}
+	s.notify(ctx, task.GroupID, "任务 #"+task.ID+" 合并失败："+bound(s.safeText(cause.Error())))
+}
+
+func approvalFailureStatus(kind string) model.Status {
+	if kind == "deploy" {
+		return model.StatusDeployFailed
+	}
+	return model.StatusFailed
+}
+
+func deployApprovalNotification(task *model.Task) string {
+	return bound(fmt.Sprintf("任务 #%s 已合并到 RC\nRC 提交：%s\n请回复：批准部署 #%s", task.ID, task.RCCommit, task.ID))
+}
+
+func deployRetryNotification(task *model.Task, reason string) string {
+	fixed := fmt.Sprintf("任务 #%s\n原因：\nRC 提交：%s\n请回复：批准部署 #%s", task.ID, task.RCCommit, task.ID)
+	budget := maxNotificationRunes - len([]rune(fixed))
+	reason = truncateSection(reason, budget, "…（已省略）")
+	return fmt.Sprintf("任务 #%s\n原因：%s\nRC 提交：%s\n请回复：批准部署 #%s", task.ID, reason, task.RCCommit, task.ID)
 }
 
 func (s *Scheduler) projectState(project config.Project) *projectScheduler {

@@ -968,7 +968,7 @@ func (s *Scheduler) Wake()
 func (s *Scheduler) Cancel(taskID string)
 ```
 
-Poll `queued`, `merging`, and `deploying` tasks after wakeups and every two seconds. Use a buffered channel per project sized to `MaxConcurrent`, a short-held Git metadata mutex per project, and a separate merge/deploy mutex per project. Claim queued tasks through optimistic `SaveTask` to `running`, so two scheduler scans cannot start the same task.
+Poll `queued`, `merging`, `merged`, and `deploying` tasks after wakeups and every two seconds. Use a buffered channel per project sized to `MaxConcurrent`, a short-held Git metadata mutex per project, and one release-operation mutex per project so merge and deploy cannot overlap each other. Claim queued tasks through optimistic `SaveTask` to `running`, so two scheduler scans cannot start the same task. Task 11 adds a durable SQLite project-operation lock for cross-instance merge/deploy serialization.
 
 Hold the Git metadata mutex around `Operator.Sync` plus `Worktrees.Prepare`, around `Operator.PushTask`, and around merge/deploy operator calls. Release it before Codex execution and checks so independent worktrees still run concurrently.
 
@@ -996,8 +996,20 @@ git commit -m "feat: schedule concurrent codex tasks"
 **Files:**
 - Create: `internal/tasksvc/approval.go`
 - Test: `internal/tasksvc/approval_test.go`
+- Create: `cmd/qqcodex-ops/main_test.go`
 - Modify: `internal/tasksvc/service.go`
 - Modify: `internal/tasksvc/scheduler.go`
+- Modify: `internal/tasksvc/ports.go`
+- Modify: `internal/model/task.go`
+- Modify: `internal/model/task_test.go`
+- Modify: `internal/store/schema.sql`
+- Modify: `internal/store/sqlite.go`
+- Modify: `internal/store/sqlite_test.go`
+- Modify: `internal/ops/operator.go`
+- Modify: `internal/ops/operator_test.go`
+- Modify: `internal/ops/client.go`
+- Modify: `internal/ops/client_test.go`
+- Modify: `cmd/qqcodex-ops/main.go`
 
 - [ ] **Step 1: Write failing approval tests**
 
@@ -1011,6 +1023,9 @@ Verify:
 - RC commit change invalidates deployment and returns to `awaiting_deploy_approval` with a failure message.
 - Deployment failure becomes `deploy_failed`; a new admin message can retry.
 - Duplicate approval message IDs do not execute merge/deploy twice.
+- Notification replay reads the immutable approval row by group/message ID rather than a task commit that may have changed later.
+- Two scheduler instances claim only one approval, and different tasks for one project cannot merge/deploy concurrently.
+- An interrupted deploy remains `executing` and is never automatically replayed.
 
 - [ ] **Step 2: Run tests and verify they fail**
 
@@ -1020,7 +1035,7 @@ Expected: FAIL because approval handlers are missing.
 
 - [ ] **Step 3: Implement approval command handling**
 
-In `approval.go`, implement `approveMerge` and `approveDeploy`. Both check admin role, exact current state, non-empty bound commit, optimistic version, and unique message ID before waking the scheduler. Persist approval before transitioning to the external-operation state.
+In `approval.go`, implement `approveMerge` and `approveDeploy`. Both check admin role, exact current state, non-empty bound commit, optimistic version, and unique message ID before waking the scheduler. Atomically persist the approval, command input, audit, processed-message claim, and transition to the external-operation state. Deployment approval also persists the deterministic `QQCODEX_DEPLOY_KEY` derived from project ID, task ID, and exact RC commit.
 
 - [ ] **Step 4: Implement serialized merge and deployment jobs**
 
@@ -1036,7 +1051,11 @@ deploying:
   -> deployed or deploy_failed -> notify
 ```
 
-Use the project merge/deploy mutex and reload the task immediately before each operator call. Never retry automatically. A new approval message is required after an RC hash mismatch or `deploy_failed`.
+Atomically change only the newest exact `approved` row to `executing` and acquire a durable per-project SQLite operation lock before any external call. Use one in-process release mutex so merge and deploy cannot overlap, and hold the existing project Git metadata mutex around each operator call so they cannot overlap `Sync`/`Prepare`/`PushTask`. Reload the task immediately before each call. Complete only the claimed approval identity (`group_id` + `message_id`), not every approval with the same commit.
+
+The ops helper response exposes stable `task_commit_changed`, `rc_commit_changed`, and `merge_conflict` codes. The client maps them to typed errors without matching public error text. A changed RC response includes the current exact RC commit; the scheduler validates and persists it, clears the old deploy key, invalidates the approval, and returns to `awaiting_deploy_approval`. Generic helper/check/persistence failures become `failed`, while actual merge conflicts become `merge_conflict`.
+
+Never retry an `executing` approval automatically. If a process stops after the claim or external side effect, startup recovery changes `merging` to `failed` and `deploying` to `deploy_failed`, then releases the durable project lock. A new deploy approval message is required after RC mismatch, interrupted deployment, or `deploy_failed`. Reconcile `merged` to `awaiting_deploy_approval` without repeating the external merge.
 
 - [ ] **Step 5: Run tests and commit milestone 2**
 
@@ -1045,7 +1064,7 @@ Run: `go test ./internal/tasksvc -v && go test ./...`
 Expected: PASS.
 
 ```bash
-git add internal/tasksvc
+git add docs/superpowers/plans/2026-08-25-qq-codex-worker-implementation.md cmd/qqcodex-ops internal/model internal/ops internal/store internal/tasksvc
 git commit -m "feat: gate rc merge and deployment"
 ```
 
