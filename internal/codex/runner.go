@@ -23,14 +23,20 @@ import (
 )
 
 const (
-	maxEventBytes         = 3 << 20
-	maxEventsResultBytes  = 1 << 20
-	maxStderrBytes        = 1 << 20
-	maxFinalBytes         = 1 << 20
-	maxBlockedReasonRunes = 512
-	finalTruncationMarker = "\n[codex final output truncated]\n"
-	finalOutputPath       = "/proc/self/fd/3"
-	finalDrainTimeout     = time.Second
+	maxEventBytes             = 3 << 20
+	maxEventsResultBytes      = 1 << 20
+	maxStderrBytes            = 1 << 20
+	maxFinalBytes             = 1 << 20
+	maxBlockedReasonRunes     = 512
+	finalTruncationMarker     = "\n[codex final output truncated]\n"
+	finalOutputPath           = "/proc/self/fd/3"
+	finalDrainTimeout         = time.Second
+	consultationWorkspacePath = "/workspace"
+	consultationRunPath       = "/run/qqcodex"
+	consultationHomePath      = consultationRunPath + "/home"
+	consultationCodexHomePath = consultationRunPath + "/codex-home"
+	consultationCodexPath     = consultationRunPath + "/bin/codex"
+	consultationPATH          = "/usr/bin:/bin"
 )
 
 // ErrFinalTooLarge reports that Result.Final was replaced with a fixed marker.
@@ -74,10 +80,11 @@ type LogSink interface {
 }
 
 type Runner struct {
-	Binary  string
-	KeepEnv []string
-	LogDir  string
-	Log     LogSink
+	Binary                    string
+	ConsultationSandboxBinary string
+	KeepEnv                   []string
+	LogDir                    string
+	Log                       LogSink
 }
 
 type invocation int
@@ -112,7 +119,7 @@ func (r Runner) run(parent context.Context, req Request, kind invocation) (resul
 		runErr = errors.Join(runErr, removeTemporaryFiles(temporaryPaths), removeTemporaryDirs(temporaryDirs))
 	}()
 
-	binary, env, toolEnv, err := r.validate(req, kind)
+	binary, sandboxBinary, env, toolEnv, err := r.validate(req, kind)
 	if err != nil {
 		return Result{}, err
 	}
@@ -149,10 +156,17 @@ func (r Runner) run(parent context.Context, req Request, kind invocation) (resul
 	}
 
 	args := invocationArgs(kind, req, schemaPath, finalOutputPath, toolEnv)
+	command := binary
+	if kind == invocationConsult {
+		args = append(consultationSandboxArgs(binary, req, env), args...)
+		command = sandboxBinary
+	}
 	ctx, cancel := context.WithTimeout(parent, req.Timeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, binary, args...)
-	cmd.Dir = req.WorkingDir
+	cmd := exec.CommandContext(ctx, command, args...)
+	if kind != invocationConsult {
+		cmd.Dir = req.WorkingDir
+	}
 	cmd.Env = env
 	cmd.ExtraFiles = []*os.File{finalWriter}
 	var stderr boundedCapture
@@ -287,47 +301,72 @@ func closePipe(pipe io.Closer) error {
 	return err
 }
 
-func (r Runner) validate(req Request, kind invocation) (string, []string, []string, error) {
+func (r Runner) validate(req Request, kind invocation) (string, string, []string, []string, error) {
 	if r.Binary == "" {
-		return "", nil, nil, fmt.Errorf("codex binary is required")
+		return "", "", nil, nil, fmt.Errorf("codex binary is required")
 	}
 	binary, err := resolveBinary(r.Binary)
 	if err != nil {
-		return "", nil, nil, err
+		return "", "", nil, nil, err
+	}
+	var sandboxBinary string
+	if kind == invocationConsult {
+		sandboxBinary, err = resolveExecutable(r.ConsultationSandboxBinary, "consultation sandbox")
+		if err != nil {
+			return "", "", nil, nil, err
+		}
 	}
 	if r.LogDir == "" {
-		return "", nil, nil, fmt.Errorf("codex log directory is required")
+		return "", "", nil, nil, fmt.Errorf("codex log directory is required")
 	}
 	if !filepath.IsAbs(r.LogDir) {
-		return "", nil, nil, fmt.Errorf("codex log directory must be absolute")
+		return "", "", nil, nil, fmt.Errorf("codex log directory must be absolute")
 	}
 	if !taskIDPattern.MatchString(req.TaskID) || req.TaskID == "." || req.TaskID == ".." {
-		return "", nil, nil, fmt.Errorf("invalid task ID %q", req.TaskID)
+		return "", "", nil, nil, fmt.Errorf("invalid task ID %q", req.TaskID)
 	}
 	if err := requireDirectory("working directory", req.WorkingDir); err != nil {
-		return "", nil, nil, err
+		return "", "", nil, nil, err
 	}
 	if req.Prompt == "" {
-		return "", nil, nil, fmt.Errorf("codex prompt is required")
+		return "", "", nil, nil, fmt.Errorf("codex prompt is required")
 	}
 	if req.Timeout <= 0 {
-		return "", nil, nil, fmt.Errorf("codex timeout must be positive")
+		return "", "", nil, nil, fmt.Errorf("codex timeout must be positive")
 	}
 	if kind == invocationExecute || kind == invocationResume {
 		if err := requireDirectory("Git common directory", req.GitCommonDir); err != nil {
-			return "", nil, nil, err
+			return "", "", nil, nil, err
 		}
 	}
 	if kind == invocationResume {
 		if err := validateSessionID(req.SessionID); err != nil {
-			return "", nil, nil, err
+			return "", "", nil, nil, err
 		}
 	}
 	env, toolEnv, err := sanitizedEnvironment(r.KeepEnv)
 	if err != nil {
-		return "", nil, nil, err
+		return "", "", nil, nil, err
 	}
-	return binary, env, toolEnv, nil
+	return binary, sandboxBinary, env, toolEnv, nil
+}
+
+func resolveExecutable(path, label string) (string, error) {
+	if path == "" {
+		return "", fmt.Errorf("%s binary is required", label)
+	}
+	resolved, err := resolveBinary(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve %s binary: %w", label, err)
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return "", fmt.Errorf("stat %s binary: %w", label, err)
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+		return "", fmt.Errorf("%s binary is not executable", label)
+	}
+	return resolved, nil
 }
 
 func withTemporaryEnvironment(env []string, tempDir string) []string {
@@ -544,11 +583,52 @@ func invocationArgs(kind invocation, req Request, schemaPath, lastPath string, t
 		return append(args, "--json", "-o", lastPath, "--", req.SessionID, req.Prompt)
 	case invocationConsult:
 		args := append([]string{"exec"}, policy...)
-		return append(args, "-C", req.WorkingDir, "--sandbox", "read-only", "--ephemeral", "--skip-git-repo-check",
+		return append(args, "-C", consultationWorkspacePath, "--sandbox", "read-only", "--ephemeral", "--skip-git-repo-check",
 			"--json", "-o", lastPath, "--", req.Prompt)
 	default:
 		panic("unknown codex invocation")
 	}
+}
+
+func consultationSandboxArgs(binary string, req Request, env []string) []string {
+	codexHome := environmentValue(env, "CODEX_HOME")
+	args := []string{
+		"--die-with-parent", "--new-session", "--unshare-all", "--share-net", "--unshare-user", "--disable-userns", "--cap-drop", "ALL",
+		"--ro-bind", "/usr", "/usr",
+		"--symlink", "usr/bin", "/bin",
+		"--symlink", "usr/sbin", "/sbin",
+		"--symlink", "usr/lib", "/lib",
+		"--symlink", "usr/lib64", "/lib64",
+		"--dev", "/dev",
+		"--proc", "/proc",
+		"--tmpfs", "/tmp",
+		"--dir", "/etc",
+		"--dir", "/etc/ssl",
+		"--dir", "/etc/ssl/certs",
+		"--ro-bind", "/etc/ssl/certs", "/etc/ssl/certs",
+		"--ro-bind-try", "/etc/ssl/openssl.cnf", "/etc/ssl/openssl.cnf",
+		"--ro-bind-try", "/etc/resolv.conf", "/etc/resolv.conf",
+		"--ro-bind-try", "/etc/hosts", "/etc/hosts",
+		"--ro-bind-try", "/etc/nsswitch.conf", "/etc/nsswitch.conf",
+		"--ro-bind-try", "/etc/gai.conf", "/etc/gai.conf",
+		"--tmpfs", "/run",
+		"--dir", consultationRunPath,
+		"--dir", consultationHomePath,
+		"--dir", consultationCodexHomePath,
+		"--dir", consultationRunPath + "/bin",
+		"--ro-bind", binary, consultationCodexPath,
+		"--ro-bind", req.WorkingDir, consultationWorkspacePath,
+		"--ro-bind-try", filepath.Join(codexHome, "config.toml"), consultationCodexHomePath + "/config.toml",
+		"--setenv", "HOME", consultationHomePath,
+		"--setenv", "CODEX_HOME", consultationCodexHomePath,
+		"--setenv", "TMPDIR", "/tmp",
+		"--setenv", "TMP", "/tmp",
+		"--setenv", "TEMP", "/tmp",
+		"--setenv", "PATH", consultationPATH,
+		"--chdir", consultationWorkspacePath,
+		consultationCodexPath,
+	}
+	return args
 }
 
 func workspaceTempPolicyArgs() []string {
@@ -567,6 +647,16 @@ func environmentPolicyArgs(names []string) []string {
 		args = append(args, "-c", `shell_environment_policy.filters.`+name+`="include"`)
 	}
 	return args
+}
+
+func environmentValue(env []string, name string) string {
+	prefix := name + "="
+	for _, entry := range env {
+		if value, ok := strings.CutPrefix(entry, prefix); ok {
+			return value
+		}
+	}
+	return ""
 }
 
 func scanEvents(reader io.Reader, log LogSink, taskID string) (Result, error) {

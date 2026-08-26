@@ -24,36 +24,43 @@ import (
 )
 
 const (
-	helperEnabled     = "GO_WANT_CODEX_HELPER"
-	helperRecord      = "QQ_CODEX_HELPER_RECORD"
-	helperFinal       = "QQ_CODEX_HELPER_FINAL"
-	helperFinalSize   = "QQ_CODEX_HELPER_FINAL_SIZE"
-	helperFinalSecret = "QQ_CODEX_HELPER_FINAL_SECRET"
-	helperStderr      = "QQ_CODEX_HELPER_STDERR"
-	helperStderrSize  = "QQ_CODEX_HELPER_STDERR_SIZE"
-	helperExit        = "QQ_CODEX_HELPER_EXIT"
-	helperSleep       = "QQ_CODEX_HELPER_SLEEP"
-	helperLarge       = "QQ_CODEX_HELPER_LARGE"
-	helperSpawn       = "QQ_CODEX_HELPER_SPAWN"
-	helperPID         = "QQ_CODEX_HELPER_PID"
-	helperChild       = "QQ_CODEX_HELPER_CHILD"
-	helperStdout      = "QQ_CODEX_HELPER_STDOUT"
-	helperDirty       = "QQ_CODEX_HELPER_DIRTY_TEMP"
-	helperMany        = "QQ_CODEX_HELPER_MANY_EVENTS"
+	helperEnabled      = "GO_WANT_CODEX_HELPER"
+	helperRecord       = "QQ_CODEX_HELPER_RECORD"
+	helperFinal        = "QQ_CODEX_HELPER_FINAL"
+	helperFinalSize    = "QQ_CODEX_HELPER_FINAL_SIZE"
+	helperFinalSecret  = "QQ_CODEX_HELPER_FINAL_SECRET"
+	helperStderr       = "QQ_CODEX_HELPER_STDERR"
+	helperStderrSize   = "QQ_CODEX_HELPER_STDERR_SIZE"
+	helperExit         = "QQ_CODEX_HELPER_EXIT"
+	helperSleep        = "QQ_CODEX_HELPER_SLEEP"
+	helperLarge        = "QQ_CODEX_HELPER_LARGE"
+	helperSpawn        = "QQ_CODEX_HELPER_SPAWN"
+	helperPID          = "QQ_CODEX_HELPER_PID"
+	helperChild        = "QQ_CODEX_HELPER_CHILD"
+	helperStdout       = "QQ_CODEX_HELPER_STDOUT"
+	helperDirty        = "QQ_CODEX_HELPER_DIRTY_TEMP"
+	helperMany         = "QQ_CODEX_HELPER_MANY_EVENTS"
+	helperRecordEvent  = "QQ_CODEX_HELPER_RECORD_EVENT"
+	helperProbeInside  = "QQ_CODEX_HELPER_PROBE_INSIDE"
+	helperProbeOutside = "QQ_CODEX_HELPER_PROBE_OUTSIDE"
+	helperProbeWrite   = "QQ_CODEX_HELPER_PROBE_WRITE"
 )
 
 type helperRecordData struct {
-	PID           int      `json:"pid"`
-	Args          []string `json:"args"`
-	Env           []string `json:"env"`
-	Dir           string   `json:"dir"`
-	SchemaPath    string   `json:"schema_path"`
-	SchemaMode    uint32   `json:"schema_mode"`
-	SchemaContent string   `json:"schema_content"`
-	LastPath      string   `json:"last_path"`
-	LastMode      uint32   `json:"last_mode"`
-	TempDir       string   `json:"temp_dir"`
-	TempMode      uint32   `json:"temp_mode"`
+	PID            int      `json:"pid"`
+	Args           []string `json:"args"`
+	Env            []string `json:"env"`
+	Dir            string   `json:"dir"`
+	SchemaPath     string   `json:"schema_path"`
+	SchemaMode     uint32   `json:"schema_mode"`
+	SchemaContent  string   `json:"schema_content"`
+	LastPath       string   `json:"last_path"`
+	LastMode       uint32   `json:"last_mode"`
+	TempDir        string   `json:"temp_dir"`
+	TempMode       uint32   `json:"temp_mode"`
+	Inside         string   `json:"inside"`
+	Outside        string   `json:"outside"`
+	WorkspaceWrite string   `json:"workspace_write"`
 }
 
 func init() {
@@ -77,6 +84,21 @@ func runCodexHelper() {
 	record.SchemaPath = flagValue(record.Args, "--output-schema")
 	record.LastPath = flagValue(record.Args, "-o")
 	record.TempDir = os.Getenv("TMPDIR")
+	if inside := os.Getenv(helperProbeInside); inside != "" {
+		data, err := os.ReadFile(inside)
+		if err != nil {
+			record.Inside = helperProbeResult(err)
+		} else {
+			record.Inside = string(data)
+		}
+	}
+	if outside := os.Getenv(helperProbeOutside); outside != "" {
+		_, err := os.ReadFile(outside)
+		record.Outside = helperProbeResult(err)
+	}
+	if os.Getenv(helperProbeWrite) == "1" {
+		record.WorkspaceWrite = helperProbeResult(os.WriteFile("/workspace/qqcodex-created", []byte("nope"), 0o600))
+	}
 	if info, err := os.Stat(record.TempDir); err == nil {
 		record.TempMode = uint32(info.Mode().Perm())
 	}
@@ -102,7 +124,14 @@ func runCodexHelper() {
 	}
 	data, err := json.Marshal(record)
 	helperMust(err)
-	helperMust(os.WriteFile(os.Getenv(helperRecord), data, 0o600))
+	if os.Getenv(helperRecordEvent) == "1" {
+		record.Env = sandboxRecordEnvironment(record.Env)
+		data, err = json.Marshal(record)
+		helperMust(err)
+		helperPrintln(`{"type":"helper.record","record":` + string(data) + `}`)
+	} else {
+		helperMust(os.WriteFile(os.Getenv(helperRecord), data, 0o600))
+	}
 	if os.Getenv(helperDirty) == "schema" {
 		helperMust(os.Remove(record.SchemaPath))
 		helperMust(os.Mkdir(record.SchemaPath, 0o700))
@@ -167,6 +196,31 @@ func helperMust(err error) {
 	}
 }
 
+func helperProbeResult(err error) string {
+	if err == nil {
+		return "readable"
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return "not-exist"
+	}
+	if errors.Is(err, os.ErrPermission) || errors.Is(err, syscall.EROFS) {
+		return "permission"
+	}
+	return "error"
+}
+
+func sandboxRecordEnvironment(env []string) []string {
+	var filtered []string
+	for _, entry := range env {
+		name, _, _ := strings.Cut(entry, "=")
+		switch name {
+		case "HOME", "CODEX_HOME", "TMPDIR", "TMP", "TEMP", "PATH":
+			filtered = append(filtered, entry)
+		}
+	}
+	return filtered
+}
+
 func flagValue(args []string, name string) string {
 	for i := range len(args) - 1 {
 		if args[i] == name {
@@ -227,11 +281,51 @@ func TestRunnerPlanArgumentsAndTemporaryFiles(t *testing.T) {
 	}
 }
 
+func TestConsultationSandboxArgumentsUseOnlyApprovedReadBoundary(t *testing.T) {
+	workingDir := "/host/projects/selected"
+	codexHome := "/host/codex-home"
+	args := consultationSandboxArgs("/host/bin/codex", Request{WorkingDir: workingDir}, []string{"CODEX_HOME=" + codexHome})
+
+	for _, sequence := range [][]string{
+		{"--die-with-parent", "--new-session", "--unshare-all", "--share-net", "--unshare-user", "--disable-userns", "--cap-drop", "ALL"},
+		{"--ro-bind", "/usr", "/usr"},
+		{"--symlink", "usr/bin", "/bin"}, {"--symlink", "usr/sbin", "/sbin"}, {"--symlink", "usr/lib", "/lib"}, {"--symlink", "usr/lib64", "/lib64"},
+		{"--dev", "/dev"}, {"--proc", "/proc"}, {"--tmpfs", "/tmp"},
+		{"--dir", "/etc"}, {"--dir", "/etc/ssl"}, {"--ro-bind", "/etc/ssl/certs", "/etc/ssl/certs"},
+		{"--ro-bind-try", "/etc/ssl/openssl.cnf", "/etc/ssl/openssl.cnf"}, {"--ro-bind-try", "/etc/resolv.conf", "/etc/resolv.conf"},
+		{"--ro-bind-try", "/etc/hosts", "/etc/hosts"}, {"--ro-bind-try", "/etc/nsswitch.conf", "/etc/nsswitch.conf"}, {"--ro-bind-try", "/etc/gai.conf", "/etc/gai.conf"},
+		{"--tmpfs", "/run"}, {"--ro-bind", "/host/bin/codex", consultationCodexPath}, {"--ro-bind", workingDir, consultationWorkspacePath},
+		{"--ro-bind-try", codexHome + "/config.toml", consultationCodexHomePath + "/config.toml"},
+		{"--setenv", "HOME", consultationHomePath}, {"--setenv", "CODEX_HOME", consultationCodexHomePath},
+		{"--setenv", "TMPDIR", "/tmp"}, {"--setenv", "TMP", "/tmp"}, {"--setenv", "TEMP", "/tmp"}, {"--chdir", consultationWorkspacePath},
+		{"--setenv", "PATH", consultationPATH},
+		{consultationCodexPath},
+	} {
+		if !containsArgSequence(args, sequence) {
+			t.Errorf("bubblewrap argv lacks %#v: %#v", sequence, args)
+		}
+	}
+	allowedMountSources := map[string]bool{
+		"/usr": true, "/etc/ssl/certs": true, "/etc/ssl/openssl.cnf": true, "/etc/resolv.conf": true,
+		"/etc/hosts": true, "/etc/nsswitch.conf": true, "/etc/gai.conf": true, "/host/bin/codex": true,
+		workingDir: true, codexHome + "/config.toml": true,
+	}
+	for i, arg := range args {
+		if arg != "--ro-bind" && arg != "--ro-bind-try" && arg != "--bind" {
+			continue
+		}
+		if i+2 >= len(args) || !allowedMountSources[args[i+1]] {
+			t.Errorf("bubblewrap argv has unapproved host mount at %d: %#v", i, args)
+		}
+	}
+}
+
 func TestRunnerAskArgumentsWithoutGitOrSession(t *testing.T) {
 	runner, _, recordPath := helperRunner(t)
 	workingDir := t.TempDir()
 	setEnv(t, helperStdout, `{"type":"item.completed"}`+"\n")
-	runner.KeepEnv = append(runner.KeepEnv, helperStdout)
+	setEnv(t, helperRecordEvent, "1")
+	runner.KeepEnv = askHelperEnvironment(runner.KeepEnv, helperStdout, helperRecordEvent)
 	result, err := runner.Ask(context.Background(), Request{
 		TaskID:     "Q-012345ABCDEF",
 		WorkingDir: workingDir,
@@ -241,9 +335,12 @@ func TestRunnerAskArgumentsWithoutGitOrSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	record := readHelperRecord(t, recordPath)
+	if _, err := os.Stat(recordPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Ask wrote helper record outside sandbox: %v", err)
+	}
+	record := readHelperRecordEvent(t, result.EventsJSONL)
 	want := append([]string{"exec"}, expectedPolicyArgs(runner.KeepEnv)...)
-	want = append(want, "-C", workingDir, "--sandbox", "read-only", "--ephemeral", "--skip-git-repo-check", "--json", "-o", record.LastPath, "--", "consult")
+	want = append(want, "-C", consultationWorkspacePath, "--sandbox", "read-only", "--ephemeral", "--skip-git-repo-check", "--json", "-o", record.LastPath, "--", "consult")
 	if !reflect.DeepEqual(record.Args, want) {
 		t.Fatalf("argv = %#v, want %#v", record.Args, want)
 	}
@@ -255,8 +352,120 @@ func TestRunnerAskArgumentsWithoutGitOrSession(t *testing.T) {
 	if record.SchemaPath != "" || record.LastPath != "/proc/self/fd/3" {
 		t.Fatalf("Ask created unexpected temporary state: %#v", record)
 	}
+	if record.Dir != consultationWorkspacePath {
+		t.Fatalf("Ask inner working directory = %q, want %q", record.Dir, consultationWorkspacePath)
+	}
 	if result.SessionID != "" || result.Final != "final answer" {
 		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestRunnerAskBubblewrapConfinement(t *testing.T) {
+	runner, _, _ := helperRunner(t)
+	workingDir := t.TempDir()
+	insidePath := filepath.Join(workingDir, "inside")
+	if err := os.WriteFile(insidePath, []byte("inside sentinel"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	outside, err := os.CreateTemp("/tmp", "qqcodex-outside-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	outsidePath := outside.Name()
+	if err := outside.Close(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(outsidePath) })
+	outsideContents := "outside sentinel must remain hidden"
+	if err := os.WriteFile(outsidePath, []byte(outsideContents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	setEnv(t, helperRecordEvent, "1")
+	setEnv(t, helperProbeInside, consultationWorkspacePath+"/inside")
+	setEnv(t, helperProbeOutside, outsidePath)
+	setEnv(t, helperProbeWrite, "1")
+	runner.KeepEnv = askHelperEnvironment(runner.KeepEnv, helperRecordEvent, helperProbeInside, helperProbeOutside, helperProbeWrite)
+	store, err := tasklog.Open(filepath.Join(t.TempDir(), "task-logs"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner.Log = store
+
+	result, err := runner.Ask(context.Background(), Request{TaskID: "Q-012345ABCDEF", WorkingDir: workingDir, Prompt: "consult", Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := readHelperRecordEvent(t, result.EventsJSONL)
+	if record.Inside != "inside sentinel" || record.Outside != "not-exist" || record.WorkspaceWrite != "permission" {
+		t.Fatalf("sandbox boundary record = %#v", record)
+	}
+	if record.Dir != consultationWorkspacePath {
+		t.Fatalf("sandbox environment = dir=%q env=%#v", record.Dir, record.Env)
+	}
+	for _, entry := range []string{
+		"HOME=" + consultationHomePath, "CODEX_HOME=" + consultationCodexHomePath, "TMPDIR=/tmp", "TMP=/tmp", "TEMP=/tmp", "PATH=" + consultationPATH,
+	} {
+		if !slices.Contains(record.Env, entry) {
+			t.Fatalf("sandbox environment lacks %q: %#v", entry, record.Env)
+		}
+	}
+	for _, value := range []string{outsidePath, outsideContents, runner.LogDir, workingDir} {
+		if strings.Contains(string(result.EventsJSONL), value) {
+			t.Fatalf("sandbox result exposed host-only value %q: %s", value, result.EventsJSONL)
+		}
+	}
+	summary, err := store.Summary("Q-012345ABCDEF", 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range []string{outsidePath, outsideContents} {
+		if strings.Contains(summary, value) {
+			t.Fatalf("sandbox log exposed host-only value %q: %s", value, summary)
+		}
+	}
+}
+
+func TestRunnerAskRequiresSandboxBinary(t *testing.T) {
+	for _, sandboxBinary := range []string{"", filepath.Join(t.TempDir(), "missing-bwrap")} {
+		runner, _, recordPath := helperRunner(t)
+		runner.ConsultationSandboxBinary = sandboxBinary
+		_, err := runner.Ask(context.Background(), Request{TaskID: "Q-012345ABCDEF", WorkingDir: t.TempDir(), Prompt: "consult", Timeout: time.Second})
+		if err == nil || !strings.Contains(err.Error(), "consultation sandbox") {
+			t.Fatalf("Ask() error = %v, want sandbox validation error", err)
+		}
+		assertNotCreated(t, recordPath)
+	}
+}
+
+func TestRunnerPlanDoesNotRequireConsultationSandbox(t *testing.T) {
+	runner, req, _ := helperRunner(t)
+	runner.ConsultationSandboxBinary = ""
+	if _, err := runner.Plan(context.Background(), req); err != nil {
+		t.Fatalf("Plan() error = %v", err)
+	}
+}
+
+func TestRunnerAskCancellationCrossesBubblewrapSession(t *testing.T) {
+	runner, _, _ := helperRunner(t)
+	setEnv(t, helperRecordEvent, "1")
+	setEnv(t, helperSleep, "10s")
+	runner.KeepEnv = askHelperEnvironment(runner.KeepEnv, helperRecordEvent, helperSleep)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := runner.Ask(ctx, Request{TaskID: "Q-012345ABCDEF", WorkingDir: t.TempDir(), Prompt: "consult", Timeout: 10 * time.Second})
+		done <- err
+	}()
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Ask() error = %v, want context canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Ask did not return after context cancellation")
 	}
 }
 
@@ -266,7 +475,8 @@ func TestRunnerAskKeepsLogRedactionAndFinalLimit(t *testing.T) {
 	setEnv(t, helperStdout, `{"type":"item.completed","data":"`+secret+`"}`+"\n")
 	setEnv(t, helperStderr, "CODEX_API_KEY="+secret)
 	setEnv(t, helperFinalSecret, secret)
-	runner.KeepEnv = append(runner.KeepEnv, helperStdout, helperStderr, helperFinalSecret)
+	setEnv(t, helperRecordEvent, "1")
+	runner.KeepEnv = askHelperEnvironment(runner.KeepEnv, helperStdout, helperStderr, helperFinalSecret, helperRecordEvent)
 	store, err := tasklog.Open(filepath.Join(t.TempDir(), "task-logs"), []string{secret})
 	if err != nil {
 		t.Fatal(err)
@@ -1366,16 +1576,17 @@ func helperRunner(t *testing.T) (Runner, Request, string) {
 	setEnv(t, helperRecord, recordPath)
 	for _, name := range []string{
 		helperFinal, helperFinalSize, helperFinalSecret, helperStderr, helperStderrSize, helperExit, helperSleep, helperLarge, helperSpawn,
-		helperPID, helperChild, helperStdout, helperDirty, helperMany,
+		helperPID, helperChild, helperStdout, helperDirty, helperMany, helperRecordEvent, helperProbeInside, helperProbeOutside, helperProbeWrite,
 	} {
 		unsetEnv(t, name)
 	}
 	workingDir := t.TempDir()
 	logDir := filepath.Join(t.TempDir(), "logs")
 	return Runner{
-			Binary:  os.Args[0],
-			KeepEnv: []string{helperEnabled, helperRecord},
-			LogDir:  logDir,
+			Binary:                    os.Args[0],
+			ConsultationSandboxBinary: "/usr/bin/bwrap",
+			KeepEnv:                   []string{helperEnabled, helperRecord},
+			LogDir:                    logDir,
 		}, Request{
 			TaskID:     "task-123",
 			WorkingDir: workingDir,
@@ -1496,6 +1707,48 @@ func readHelperRecord(t *testing.T, path string) helperRecordData {
 	return record
 }
 
+func readHelperRecordEvent(t *testing.T, events []byte) helperRecordData {
+	t.Helper()
+	for _, line := range strings.Split(strings.TrimSpace(string(events)), "\n") {
+		var event struct {
+			Type   string          `json:"type"`
+			Record json.RawMessage `json:"record"`
+		}
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatal(err)
+		}
+		if event.Type != "helper.record" {
+			continue
+		}
+		var record helperRecordData
+		if err := json.Unmarshal(event.Record, &record); err != nil {
+			t.Fatal(err)
+		}
+		return record
+	}
+	t.Fatalf("helper record event not found in %q", events)
+	return helperRecordData{}
+}
+
+func askHelperEnvironment(keep []string, names ...string) []string {
+	filtered := make([]string, 0, len(keep)+len(names))
+	for _, name := range keep {
+		if name != helperRecord {
+			filtered = append(filtered, name)
+		}
+	}
+	return append(filtered, names...)
+}
+
+func containsArgSequence(args, want []string) bool {
+	for start := range len(args) - len(want) + 1 {
+		if slices.Equal(args[start:start+len(want)], want) {
+			return true
+		}
+	}
+	return false
+}
+
 func countArg(args []string, target string) int {
 	var count int
 	for _, arg := range args {
@@ -1531,16 +1784,6 @@ func expectedWorkspaceTempArgs() []string {
 		"-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
 		"-c", "sandbox_workspace_write.exclude_slash_tmp=true",
 	}
-}
-
-func environmentValue(env []string, name string) string {
-	prefix := name + "="
-	for _, entry := range env {
-		if value, ok := strings.CutPrefix(entry, prefix); ok {
-			return value
-		}
-	}
-	return ""
 }
 
 func assertPrivateGitTemp(t *testing.T, record helperRecordData, gitCommonDir string) {
