@@ -34,6 +34,8 @@ var createPattern = regexp.MustCompile(`(?s)^\[([\p{L}\p{N}_-]+)\]\s+(.+)$`)
 
 var projectConsultPattern = regexp.MustCompile(`(?s)^问\s+\[([\p{L}\p{N}_-]+)\]\s+(.+)$`)
 
+var projectConsultPrefix = regexp.MustCompile(`^问\s+\[`)
+
 var fixedCommands = []struct {
 	kind    Kind
 	pattern *regexp.Regexp
@@ -89,7 +91,7 @@ func Parse(text string, mentioned bool) (Command, error) {
 		return Command{Kind: KindProjectConsult, ProjectAlias: matches[1], Body: body}, nil
 	}
 
-	if strings.HasPrefix(text, "问") {
+	if projectConsultPrefix.MatchString(text) {
 		return Command{}, errors.New("invalid project consultation")
 	}
 	if strings.HasPrefix(text, "[") {
