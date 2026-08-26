@@ -620,6 +620,16 @@ func invocationArgs(kind invocation, req Request, schemaPath, lastPath string, t
 }
 
 func consultationSandboxArgs(binary string, req Request, configFD int) []string {
+	return consultationSandboxCommandArgs(binary, req.WorkingDir, configFD, consultationCodexPath)
+}
+
+// ConsultationSandboxProbeArgs returns the production consultation mount shape
+// with a harmless command and the config supplied as the sole ExtraFile (fd 3).
+func ConsultationSandboxProbeArgs(binary, workspace string) []string {
+	return consultationSandboxCommandArgs(binary, workspace, 3, "/bin/true")
+}
+
+func consultationSandboxCommandArgs(binary, workspace string, configFD int, command string) []string {
 	args := []string{
 		"--die-with-parent", "--new-session", "--unshare-all", "--share-net", "--unshare-user", "--cap-drop", "ALL",
 		"--ro-bind", "/usr", "/usr",
@@ -645,7 +655,7 @@ func consultationSandboxArgs(binary string, req Request, configFD int) []string 
 		"--dir", consultationCodexHomePath,
 		"--dir", consultationRunPath + "/bin",
 		"--ro-bind", binary, consultationCodexPath,
-		"--ro-bind", req.WorkingDir, consultationWorkspacePath,
+		"--ro-bind", workspace, consultationWorkspacePath,
 		"--ro-bind-data", strconv.Itoa(configFD), consultationCodexHomePath + "/config.toml",
 		"--setenv", "HOME", consultationHomePath,
 		"--setenv", "CODEX_HOME", consultationCodexHomePath,
@@ -654,7 +664,7 @@ func consultationSandboxArgs(binary string, req Request, configFD int) []string 
 		"--setenv", "TEMP", "/tmp",
 		"--setenv", "PATH", consultationPATH,
 		"--chdir", consultationWorkspacePath,
-		consultationCodexPath,
+		command,
 	}
 	return args
 }

@@ -39,7 +39,7 @@ type sandboxStartupOptions struct {
 	path, root   string
 	trustedUID   uint32
 	probeTimeout time.Duration
-	probe        func(context.Context, string, string) error
+	probe        func(context.Context, string, string, string) error
 }
 
 func main() {
@@ -211,7 +211,7 @@ func validateStartupWithSandbox(cfg *config.Config, sandbox sandboxStartupOption
 	}
 	probeCtx, cancel := context.WithTimeout(context.Background(), sandbox.probeTimeout)
 	defer cancel()
-	if err := sandbox.probe(probeCtx, sandbox.path, cfg.Consultation.Workspace); err != nil || probeCtx.Err() != nil {
+	if err := sandbox.probe(probeCtx, sandbox.path, cfg.Codex.Binary, cfg.Consultation.Workspace); err != nil || probeCtx.Err() != nil {
 		return errors.New("consultation sandbox probe failed")
 	}
 	cfg.Consultation.SandboxBinary = sandbox.path
@@ -271,27 +271,29 @@ func validateTrustedSandboxExecutable(root, path string, trustedUID uint32) erro
 	return nil
 }
 
-func probeConsultationSandbox(ctx context.Context, binary, workspace string) error {
-	cmd := exec.CommandContext(ctx, binary, consultationSandboxProbeArgs()...)
+func probeConsultationSandbox(ctx context.Context, binary, codexBinary, workspace string) error {
+	configFile, err := os.CreateTemp(workspace, ".sandbox-probe-config-*.toml")
+	if err != nil {
+		return err
+	}
+	defer configFile.Close()
+	defer os.Remove(configFile.Name())
+	if _, err := configFile.WriteString("# qqcodex consultation sandbox probe\n"); err != nil {
+		return err
+	}
+	if _, err := configFile.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+
+	args := codex.ConsultationSandboxProbeArgs(codexBinary, workspace)
+	cmd := exec.CommandContext(ctx, binary, args...)
 	cmd.Dir = workspace
 	cmd.Env = []string{"PATH=/usr/bin:/bin"}
+	cmd.ExtraFiles = []*os.File{configFile}
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
 	cmd.WaitDelay = time.Second
 	return cmd.Run()
-}
-
-func consultationSandboxProbeArgs() []string {
-	return []string{
-		"--die-with-parent", "--new-session", "--unshare-all", "--share-net", "--unshare-user", "--cap-drop", "ALL",
-		"--ro-bind", "/usr", "/usr",
-		"--symlink", "usr/bin", "/bin",
-		"--symlink", "usr/sbin", "/sbin",
-		"--symlink", "usr/lib", "/lib",
-		"--symlink", "usr/lib64", "/lib64",
-		"--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", "/run",
-		"--dir", "/workspace", "--chdir", "/workspace", "/bin/true",
-	}
 }
 
 func newCodexRunner(cfg config.Config, logs codex.LogSink) *codex.Runner {
