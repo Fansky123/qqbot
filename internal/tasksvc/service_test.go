@@ -185,7 +185,7 @@ func testServiceWithLogs(t *testing.T, planner Planner, logs LogReader) (*Servic
 	cfg := config.Config{
 		MessageWorkers: 1,
 		OneBot:         config.OneBotConfig{URL: "ws://127.0.0.1", AccessTokenEnv: "NAPCAT_ACCESS_TOKEN", SelfID: "bot", MessageRunes: 1200},
-		DatabasePath:   filepath.Join(t.TempDir(), "db"), LogDir: t.TempDir(), WorktreeRoot: t.TempDir(),
+		DatabasePath:   filepath.Join(t.TempDir(), "db"), LogDir: t.TempDir(), WorktreeRoot: t.TempDir(), Consultation: config.ConsultationConfig{Workspace: t.TempDir(), TimeoutSeconds: 90},
 		AllowedGroupIDs: []string{"g1"}, EmployeeIDs: []string{"u1", "u2", "admin"}, AdminIDs: []string{"admin"},
 		Codex: config.CodexConfig{Binary: "/bin/true"}, OpsCommand: []string{"/bin/true"},
 		Projects: []config.Project{{ID: "orders", Aliases: []string{"orders", "o"}, RepoPath: projectRoot, BaseBranch: "main", RCBranch: "rc", Remote: "origin", Checks: [][]string{{"go", "test", "./..."}}, MaxConcurrent: 1, CodexTimeoutSeconds: 30, LogRetentionDays: 1}},
@@ -284,7 +284,7 @@ func TestServiceDeduplicatesAcrossStoreConnections(t *testing.T) {
 	cfg := config.Config{
 		MessageWorkers: 1,
 		OneBot:         config.OneBotConfig{URL: "ws://127.0.0.1", AccessTokenEnv: "NAPCAT_ACCESS_TOKEN", SelfID: "bot", MessageRunes: 1200},
-		DatabasePath:   path, LogDir: t.TempDir(), WorktreeRoot: t.TempDir(),
+		DatabasePath:   path, LogDir: t.TempDir(), WorktreeRoot: t.TempDir(), Consultation: config.ConsultationConfig{Workspace: t.TempDir(), TimeoutSeconds: 90},
 		AllowedGroupIDs: []string{"g1"}, EmployeeIDs: []string{"u1"},
 		Codex: config.CodexConfig{Binary: "/bin/true"}, OpsCommand: []string{"/bin/true"},
 		Projects: []config.Project{{ID: "orders", Aliases: []string{"orders"}, RepoPath: projectRoot, BaseBranch: "main", RCBranch: "rc", Remote: "origin", Checks: [][]string{{"go", "test", "./..."}}, MaxConcurrent: 1, CodexTimeoutSeconds: 30, LogRetentionDays: 1}},

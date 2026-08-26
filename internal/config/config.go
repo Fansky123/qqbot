@@ -10,17 +10,18 @@ import (
 )
 
 type Config struct {
-	OneBot          OneBotConfig `json:"onebot"`
-	DatabasePath    string       `json:"database_path"`
-	LogDir          string       `json:"log_dir"`
-	WorktreeRoot    string       `json:"worktree_root"`
-	MessageWorkers  int          `json:"message_workers"`
-	AllowedGroupIDs []string     `json:"allowed_group_ids"`
-	EmployeeIDs     []string     `json:"employee_ids"`
-	AdminIDs        []string     `json:"admin_ids"`
-	Codex           CodexConfig  `json:"codex"`
-	OpsCommand      []string     `json:"ops_command"`
-	Projects        []Project    `json:"projects"`
+	OneBot          OneBotConfig       `json:"onebot"`
+	DatabasePath    string             `json:"database_path"`
+	LogDir          string             `json:"log_dir"`
+	WorktreeRoot    string             `json:"worktree_root"`
+	Consultation    ConsultationConfig `json:"consultation"`
+	MessageWorkers  int                `json:"message_workers"`
+	AllowedGroupIDs []string           `json:"allowed_group_ids"`
+	EmployeeIDs     []string           `json:"employee_ids"`
+	AdminIDs        []string           `json:"admin_ids"`
+	Codex           CodexConfig        `json:"codex"`
+	OpsCommand      []string           `json:"ops_command"`
+	Projects        []Project          `json:"projects"`
 }
 
 type OneBotConfig struct {
@@ -33,6 +34,11 @@ type OneBotConfig struct {
 type CodexConfig struct {
 	Binary          string   `json:"binary"`
 	EnvironmentKeep []string `json:"environment_keep"`
+}
+
+type ConsultationConfig struct {
+	Workspace      string `json:"workspace"`
+	TimeoutSeconds int    `json:"timeout_seconds"`
 }
 
 type Project struct {
@@ -88,6 +94,12 @@ func Validate(cfg Config) error {
 	}
 	if err := requireAbsolutePath("worktree root", cfg.WorktreeRoot); err != nil {
 		return err
+	}
+	if err := requireAbsolutePath("consultation workspace", cfg.Consultation.Workspace); err != nil {
+		return err
+	}
+	if cfg.Consultation.TimeoutSeconds <= 0 {
+		return fmt.Errorf("consultation timeout must be positive")
 	}
 	if cfg.OneBot.URL == "" || cfg.OneBot.AccessTokenEnv == "" || cfg.OneBot.SelfID == "" {
 		return fmt.Errorf("onebot URL, access token environment variable, and self ID are required")

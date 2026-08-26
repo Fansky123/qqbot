@@ -121,6 +121,69 @@ func TestValidateStartupAcceptsValidGitConfig(t *testing.T) {
 	}
 }
 
+func TestValidateStartupCreatesPrivateConsultationWorkspace(t *testing.T) {
+	tests := []struct {
+		name     string
+		validate func(*config.Config) error
+	}{
+		{name: "runtime", validate: validateStartup},
+		{name: "cleanup", validate: validateCleanupStartup},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, _ := validGitConfig(t)
+			workspace := filepath.Join(filepath.Dir(cfg.LogDir), "created-consultation")
+			cfg = loadConfigWithConsultation(t, cfg, workspace, 90)
+
+			if err := tt.validate(&cfg); err != nil {
+				t.Fatalf("startup validation error = %v", err)
+			}
+			info, err := os.Stat(workspace)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !info.IsDir() || info.Mode().Perm() != 0o700 {
+				t.Fatalf("consultation workspace mode = %v, want private directory mode 0700", info.Mode())
+			}
+		})
+	}
+}
+
+func TestValidateStartupRejectsConsultationWorkspaceOverlap(t *testing.T) {
+	tests := []struct {
+		name      string
+		workspace func(config.Config) string
+		prepare   func(*config.Config) error
+	}{
+		{name: "database parent", workspace: func(cfg config.Config) string { return filepath.Dir(cfg.DatabasePath) }},
+		{name: "log root", workspace: func(cfg config.Config) string { return cfg.LogDir }},
+		{name: "worktree root", workspace: func(cfg config.Config) string { return cfg.WorktreeRoot }},
+		{
+			name:      "project repository",
+			workspace: func(cfg config.Config) string { return cfg.Projects[0].RepoPath },
+			prepare: func(cfg *config.Config) error {
+				return os.Chmod(cfg.Projects[0].RepoPath, 0o700)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, _ := validGitConfig(t)
+			if tt.prepare != nil {
+				if err := tt.prepare(&cfg); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cfg = loadConfigWithConsultation(t, cfg, tt.workspace(cfg), 90)
+			if err := validateStartup(&cfg); err == nil || err.Error() != "configured paths overlap" {
+				t.Fatalf("validateStartup() error = %v, want configured paths overlap", err)
+			}
+		})
+	}
+}
+
 func TestValidateStartupRejectsUnsafeOrDuplicateBranches(t *testing.T) {
 	for _, branch := range []string{"", "-bad", "feature..bad", "feature~bad"} {
 		t.Run("base "+branch, func(t *testing.T) {
@@ -326,7 +389,7 @@ func validConfig(t *testing.T) config.Config {
 	}
 	return config.Config{
 		OneBot:       config.OneBotConfig{URL: "ws://127.0.0.1:3001", AccessTokenEnv: "NAPCAT_TOKEN", SelfID: "10000", MessageRunes: 1200},
-		DatabasePath: filepath.Join(root, "tasks.db"), LogDir: filepath.Join(root, "logs"), WorktreeRoot: filepath.Join(root, "worktrees"), MessageWorkers: 2,
+		DatabasePath: filepath.Join(root, "tasks.db"), LogDir: filepath.Join(root, "logs"), WorktreeRoot: filepath.Join(root, "worktrees"), Consultation: config.ConsultationConfig{Workspace: filepath.Join(root, "consultation"), TimeoutSeconds: 90}, MessageWorkers: 2,
 		AllowedGroupIDs: []string{"100"}, EmployeeIDs: []string{"200", "201"}, AdminIDs: []string{"201"},
 		Codex:      config.CodexConfig{Binary: "codex"},
 		OpsCommand: []string{"/usr/local/bin/qqcodex-ops", "-config", "/etc/qqcodex/ops.json"},
@@ -348,9 +411,41 @@ func writeConfig(t *testing.T, path string, cfg config.Config) {
 	}
 }
 
+func loadConfigWithConsultation(t *testing.T, cfg config.Config, workspace string, timeoutSeconds int) config.Config {
+	t.Helper()
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := json.Unmarshal(data, &document); err != nil {
+		t.Fatal(err)
+	}
+	document["consultation"] = map[string]any{
+		"workspace":       workspace,
+		"timeout_seconds": timeoutSeconds,
+	}
+	data, err = json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "qqcodex.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return loaded
+}
+
 func validGitConfig(t *testing.T) (config.Config, string) {
 	t.Helper()
 	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	repo := filepath.Join(root, "repo")
 	remote := filepath.Join(root, "remote.git")
 	if err := runCmd(root, "git", "init", "--bare", remote); err != nil {
@@ -383,7 +478,7 @@ func validGitConfig(t *testing.T) (config.Config, string) {
 		t.Fatal(err)
 	}
 	state := filepath.Join(root, "state")
-	for _, dir := range []string{state, filepath.Join(root, "logs"), filepath.Join(root, "worktrees")} {
+	for _, dir := range []string{state, filepath.Join(root, "logs"), filepath.Join(root, "worktrees"), filepath.Join(root, "consultation")} {
 		if err := os.Mkdir(dir, 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -401,7 +496,7 @@ func validGitConfig(t *testing.T) (config.Config, string) {
 	}
 	return config.Config{
 		OneBot:       config.OneBotConfig{URL: "ws://127.0.0.1:3001", AccessTokenEnv: "TOKEN", SelfID: "10000", MessageRunes: 1200},
-		DatabasePath: filepath.Join(state, "tasks.db"), LogDir: filepath.Join(root, "logs"), WorktreeRoot: filepath.Join(root, "worktrees"), MessageWorkers: 1,
+		DatabasePath: filepath.Join(state, "tasks.db"), LogDir: filepath.Join(root, "logs"), WorktreeRoot: filepath.Join(root, "worktrees"), Consultation: config.ConsultationConfig{Workspace: filepath.Join(root, "consultation"), TimeoutSeconds: 90}, MessageWorkers: 1,
 		Codex: config.CodexConfig{Binary: "/bin/sh"}, OpsCommand: []string{"/bin/true", "-config", opsPath},
 		Projects: []config.Project{{ID: "project", Aliases: []string{"p"}, RepoPath: repo, BaseBranch: "main", RCBranch: "rc", Remote: "origin", Checks: [][]string{{"/bin/sh", "-c", "true"}}, DeployAction: "deploy", MaxConcurrent: 1, CodexTimeoutSeconds: 30, LogRetentionDays: 7}},
 	}, opsPath

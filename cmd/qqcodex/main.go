@@ -181,6 +181,9 @@ func validateStartup(cfg *config.Config) error {
 	if err := ensurePrivateDirectory(cfg.WorktreeRoot); err != nil {
 		return errors.New("worktree directory is invalid")
 	}
+	if err := ensurePrivateDirectory(cfg.Consultation.Workspace); err != nil {
+		return errors.New("consultation workspace is invalid")
+	}
 	for _, project := range cfg.Projects {
 		if err := validateProject(project); err != nil {
 			return fmt.Errorf("project %q is invalid", project.ID)
@@ -204,6 +207,9 @@ func validateCleanupStartup(cfg *config.Config) error {
 	}
 	if err := ensurePrivateDirectory(cfg.WorktreeRoot); err != nil {
 		return errors.New("worktree directory is invalid")
+	}
+	if err := ensurePrivateDirectory(cfg.Consultation.Workspace); err != nil {
+		return errors.New("consultation workspace is invalid")
 	}
 	for _, project := range cfg.Projects {
 		if err := validateRepository(project.RepoPath); err != nil {
@@ -368,7 +374,7 @@ func runGit(repo string, args ...string) ([]byte, error) {
 }
 
 func validatePathOverlap(cfg *config.Config) error {
-	paths := []string{filepath.Dir(cfg.DatabasePath), cfg.LogDir, cfg.WorktreeRoot}
+	paths := []string{filepath.Dir(cfg.DatabasePath), cfg.LogDir, cfg.WorktreeRoot, cfg.Consultation.Workspace}
 	for _, project := range cfg.Projects {
 		paths = append(paths, project.RepoPath)
 	}

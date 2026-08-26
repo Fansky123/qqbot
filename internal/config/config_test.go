@@ -156,6 +156,74 @@ func TestValidate(t *testing.T) {
 	}
 }
 
+func TestLoadValidatesConsultationConfig(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		consultation map[string]any
+		wantErr      bool
+	}{
+		{
+			name: "valid consultation configuration",
+			consultation: map[string]any{
+				"workspace":       filepath.Join(t.TempDir(), "consultation"),
+				"timeout_seconds": 90,
+			},
+		},
+		{
+			name: "missing workspace",
+			consultation: map[string]any{
+				"timeout_seconds": 90,
+			},
+			wantErr: true,
+		},
+		{
+			name: "relative workspace",
+			consultation: map[string]any{
+				"workspace":       "consultation",
+				"timeout_seconds": 90,
+			},
+			wantErr: true,
+		},
+		{
+			name: "non-positive timeout",
+			consultation: map[string]any{
+				"workspace":       filepath.Join(t.TempDir(), "consultation"),
+				"timeout_seconds": 0,
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data, err := json.Marshal(validConfig(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var document map[string]any
+			if err := json.Unmarshal(data, &document); err != nil {
+				t.Fatal(err)
+			}
+			document["consultation"] = tt.consultation
+			data, err = json.Marshal(document)
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(t.TempDir(), "qqcodex.json")
+			if err := os.WriteFile(path, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			_, err = Load(path)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("Load() error = %v, want error: %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestLoadAppliesDefaultsOnlyDuringLoad(t *testing.T) {
 	t.Parallel()
 
@@ -300,6 +368,7 @@ func validConfig(t *testing.T) Config {
 		DatabasePath:    filepath.Join(root, "tasks.db"),
 		LogDir:          filepath.Join(root, "logs"),
 		WorktreeRoot:    filepath.Join(root, "worktrees"),
+		Consultation:    ConsultationConfig{Workspace: filepath.Join(root, "consultation"), TimeoutSeconds: 90},
 		MessageWorkers:  4,
 		AllowedGroupIDs: []string{"20000"},
 		EmployeeIDs:     []string{"30000", "30001"},

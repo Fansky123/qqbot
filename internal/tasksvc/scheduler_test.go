@@ -1581,6 +1581,7 @@ func newSchedulerFixture(t *testing.T, p1Concurrency int) *schedulerFixture {
 		DatabasePath:   dbPath,
 		LogDir:         filepath.Join(root, "logs"),
 		WorktreeRoot:   filepath.Join(root, "worktrees"),
+		Consultation:   config.ConsultationConfig{Workspace: filepath.Join(root, "consultation"), TimeoutSeconds: 90},
 		Codex:          config.CodexConfig{Binary: "/bin/true"},
 		OpsCommand:     []string{"/bin/true"},
 		Projects: []config.Project{

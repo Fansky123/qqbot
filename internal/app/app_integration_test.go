@@ -53,7 +53,7 @@ func TestEndToEnd(t *testing.T) {
 	defer oneBot.Close()
 	cfg := config.Config{
 		OneBot:       config.OneBotConfig{URL: oneBot.URL(), AccessTokenEnv: "NAPCAT_TOKEN", SelfID: "10000", MessageRunes: 1200},
-		DatabasePath: filepath.Join(root, "tasks.db"), LogDir: logRoot, WorktreeRoot: worktreeRoot, MessageWorkers: 2,
+		DatabasePath: filepath.Join(root, "tasks.db"), LogDir: logRoot, WorktreeRoot: worktreeRoot, Consultation: config.ConsultationConfig{Workspace: filepath.Join(root, "consultation"), TimeoutSeconds: 90}, MessageWorkers: 2,
 		AllowedGroupIDs: []string{"100"}, EmployeeIDs: []string{"200", "201"}, AdminIDs: []string{"201"},
 		Codex:      config.CodexConfig{Binary: codexBinary, EnvironmentKeep: []string{"QQCODEX_EXEC_COUNT"}},
 		OpsCommand: []string{"fake-ops"},
@@ -828,7 +828,7 @@ func TestCleanupExpiredRemovesOnlyOldFailedAndCancelledLocalArtifacts(t *testing
 	}
 	registry, err := config.NewRegistry(config.Config{
 		OneBot:       config.OneBotConfig{URL: "ws://127.0.0.1", AccessTokenEnv: "TOKEN", SelfID: "1", MessageRunes: 100},
-		DatabasePath: filepath.Join(root, "tasks.db"), LogDir: logRoot, WorktreeRoot: worktreeRoot, MessageWorkers: 1,
+		DatabasePath: filepath.Join(root, "tasks.db"), LogDir: logRoot, WorktreeRoot: worktreeRoot, Consultation: config.ConsultationConfig{Workspace: filepath.Join(root, "consultation"), TimeoutSeconds: 90}, MessageWorkers: 1,
 		AllowedGroupIDs: []string{"1"}, EmployeeIDs: []string{"2"}, AdminIDs: []string{"2"},
 		Codex: config.CodexConfig{Binary: "unused"}, OpsCommand: []string{"unused"}, Projects: []config.Project{project},
 	})

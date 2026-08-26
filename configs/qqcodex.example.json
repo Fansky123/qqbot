@@ -8,6 +8,7 @@
   "database_path": "/var/lib/qqcodex-worker/tasks.db",
   "log_dir": "/var/log/qqcodex-worker",
   "worktree_root": "/srv/qqcodex-worker/worktrees",
+  "consultation": {"workspace": "/srv/qqcodex-worker/consultation", "timeout_seconds": 90},
   "message_workers": 4,
   "allowed_group_ids": ["10002"],
   "employee_ids": ["10003", "10004"],
