@@ -1022,6 +1022,185 @@ func TestSchedulerLeaseIsExclusiveRenewableAndExpires(t *testing.T) {
 	}
 }
 
+func TestConsultationPersistenceAndCompletion(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	db := openTestStore(t)
+	now := time.UnixMilli(1_787_600_000_000).UTC()
+	consultation := testConsultation(now)
+
+	if err := db.CreateConsultation(ctx, consultation); err != nil {
+		t.Fatal(err)
+	}
+	got, err := db.GetConsultationByMessage(ctx, consultation.GroupID, consultation.MessageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, consultation) {
+		t.Fatalf("stored consultation mismatch\ngot:  %#v\nwant: %#v", got, consultation)
+	}
+
+	completedAt := now.Add(2 * time.Minute)
+	if err := db.CompleteConsultation(ctx, consultation.ID, consultation.LeaseToken, "Here is the answer.", completedAt); err != nil {
+		t.Fatal(err)
+	}
+	consultation.Reply = "Here is the answer."
+	consultation.CompletedAt = completedAt
+	consultation.UpdatedAt = completedAt
+	got, err = db.GetConsultationByMessage(ctx, consultation.GroupID, consultation.MessageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, consultation) {
+		t.Fatalf("completed consultation mismatch\ngot:  %#v\nwant: %#v", got, consultation)
+	}
+
+	if _, err := db.GetConsultationByMessage(ctx, consultation.GroupID, "missing"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing consultation error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestCreateConsultationDuplicateMessageConflicts(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	db := openTestStore(t)
+	now := time.UnixMilli(1_787_600_000_000).UTC()
+	consultation := testConsultation(now)
+	if err := db.CreateConsultation(ctx, consultation); err != nil {
+		t.Fatal(err)
+	}
+
+	duplicate := *consultation
+	duplicate.ID = "consultation-2"
+	if err := db.CreateConsultation(ctx, &duplicate); !errors.Is(err, ErrConflict) {
+		t.Fatalf("duplicate consultation error = %v, want ErrConflict", err)
+	}
+}
+
+func TestConsultationReclaimFencesCompletion(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	db := openTestStore(t)
+	now := time.UnixMilli(1_787_600_000_000).UTC()
+	consultation := testConsultation(now)
+	if err := db.CreateConsultation(ctx, consultation); err != nil {
+		t.Fatal(err)
+	}
+
+	reclaimed, err := db.TryReclaimConsultation(ctx, consultation.ID, "lease-2", now.Add(2*time.Minute), now.Add(30*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reclaimed {
+		t.Fatal("live consultation lease was reclaimed")
+	}
+
+	leaseUntil := now.Add(3 * time.Minute)
+	reclaimed, err = db.TryReclaimConsultation(ctx, consultation.ID, "lease-2", leaseUntil, now.Add(2*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reclaimed {
+		t.Fatal("expired consultation lease was not reclaimed")
+	}
+	consultation.LeaseToken = "lease-2"
+	consultation.LeaseExpiresAt = leaseUntil
+	consultation.UpdatedAt = now.Add(2 * time.Minute)
+
+	if err := db.CompleteConsultation(ctx, consultation.ID, "lease-1", "stale answer", now.Add(2*time.Minute)); !errors.Is(err, ErrConflict) {
+		t.Fatalf("stale completion error = %v, want ErrConflict", err)
+	}
+	completedAt := now.Add(2 * time.Minute)
+	if err := db.CompleteConsultation(ctx, consultation.ID, consultation.LeaseToken, "current answer", completedAt); err != nil {
+		t.Fatal(err)
+	}
+	consultation.Reply = "current answer"
+	consultation.CompletedAt = completedAt
+	consultation.UpdatedAt = completedAt
+
+	reclaimed, err = db.TryReclaimConsultation(ctx, consultation.ID, "lease-3", now.Add(4*time.Minute), now.Add(3*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reclaimed {
+		t.Fatal("completed consultation was reclaimed")
+	}
+	if err := db.CompleteConsultation(ctx, consultation.ID, consultation.LeaseToken, "overwritten answer", now.Add(3*time.Minute)); !errors.Is(err, ErrConflict) {
+		t.Fatalf("completed consultation overwrite error = %v, want ErrConflict", err)
+	}
+	got, err := db.GetConsultationByMessage(ctx, consultation.GroupID, consultation.MessageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, consultation) {
+		t.Fatalf("completed consultation changed\ngot:  %#v\nwant: %#v", got, consultation)
+	}
+}
+
+func TestConsultationReclaimIsAtomicAcrossStoreConnections(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "consultations.db")
+	first, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := first.Close(); err != nil {
+			t.Errorf("close first store: %v", err)
+		}
+	})
+	second, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := second.Close(); err != nil {
+			t.Errorf("close second store: %v", err)
+		}
+	})
+
+	now := time.UnixMilli(1_787_600_000_000).UTC()
+	consultation := testConsultation(now)
+	consultation.LeaseExpiresAt = now.Add(-time.Minute)
+	if err := first.CreateConsultation(ctx, consultation); err != nil {
+		t.Fatal(err)
+	}
+
+	start := make(chan struct{})
+	results := make(chan bool, 2)
+	errs := make(chan error, 2)
+	for _, claim := range []struct {
+		store *Store
+		token string
+	}{{first, "lease-2"}, {second, "lease-3"}} {
+		go func() {
+			<-start
+			claimed, err := claim.store.TryReclaimConsultation(ctx, consultation.ID, claim.token, now.Add(time.Minute), now)
+			results <- claimed
+			errs <- err
+		}()
+	}
+	close(start)
+
+	claimed := 0
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+		if <-results {
+			claimed++
+		}
+	}
+	if claimed != 1 {
+		t.Fatalf("successful concurrent reclaims = %d, want 1", claimed)
+	}
+}
+
 func openTestStore(t *testing.T) *Store {
 	t.Helper()
 
@@ -1057,5 +1236,20 @@ func testTask(id string, status model.Status, at time.Time) *model.Task {
 		Failure:      "failure detail",
 		CreatedAt:    at,
 		UpdatedAt:    at,
+	}
+}
+
+func testConsultation(at time.Time) *model.Consultation {
+	return &model.Consultation{
+		ID:             "consultation-1",
+		GroupID:        "group-1",
+		MessageID:      "message-1",
+		UserID:         "user-1",
+		ProjectID:      "project-1",
+		Question:       "What is the current status?",
+		LeaseToken:     "lease-1",
+		LeaseExpiresAt: at.Add(time.Minute),
+		CreatedAt:      at,
+		UpdatedAt:      at,
 	}
 }

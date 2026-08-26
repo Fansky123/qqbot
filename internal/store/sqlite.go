@@ -12,7 +12,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
-	_ "modernc.org/sqlite"
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 
 	"qqcodex/internal/model"
 )
@@ -31,6 +32,10 @@ const taskColumns = `
 	id, project_id, group_id, creator_id, requirement, plan, status, branch,
 	worktree, base_commit, git_common_dir, task_commit, rc_commit, deploy_key, session_id, summary, failure,
 	version, created_at, updated_at`
+
+const consultationColumns = `
+	id, group_id, message_id, user_id, project_id, question, reply, lease_token,
+	lease_expires_at, completed_at, created_at, updated_at`
 
 type Store struct {
 	db       *sql.DB
@@ -807,6 +812,106 @@ func (s *Store) AppendAudit(ctx context.Context, taskID, kind, detail string, at
 	return nil
 }
 
+func (s *Store) CreateConsultation(ctx context.Context, consultation *model.Consultation) error {
+	if err := validateNewConsultation(consultation); err != nil {
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO consultations (
+			id, group_id, message_id, user_id, project_id, question, reply, lease_token,
+			lease_expires_at, completed_at, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+		consultation.ID, consultation.GroupID, consultation.MessageID, consultation.UserID,
+		consultation.ProjectID, consultation.Question, consultation.Reply, consultation.LeaseToken,
+		consultation.LeaseExpiresAt.UTC().UnixMilli(), consultation.CreatedAt.UTC().UnixMilli(), consultation.UpdatedAt.UTC().UnixMilli(),
+	)
+	if isSQLiteUniqueConstraint(err) {
+		return fmt.Errorf("create consultation for message %q/%q: %w", consultation.GroupID, consultation.MessageID, ErrConflict)
+	}
+	if err != nil {
+		return fmt.Errorf("create consultation for message %q/%q: %w", consultation.GroupID, consultation.MessageID, err)
+	}
+	return nil
+}
+
+func (s *Store) GetConsultationByMessage(ctx context.Context, groupID, messageID string) (*model.Consultation, error) {
+	if groupID == "" || messageID == "" {
+		return nil, errors.New("consultation group and message are required")
+	}
+	consultation, err := scanConsultation(s.db.QueryRowContext(ctx, `
+		SELECT `+consultationColumns+`
+		FROM consultations
+		WHERE group_id = ? AND message_id = ?`, groupID, messageID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("get consultation for message %q/%q: %w", groupID, messageID, ErrNotFound)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get consultation for message %q/%q: %w", groupID, messageID, err)
+	}
+	return consultation, nil
+}
+
+func (s *Store) TryReclaimConsultation(ctx context.Context, id, newToken string, leaseUntil, now time.Time) (bool, error) {
+	if id == "" || newToken == "" || now.IsZero() || !leaseUntil.After(now) {
+		return false, errors.New("consultation id, lease token, current time, and future expiry are required")
+	}
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE consultations
+		SET lease_token = ?, lease_expires_at = ?, updated_at = ?
+		WHERE id = ? AND completed_at = 0 AND lease_expires_at <= ?`,
+		newToken, leaseUntil.UTC().UnixMilli(), now.UTC().UnixMilli(), id, now.UTC().UnixMilli(),
+	)
+	if err != nil {
+		return false, fmt.Errorf("reclaim consultation %q: %w", id, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("reclaim consultation %q rows affected: %w", id, err)
+	}
+	return rows == 1, nil
+}
+
+func (s *Store) CompleteConsultation(ctx context.Context, id, leaseToken, reply string, now time.Time) error {
+	if id == "" || leaseToken == "" || reply == "" || now.IsZero() || now.UTC().UnixMilli() == 0 {
+		return errors.New("consultation id, lease token, reply, and completion time are required")
+	}
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE consultations
+		SET reply = ?, completed_at = ?, updated_at = ?
+		WHERE id = ? AND completed_at = 0 AND lease_token = ?`,
+		reply, now.UTC().UnixMilli(), now.UTC().UnixMilli(), id, leaseToken,
+	)
+	if err != nil {
+		return fmt.Errorf("complete consultation %q: %w", id, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("complete consultation %q rows affected: %w", id, err)
+	}
+	if rows != 1 {
+		return fmt.Errorf("complete consultation %q: %w", id, ErrConflict)
+	}
+	return nil
+}
+
+func validateNewConsultation(consultation *model.Consultation) error {
+	if consultation == nil || consultation.ID == "" || consultation.GroupID == "" || consultation.MessageID == "" ||
+		consultation.UserID == "" || consultation.ProjectID == "" || consultation.Question == "" || consultation.LeaseToken == "" ||
+		consultation.LeaseExpiresAt.IsZero() || consultation.CreatedAt.IsZero() || consultation.UpdatedAt.IsZero() ||
+		!consultation.CompletedAt.IsZero() {
+		return errors.New("pending consultation identity, question, lease, and timestamps are required")
+	}
+	return nil
+}
+
+func isSQLiteUniqueConstraint(err error) bool {
+	var sqliteErr *sqlite.Error
+	if !errors.As(err, &sqliteErr) {
+		return false
+	}
+	return sqliteErr.Code() == sqlite3.SQLITE_CONSTRAINT_UNIQUE || sqliteErr.Code() == sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY
+}
+
 // TryAcquireSchedulerLease atomically acquires an absent or expired task lease.
 func (s *Store) TryAcquireSchedulerLease(ctx context.Context, taskID, owner string, now, expiresAt time.Time) (bool, error) {
 	if taskID == "" || owner == "" || !expiresAt.After(now) {
@@ -963,4 +1068,24 @@ func scanTasks(rows *sql.Rows) ([]*model.Task, error) {
 		return nil, err
 	}
 	return tasks, nil
+}
+
+func scanConsultation(scanner taskScanner) (*model.Consultation, error) {
+	var consultation model.Consultation
+	var leaseExpiresAt, completedAt, createdAt, updatedAt int64
+	err := scanner.Scan(
+		&consultation.ID, &consultation.GroupID, &consultation.MessageID, &consultation.UserID,
+		&consultation.ProjectID, &consultation.Question, &consultation.Reply, &consultation.LeaseToken,
+		&leaseExpiresAt, &completedAt, &createdAt, &updatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	consultation.LeaseExpiresAt = time.UnixMilli(leaseExpiresAt).UTC()
+	if completedAt != 0 {
+		consultation.CompletedAt = time.UnixMilli(completedAt).UTC()
+	}
+	consultation.CreatedAt = time.UnixMilli(createdAt).UTC()
+	consultation.UpdatedAt = time.UnixMilli(updatedAt).UTC()
+	return &consultation, nil
 }

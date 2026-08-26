@@ -63,6 +63,22 @@ CREATE TABLE IF NOT EXISTS processed_messages (
     processed_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS consultations (
+    id TEXT PRIMARY KEY,
+    group_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    question TEXT NOT NULL,
+    reply TEXT NOT NULL,
+    lease_token TEXT NOT NULL,
+    lease_expires_at INTEGER NOT NULL,
+    completed_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE (group_id, message_id)
+);
+
 CREATE TABLE IF NOT EXISTS audit_events (
     id INTEGER PRIMARY KEY,
     task_id TEXT NOT NULL REFERENCES tasks(id),
