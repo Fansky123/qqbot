@@ -1,0 +1,833 @@
+package app
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/coder/websocket"
+	"github.com/coder/websocket/wsjson"
+
+	"qqcodex/internal/auth"
+	"qqcodex/internal/codex"
+	"qqcodex/internal/config"
+	"qqcodex/internal/gitwork"
+	"qqcodex/internal/model"
+	"qqcodex/internal/onebot"
+	"qqcodex/internal/store"
+	"qqcodex/internal/tasklog"
+	"qqcodex/internal/tasksvc"
+)
+
+func TestEndToEnd(t *testing.T) {
+	root := t.TempDir()
+	repo, remote := createGitProject(t, root)
+	worktreeRoot := filepath.Join(root, "worktrees")
+	logRoot := filepath.Join(root, "logs")
+	executionCount := filepath.Join(root, "executions")
+	codexBinary := createFakeCodex(t, root)
+	t.Setenv("CODEX_API_KEY", "codex-api-key-for-e2e")
+	t.Setenv("HOME", filepath.Join(root, "home"))
+	t.Setenv("CODEX_HOME", filepath.Join(root, "codex-home"))
+	t.Setenv("QQCODEX_EXEC_COUNT", executionCount)
+	if err := os.MkdirAll(os.Getenv("HOME"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	oneBot := newFakeOneBot(t, "10000", "onebot-token-for-e2e")
+	defer oneBot.Close()
+	cfg := config.Config{
+		OneBot:       config.OneBotConfig{URL: oneBot.URL(), AccessTokenEnv: "NAPCAT_TOKEN", SelfID: "10000", MessageRunes: 1200},
+		DatabasePath: filepath.Join(root, "tasks.db"), LogDir: logRoot, WorktreeRoot: worktreeRoot, MessageWorkers: 2,
+		AllowedGroupIDs: []string{"100"}, EmployeeIDs: []string{"200", "201"}, AdminIDs: []string{"201"},
+		Codex:      config.CodexConfig{Binary: codexBinary, EnvironmentKeep: []string{"QQCODEX_EXEC_COUNT"}},
+		OpsCommand: []string{"fake-ops"},
+		Projects: []config.Project{{
+			ID: "project", Aliases: []string{"p"}, RepoPath: repo, BaseBranch: "main", RCBranch: "rc", Remote: "origin",
+			Checks: [][]string{{"git", "status", "--porcelain"}}, DeployAction: "deploy-rc",
+			MaxConcurrent: 1, CodexTimeoutSeconds: 10, LogRetentionDays: 7,
+		}},
+	}
+	registry, err := config.NewRegistry(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db := openStore(t, cfg.DatabasePath)
+	defer closeStore(t, db)
+	logs, err := tasklog.Open(logRoot, []string{"onebot-token-for-e2e", "codex-api-key-for-e2e"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &codex.Runner{Binary: codexBinary, KeepEnv: cfg.Codex.EnvironmentKeep, LogDir: logRoot, Log: logs}
+	worktrees := &gitwork.Manager{Root: worktreeRoot}
+	operator := &e2eOperator{repo: repo, remote: remote}
+	client := &onebot.Client{URL: oneBot.URL(), Token: "onebot-token-for-e2e", SelfID: "10000", MessageRunes: 1200}
+	authorizer := auth.New(cfg.AllowedGroupIDs, cfg.EmployeeIDs, cfg.AdminIDs)
+	scheduler := tasksvc.NewScheduler(registry, db, runner, worktrees, operator, client, logs, discardLogger(), 10*time.Millisecond)
+	service := tasksvc.NewService(registry, db, authorizer, runner, scheduler, client, logs)
+	application := App{
+		Store: db, Client: client, Scheduler: scheduler, Service: service, Groups: authorizer,
+		MessageWorkers: cfg.MessageWorkers, Logger: discardLogger(),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- application.Run(ctx) }()
+	oneBot.WaitReady(t)
+
+	const groupID = "100"
+	taskID := tasksvc.TaskID(groupID, "1")
+	oneBot.Send(t, groupEvent("1", groupID, "200", "10000", "[p] update e2e file", true))
+	oneBot.WaitText(t, func(text string) bool {
+		return strings.Contains(text, "任务 #"+taskID+" 规划完成") && strings.Contains(text, "确认 #"+taskID)
+	})
+
+	confirm := groupEvent("2", groupID, "200", "10000", "确认 #"+taskID, false)
+	oneBot.Send(t, confirm)
+	oneBot.Send(t, confirm)
+	waitTaskStatus(t, db, taskID, model.StatusAwaitingMergeApproval)
+	oneBot.WaitText(t, func(text string) bool { return strings.Contains(text, "批准合并 #"+taskID) })
+
+	oneBot.Send(t, groupEvent("3", groupID, "201", "10000", "批准合并 #"+taskID, false))
+	waitTaskStatus(t, db, taskID, model.StatusAwaitingDeployApproval)
+	oneBot.WaitText(t, func(text string) bool { return strings.Contains(text, "批准部署 #"+taskID) })
+
+	oneBot.Send(t, groupEvent("4", groupID, "201", "10000", "批准部署 #"+taskID, false))
+	waitTaskStatus(t, db, taskID, model.StatusDeployed)
+
+	task, err := db.GetTask(context.Background(), taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.TaskCommit == "" || task.RCCommit == "" || task.SessionID != "e2e-session" || task.Status != model.StatusDeployed {
+		t.Fatalf("final task = %#v", task)
+	}
+	if operator.pushes.Load() != 1 || operator.merges.Load() != 1 || operator.deploys.Load() != 1 {
+		t.Fatalf("external calls push=%d merge=%d deploy=%d, want once each", operator.pushes.Load(), operator.merges.Load(), operator.deploys.Load())
+	}
+	countData, err := os.ReadFile(executionCount)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(countData), "execute\n"); got != 1 {
+		t.Fatalf("Codex executions = %d, want 1", got)
+	}
+	remoteCommit := gitOutput(t, repo, "rev-parse", "refs/remotes/origin/codex/"+taskID)
+	if remoteCommit != task.TaskCommit {
+		t.Fatalf("remote task commit = %q, want %q", remoteCommit, task.TaskCommit)
+	}
+
+	cancel()
+	if err := waitError(t, done, "e2e shutdown"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRunRecoversBeforeLoopsAndHoldsRuntimeLock(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "tasks.db")
+	db := openStore(t, dbPath)
+	defer closeStore(t, db)
+	secondDB := openStore(t, dbPath)
+	defer closeStore(t, secondDB)
+
+	task := &model.Task{
+		ID: "T-000000000001", ProjectID: "project", GroupID: "100", CreatorID: "200",
+		Requirement: "test", Status: model.StatusRunning, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+	}
+	if err := db.CreateTask(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+
+	clientStarted := make(chan struct{})
+	schedulerStarted := make(chan struct{})
+	first := App{
+		Store: db, Client: blockingClient{started: clientStarted}, Scheduler: blockingScheduler{started: schedulerStarted},
+		Service: serviceFunc(func(context.Context, tasksvc.Message) error { return nil }),
+		Groups:  groupFunc(func(string) bool { return true }), MessageWorkers: 1, Logger: discardLogger(),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- first.Run(ctx) }()
+	waitClosed(t, clientStarted, "client start")
+	waitClosed(t, schedulerStarted, "scheduler start")
+
+	recovered, err := db.GetTask(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.Status != model.StatusFailed {
+		t.Fatalf("recovered status = %q, want %q", recovered.Status, model.StatusFailed)
+	}
+
+	secondClient := &countingClient{}
+	secondScheduler := &countingScheduler{}
+	err = (App{
+		Store: secondDB, Client: secondClient, Scheduler: secondScheduler,
+		Service: serviceFunc(func(context.Context, tasksvc.Message) error { return nil }),
+		Groups:  groupFunc(func(string) bool { return true }), MessageWorkers: 1, Logger: discardLogger(),
+	}).Run(context.Background())
+	if !errors.Is(err, store.ErrRuntimeLocked) {
+		t.Fatalf("second Run error = %v, want ErrRuntimeLocked", err)
+	}
+	if secondClient.calls.Load() != 0 || secondScheduler.calls.Load() != 0 {
+		t.Fatalf("loops started before lock: client=%d scheduler=%d", secondClient.calls.Load(), secondScheduler.calls.Load())
+	}
+
+	cancel()
+	if err := waitError(t, done, "first app shutdown"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRunDoesNotStartLoopsWhenRecoveryFails(t *testing.T) {
+	db := openStore(t, filepath.Join(t.TempDir(), "tasks.db"))
+	defer closeStore(t, db)
+	client := &countingClient{}
+	scheduler := &countingScheduler{}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := (App{
+		Store: db, Client: client, Scheduler: scheduler,
+		Service: serviceFunc(func(context.Context, tasksvc.Message) error { return nil }),
+		Groups:  groupFunc(func(string) bool { return true }), MessageWorkers: 1, Logger: discardLogger(),
+	}).Run(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run error = %v, want canceled recovery", err)
+	}
+	if client.calls.Load() != 0 || scheduler.calls.Load() != 0 {
+		t.Fatalf("loops started after failed recovery: client=%d scheduler=%d", client.calls.Load(), scheduler.calls.Load())
+	}
+	lock, err := db.AcquireRuntimeLock()
+	if err != nil {
+		t.Fatalf("runtime lock remained held after recovery failure: %v", err)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRunFiltersGroupsAndRetriesOnlyNotificationDelivery(t *testing.T) {
+	db := openStore(t, filepath.Join(t.TempDir(), "tasks.db"))
+	defer closeStore(t, db)
+
+	allowed := onebot.GroupMessage{GroupID: "100", UserID: "200", MessageID: "300", Text: "hello", Mentioned: true}
+	disallowed := allowed
+	disallowed.GroupID = "999"
+	disallowed.MessageID = "301"
+	var mu sync.Mutex
+	var got []tasksvc.Message
+	thirdAttempt := make(chan struct{})
+	service := serviceFunc(func(_ context.Context, message tasksvc.Message) error {
+		mu.Lock()
+		got = append(got, message)
+		attempt := len(got)
+		mu.Unlock()
+		if attempt < 3 {
+			return errors.Join(tasksvc.ErrNotificationDelivery, errors.New("send failed"))
+		}
+		close(thirdAttempt)
+		return nil
+	})
+	client := emittingClient{messages: []onebot.GroupMessage{disallowed, allowed}}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- (App{
+			Store: db, Client: client, Scheduler: blockingScheduler{}, Service: service,
+			Groups:         groupFunc(func(groupID string) bool { return groupID == "100" }),
+			MessageWorkers: 1, Logger: discardLogger(),
+		}).Run(ctx)
+	}()
+	waitClosed(t, thirdAttempt, "notification retry")
+	cancel()
+	if err := waitError(t, done, "app shutdown"); err != nil {
+		t.Fatal(err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != 3 {
+		t.Fatalf("service calls = %d, want 3", len(got))
+	}
+	want := tasksvc.Message{GroupID: "100", UserID: "200", MessageID: "300", Text: "hello", Mentioned: true}
+	for i, message := range got {
+		if message != want {
+			t.Fatalf("attempt %d message = %#v, want immutable %#v", i+1, message, want)
+		}
+	}
+}
+
+func TestRunDoesNotRetryBusinessErrorsOrLogMessageText(t *testing.T) {
+	db := openStore(t, filepath.Join(t.TempDir(), "tasks.db"))
+	defer closeStore(t, db)
+
+	const secretText = "message-full-secret"
+	var calls atomic.Int32
+	called := make(chan struct{})
+	service := serviceFunc(func(context.Context, tasksvc.Message) error {
+		calls.Add(1)
+		close(called)
+		return errors.New("invalid command contains " + secretText)
+	})
+	var logs strings.Builder
+	logWritten := make(chan struct{})
+	logger := slog.New(slog.NewJSONHandler(&lockedWriter{writer: &logs, wrote: logWritten}, nil))
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- (App{
+			Store: db, Client: emittingClient{messages: []onebot.GroupMessage{{GroupID: "100", UserID: "200", MessageID: "300", Text: secretText}}},
+			Scheduler: blockingScheduler{}, Service: service, Groups: groupFunc(func(string) bool { return true }),
+			MessageWorkers: 1, Logger: logger,
+		}).Run(ctx)
+	}()
+	waitClosed(t, called, "business error")
+	waitClosed(t, logWritten, "business error log")
+	cancel()
+	if err := waitError(t, done, "app shutdown"); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("service calls = %d, want 1", calls.Load())
+	}
+	if strings.Contains(logs.String(), secretText) {
+		t.Fatalf("logs contain message/error text: %s", logs.String())
+	}
+}
+
+func TestRunBoundsMessageWorkers(t *testing.T) {
+	db := openStore(t, filepath.Join(t.TempDir(), "tasks.db"))
+	defer closeStore(t, db)
+
+	const workerCount = 2
+	release := make(chan struct{})
+	var active atomic.Int32
+	var maximum atomic.Int32
+	started := make(chan struct{}, 8)
+	service := serviceFunc(func(ctx context.Context, _ tasksvc.Message) error {
+		current := active.Add(1)
+		defer active.Add(-1)
+		for {
+			old := maximum.Load()
+			if current <= old || maximum.CompareAndSwap(old, current) {
+				break
+			}
+		}
+		started <- struct{}{}
+		select {
+		case <-release:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+	messages := make([]onebot.GroupMessage, 8)
+	for i := range messages {
+		messages[i] = onebot.GroupMessage{GroupID: "100", UserID: "200", MessageID: onebot.ID(string(rune('1' + i)))}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- (App{
+			Store: db, Client: emittingClient{messages: messages}, Scheduler: blockingScheduler{}, Service: service,
+			Groups: groupFunc(func(string) bool { return true }), MessageWorkers: workerCount, Logger: discardLogger(),
+		}).Run(ctx)
+	}()
+	for range workerCount {
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("workers did not start")
+		}
+	}
+	if got := maximum.Load(); got != workerCount {
+		t.Fatalf("maximum workers = %d, want %d", got, workerCount)
+	}
+	close(release)
+	cancel()
+	if err := waitError(t, done, "worker shutdown"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRunTreatsEarlySchedulerReturnAsFatal(t *testing.T) {
+	db := openStore(t, filepath.Join(t.TempDir(), "tasks.db"))
+	defer closeStore(t, db)
+
+	clientStopped := make(chan struct{})
+	err := (App{
+		Store:     db,
+		Client:    clientFunc(func(ctx context.Context, _ onebot.Handler) error { <-ctx.Done(); close(clientStopped); return nil }),
+		Scheduler: schedulerFunc(func(context.Context) error { return nil }),
+		Service:   serviceFunc(func(context.Context, tasksvc.Message) error { return nil }),
+		Groups:    groupFunc(func(string) bool { return true }), MessageWorkers: 1, Logger: discardLogger(),
+	}).Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "scheduler") {
+		t.Fatalf("Run error = %v, want scheduler fatal error", err)
+	}
+	waitClosed(t, clientStopped, "client cancellation")
+}
+
+func TestRunTreatsEarlyOneBotReturnAsFatal(t *testing.T) {
+	db := openStore(t, filepath.Join(t.TempDir(), "tasks.db"))
+	defer closeStore(t, db)
+
+	schedulerStopped := make(chan struct{})
+	err := (App{
+		Store:     db,
+		Client:    clientFunc(func(context.Context, onebot.Handler) error { return errors.New("invalid onebot configuration") }),
+		Scheduler: schedulerFunc(func(ctx context.Context) error { <-ctx.Done(); close(schedulerStopped); return nil }),
+		Service:   serviceFunc(func(context.Context, tasksvc.Message) error { return nil }),
+		Groups:    groupFunc(func(string) bool { return true }), MessageWorkers: 1, Logger: discardLogger(),
+	}).Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "onebot") {
+		t.Fatalf("Run error = %v, want OneBot fatal error", err)
+	}
+	waitClosed(t, schedulerStopped, "scheduler cancellation")
+}
+
+type fakeOneBot struct {
+	server   *httptest.Server
+	selfID   string
+	token    string
+	events   chan json.RawMessage
+	messages chan string
+	ready    chan struct{}
+	readyOne sync.Once
+}
+
+func newFakeOneBot(t *testing.T, selfID, token string) *fakeOneBot {
+	t.Helper()
+	fake := &fakeOneBot{
+		selfID: selfID, token: token, events: make(chan json.RawMessage, 32),
+		messages: make(chan string, 64), ready: make(chan struct{}),
+	}
+	fake.server = httptest.NewServer(http.HandlerFunc(fake.serve))
+	return fake
+}
+
+func (f *fakeOneBot) URL() string { return "ws" + strings.TrimPrefix(f.server.URL, "http") }
+
+func (f *fakeOneBot) Close() { f.server.Close() }
+
+func (f *fakeOneBot) WaitReady(t *testing.T) { waitClosed(t, f.ready, "OneBot connection") }
+
+func (f *fakeOneBot) Send(t *testing.T, event json.RawMessage) {
+	t.Helper()
+	select {
+	case f.events <- event:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out sending OneBot event")
+	}
+}
+
+func (f *fakeOneBot) WaitText(t *testing.T, match func(string) bool) string {
+	t.Helper()
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case text := <-f.messages:
+			if match(text) {
+				return text
+			}
+		case <-timer.C:
+			t.Fatal("timed out waiting for OneBot notification")
+			return ""
+		}
+	}
+}
+
+func (f *fakeOneBot) serve(response http.ResponseWriter, request *http.Request) {
+	if request.Header.Get("Authorization") != "Bearer "+f.token {
+		http.Error(response, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	conn, err := websocket.Accept(response, request, nil)
+	if err != nil {
+		return
+	}
+	defer func() { _ = conn.CloseNow() }()
+	f.readyOne.Do(func() { close(f.ready) })
+
+	requests := make(chan onebot.ActionRequest)
+	readerDone := make(chan struct{})
+	go func() {
+		defer close(readerDone)
+		for {
+			var action onebot.ActionRequest
+			if err := wsjson.Read(request.Context(), conn, &action); err != nil {
+				return
+			}
+			select {
+			case requests <- action:
+			case <-request.Context().Done():
+				return
+			}
+		}
+	}()
+	for {
+		select {
+		case raw := <-f.events:
+			if err := wsjson.Write(request.Context(), conn, raw); err != nil {
+				return
+			}
+		case action := <-requests:
+			text := actionText(action)
+			select {
+			case f.messages <- text:
+			case <-request.Context().Done():
+				return
+			}
+			result := onebot.ActionResponse{Status: "ok", RetCode: 0, Echo: action.Echo}
+			if err := wsjson.Write(request.Context(), conn, result); err != nil {
+				return
+			}
+		case <-readerDone:
+			return
+		case <-request.Context().Done():
+			return
+		}
+	}
+}
+
+func actionText(action onebot.ActionRequest) string {
+	var result strings.Builder
+	for _, segment := range action.Params.Message {
+		if segment.Type != "text" {
+			continue
+		}
+		var text string
+		if json.Unmarshal(segment.Data["text"], &text) == nil {
+			result.WriteString(text)
+		}
+	}
+	return result.String()
+}
+
+func groupEvent(messageID, groupID, userID, selfID, text string, mentioned bool) json.RawMessage {
+	segments := []map[string]any{}
+	if mentioned {
+		segments = append(segments, map[string]any{"type": "at", "data": map[string]string{"qq": selfID}})
+	}
+	segments = append(segments, map[string]any{"type": "text", "data": map[string]string{"text": text}})
+	event := map[string]any{
+		"post_type": "message", "message_type": "group", "message_id": messageID,
+		"group_id": groupID, "user_id": userID, "self_id": selfID, "message": segments,
+	}
+	data, err := json.Marshal(event)
+	if err != nil {
+		panic(err)
+	}
+	return data
+}
+
+type e2eOperator struct {
+	repo, remote            string
+	pushes, merges, deploys atomic.Int32
+}
+
+func (o *e2eOperator) Sync(ctx context.Context, _ string) error {
+	return runGitCommand(ctx, o.repo, "fetch", "origin")
+}
+
+func (o *e2eOperator) PushTask(ctx context.Context, _, taskID, branch, commit string) error {
+	if gitCommandOutput(ctx, o.repo, "rev-parse", branch) != commit {
+		return errors.New("task commit does not match branch")
+	}
+	if err := runGitCommand(ctx, o.repo, "push", "origin", "refs/heads/"+branch+":refs/heads/"+branch); err != nil {
+		return err
+	}
+	if err := runGitCommand(ctx, o.repo, "fetch", "origin"); err != nil {
+		return err
+	}
+	o.pushes.Add(1)
+	return nil
+}
+
+func (o *e2eOperator) MergeRC(ctx context.Context, _, taskID, commit string) (string, error) {
+	root, err := os.MkdirTemp("", "qqcodex-e2e-merge-")
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = os.RemoveAll(root) }()
+	if err := runCommand(ctx, "", "git", "clone", o.remote, root); err != nil {
+		return "", err
+	}
+	for _, args := range [][]string{
+		{"config", "user.name", "QQ Codex E2E"},
+		{"config", "user.email", "qqcodex-e2e@example.invalid"},
+		{"checkout", "-b", "rc", "origin/rc"},
+		{"merge", "--no-ff", commit, "-m", "merge " + taskID},
+		{"push", "origin", "refs/heads/rc:refs/heads/rc"},
+	} {
+		if err := runGitCommand(ctx, root, args...); err != nil {
+			return "", err
+		}
+	}
+	rcCommit := gitCommandOutput(ctx, root, "rev-parse", "HEAD")
+	if len(rcCommit) != 40 {
+		return "", errors.New("invalid merged commit")
+	}
+	o.merges.Add(1)
+	return rcCommit, nil
+}
+
+func (o *e2eOperator) DeployRC(context.Context, string, string, string) error {
+	o.deploys.Add(1)
+	return nil
+}
+
+func createGitProject(t *testing.T, root string) (string, string) {
+	t.Helper()
+	remote := filepath.Join(root, "remote.git")
+	repo := filepath.Join(root, "repo")
+	runTestCommand(t, "", "git", "init", "--bare", remote)
+	runTestCommand(t, "", "git", "init", "-b", "main", repo)
+	runTestCommand(t, repo, "git", "config", "user.name", "QQ Codex E2E")
+	runTestCommand(t, repo, "git", "config", "user.email", "qqcodex-e2e@example.invalid")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("base\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runTestCommand(t, repo, "git", "add", "README.md")
+	runTestCommand(t, repo, "git", "commit", "-m", "base")
+	runTestCommand(t, repo, "git", "remote", "add", "origin", remote)
+	runTestCommand(t, repo, "git", "push", "-u", "origin", "main")
+	runTestCommand(t, repo, "git", "branch", "rc")
+	runTestCommand(t, repo, "git", "push", "origin", "rc")
+	return repo, remote
+}
+
+func createFakeCodex(t *testing.T, root string) string {
+	t.Helper()
+	path := filepath.Join(root, "fake-codex")
+	script := `#!/bin/sh
+set -eu
+last=''
+schema=''
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o) shift; last="$1" ;;
+    --output-schema) shift; schema="$1" ;;
+  esac
+  shift
+done
+if [ -n "$schema" ]; then
+  final='{"summary":"e2e plan","scope":["repository"],"checks":["git status"],"risks":[]}'
+  session='planning-session'
+else
+  printf 'changed by fake codex\n' > qqcodex-e2e.txt
+  git add qqcodex-e2e.txt
+  git -c user.name='QQ Codex E2E' -c user.email='qqcodex-e2e@example.invalid' commit -m 'implement e2e task' >/dev/null 2>&1
+  printf 'execute\n' >> "$QQCODEX_EXEC_COUNT"
+  final='implementation complete'
+  session='e2e-session'
+fi
+printf '%s' "$final" > "$last"
+printf '{"type":"thread.started","thread_id":"%s"}\n' "$session"
+`
+	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func waitTaskStatus(t *testing.T, db *store.Store, taskID string, want model.Status) {
+	t.Helper()
+	deadline := time.NewTimer(10 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	var last model.Status
+	for {
+		task, err := db.GetTask(context.Background(), taskID)
+		if err == nil {
+			last = task.Status
+			if task.Status == want {
+				return
+			}
+			if task.Status == model.StatusFailed || task.Status == model.StatusMergeConflict || task.Status == model.StatusDeployFailed {
+				t.Fatalf("task reached %q while waiting for %q: %s", task.Status, want, task.Failure)
+			}
+		}
+		select {
+		case <-ticker.C:
+		case <-deadline.C:
+			t.Fatalf("timed out waiting for task %s status %q; last=%q", taskID, want, last)
+		}
+	}
+}
+
+func gitOutput(t *testing.T, repo string, args ...string) string {
+	t.Helper()
+	cmdArgs := append([]string{"-C", repo}, args...)
+	output, err := exec.Command("git", cmdArgs...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v: %s", args, err, output)
+	}
+	return strings.TrimSpace(string(output))
+}
+
+func runTestCommand(t *testing.T, dir, name string, args ...string) {
+	t.Helper()
+	if err := runCommand(context.Background(), dir, name, args...); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func runGitCommand(ctx context.Context, repo string, args ...string) error {
+	return runCommand(ctx, repo, "git", args...)
+}
+
+func gitCommandOutput(ctx context.Context, repo string, args ...string) string {
+	cmdArgs := append([]string{"-C", repo}, args...)
+	output, err := exec.CommandContext(ctx, "git", cmdArgs...).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(output))
+}
+
+func runCommand(ctx context.Context, dir, name string, args ...string) error {
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Dir = dir
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s failed: %w: %s", name, err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+type serviceFunc func(context.Context, tasksvc.Message) error
+
+func (f serviceFunc) Handle(ctx context.Context, message tasksvc.Message) error {
+	return f(ctx, message)
+}
+
+type groupFunc func(string) bool
+
+func (f groupFunc) AllowedGroup(groupID string) bool { return f(groupID) }
+
+type clientFunc func(context.Context, onebot.Handler) error
+
+func (f clientFunc) Run(ctx context.Context, handler onebot.Handler) error { return f(ctx, handler) }
+
+type schedulerFunc func(context.Context) error
+
+func (f schedulerFunc) Run(ctx context.Context) error { return f(ctx) }
+
+type blockingClient struct{ started chan struct{} }
+
+func (c blockingClient) Run(ctx context.Context, _ onebot.Handler) error {
+	if c.started != nil {
+		close(c.started)
+	}
+	<-ctx.Done()
+	return nil
+}
+
+type blockingScheduler struct{ started chan struct{} }
+
+func (s blockingScheduler) Run(ctx context.Context) error {
+	if s.started != nil {
+		close(s.started)
+	}
+	<-ctx.Done()
+	return nil
+}
+
+type countingClient struct{ calls atomic.Int32 }
+
+func (c *countingClient) Run(ctx context.Context, _ onebot.Handler) error {
+	c.calls.Add(1)
+	<-ctx.Done()
+	return nil
+}
+
+type countingScheduler struct{ calls atomic.Int32 }
+
+func (s *countingScheduler) Run(ctx context.Context) error {
+	s.calls.Add(1)
+	<-ctx.Done()
+	return nil
+}
+
+type emittingClient struct{ messages []onebot.GroupMessage }
+
+func (c emittingClient) Run(ctx context.Context, handler onebot.Handler) error {
+	for _, message := range c.messages {
+		if err := handler(ctx, message); err != nil {
+			return err
+		}
+	}
+	<-ctx.Done()
+	return nil
+}
+
+type lockedWriter struct {
+	mu     sync.Mutex
+	writer io.Writer
+	wrote  chan struct{}
+	once   sync.Once
+}
+
+func (w *lockedWriter) Write(data []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	n, err := w.writer.Write(data)
+	if w.wrote != nil {
+		w.once.Do(func() { close(w.wrote) })
+	}
+	return n, err
+}
+
+func openStore(t *testing.T, path string) *store.Store {
+	t.Helper()
+	db, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return db
+}
+
+func closeStore(t *testing.T, db *store.Store) {
+	t.Helper()
+	if err := db.Close(); err != nil {
+		t.Errorf("close store: %v", err)
+	}
+}
+
+func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
+
+func waitClosed(t *testing.T, ch <-chan struct{}, label string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for %s", label)
+	}
+}
+
+func waitError(t *testing.T, ch <-chan error, label string) error {
+	t.Helper()
+	select {
+	case err := <-ch:
+		return err
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for %s", label)
+		return nil
+	}
+}
