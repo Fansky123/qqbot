@@ -24,21 +24,22 @@ import (
 )
 
 const (
-	maxEventBytes             = 3 << 20
-	maxEventsResultBytes      = 1 << 20
-	maxStderrBytes            = 1 << 20
-	maxFinalBytes             = 1 << 20
-	maxBlockedReasonRunes     = 512
-	finalTruncationMarker     = "\n[codex final output truncated]\n"
-	finalOutputPath           = "/proc/self/fd/3"
-	finalDrainTimeout         = time.Second
-	consultationWorkspacePath = "/workspace"
-	consultationRunPath       = "/run/qqcodex"
-	consultationHomePath      = consultationRunPath + "/home"
-	consultationCodexHomePath = consultationRunPath + "/codex-home"
-	consultationCodexPath     = consultationRunPath + "/bin/codex"
-	consultationPATH          = "/usr/bin:/bin"
-	consultationConfigFD      = 4
+	maxEventBytes                = 3 << 20
+	maxEventsResultBytes         = 1 << 20
+	maxStderrBytes               = 1 << 20
+	maxFinalBytes                = 1 << 20
+	maxBlockedReasonRunes        = 512
+	finalTruncationMarker        = "\n[codex final output truncated]\n"
+	finalOutputPath              = "/proc/self/fd/3"
+	finalDrainTimeout            = time.Second
+	consultationWorkspacePath    = "/workspace"
+	consultationRunPath          = "/run/qqcodex"
+	consultationHomePath         = consultationRunPath + "/home"
+	consultationCodexHomePath    = consultationRunPath + "/codex-home"
+	consultationCodexPath        = consultationRunPath + "/bin/codex"
+	consultationCodeModeHostPath = consultationRunPath + "/bin/codex-code-mode-host"
+	consultationPATH             = "/usr/bin:/bin"
+	consultationConfigFD         = 4
 )
 
 // ErrFinalTooLarge reports that Result.Final was replaced with a fixed marker.
@@ -82,11 +83,12 @@ type LogSink interface {
 }
 
 type Runner struct {
-	Binary                    string
-	ConsultationSandboxBinary string
-	KeepEnv                   []string
-	LogDir                    string
-	Log                       LogSink
+	Binary                         string
+	ConsultationSandboxBinary      string
+	ConsultationCodeModeHostBinary string
+	KeepEnv                        []string
+	LogDir                         string
+	Log                            LogSink
 }
 
 type invocation int
@@ -124,6 +126,13 @@ func (r Runner) run(parent context.Context, req Request, kind invocation) (resul
 	binary, sandboxBinary, env, toolEnv, err := r.validate(req, kind)
 	if err != nil {
 		return Result{}, err
+	}
+	var codeModeHostBinary string
+	if kind == invocationConsult {
+		codeModeHostBinary, err = resolveExecutable(r.ConsultationCodeModeHostBinary, "consultation code mode host")
+		if err != nil {
+			return Result{}, err
+		}
 	}
 	if kind == invocationExecute || kind == invocationResume {
 		tempDir, err := privateTempDir(req.GitCommonDir)
@@ -183,7 +192,7 @@ func (r Runner) run(parent context.Context, req Request, kind invocation) (resul
 			return Result{}, err
 		}
 		args = invocationArgs(kind, req, schemaPath, finalOutputPath, nil)
-		args = append(consultationSandboxArgs(binary, req, consultationConfigFD), args...)
+		args = append(consultationSandboxArgs(binary, codeModeHostBinary, req, consultationConfigFD), args...)
 		command = sandboxBinary
 		commandEnv = consultationEnvironment(env, binary, token)
 	}
@@ -619,17 +628,17 @@ func invocationArgs(kind invocation, req Request, schemaPath, lastPath string, t
 	}
 }
 
-func consultationSandboxArgs(binary string, req Request, configFD int) []string {
-	return consultationSandboxCommandArgs(binary, req.WorkingDir, configFD, consultationCodexPath)
+func consultationSandboxArgs(binary, codeModeHostBinary string, req Request, configFD int) []string {
+	return consultationSandboxCommandArgs(binary, codeModeHostBinary, req.WorkingDir, configFD, consultationCodexPath)
 }
 
 // ConsultationSandboxProbeArgs returns the production consultation mount shape
 // with a harmless command and the config supplied as the sole ExtraFile (fd 3).
-func ConsultationSandboxProbeArgs(binary, workspace string) []string {
-	return consultationSandboxCommandArgs(binary, workspace, 3, "/bin/true")
+func ConsultationSandboxProbeArgs(binary, codeModeHostBinary, workspace string) []string {
+	return consultationSandboxCommandArgs(binary, codeModeHostBinary, workspace, 3, "/bin/true")
 }
 
-func consultationSandboxCommandArgs(binary, workspace string, configFD int, command string) []string {
+func consultationSandboxCommandArgs(binary, codeModeHostBinary, workspace string, configFD int, command string) []string {
 	args := []string{
 		"--die-with-parent", "--new-session", "--unshare-all", "--share-net", "--unshare-user", "--cap-drop", "ALL",
 		"--ro-bind", "/usr", "/usr",
@@ -655,6 +664,7 @@ func consultationSandboxCommandArgs(binary, workspace string, configFD int, comm
 		"--dir", consultationCodexHomePath,
 		"--dir", consultationRunPath + "/bin",
 		"--ro-bind", binary, consultationCodexPath,
+		"--ro-bind", codeModeHostBinary, consultationCodeModeHostPath,
 		"--ro-bind", workspace, consultationWorkspacePath,
 		"--ro-bind-data", strconv.Itoa(configFD), consultationCodexHomePath + "/config.toml",
 		"--setenv", "HOME", consultationHomePath,

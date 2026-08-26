@@ -301,7 +301,7 @@ func TestRunnerPlanArgumentsAndTemporaryFiles(t *testing.T) {
 
 func TestConsultationSandboxArgumentsUseOnlyApprovedReadBoundary(t *testing.T) {
 	workingDir := "/host/projects/selected"
-	args := consultationSandboxArgs("/host/bin/codex", Request{WorkingDir: workingDir}, 4)
+	args := consultationSandboxArgs("/host/bin/codex", "/host/bin/codex-code-mode-host", Request{WorkingDir: workingDir}, 4)
 
 	for _, sequence := range [][]string{
 		{"--die-with-parent", "--new-session", "--unshare-all", "--share-net", "--unshare-user", "--cap-drop", "ALL"},
@@ -312,6 +312,7 @@ func TestConsultationSandboxArgumentsUseOnlyApprovedReadBoundary(t *testing.T) {
 		{"--ro-bind-try", "/etc/ssl/openssl.cnf", "/etc/ssl/openssl.cnf"}, {"--ro-bind-try", "/etc/resolv.conf", "/etc/resolv.conf"},
 		{"--ro-bind-try", "/etc/hosts", "/etc/hosts"}, {"--ro-bind-try", "/etc/nsswitch.conf", "/etc/nsswitch.conf"}, {"--ro-bind-try", "/etc/gai.conf", "/etc/gai.conf"},
 		{"--tmpfs", "/run"}, {"--ro-bind", "/host/bin/codex", consultationCodexPath}, {"--ro-bind", workingDir, consultationWorkspacePath},
+		{"--ro-bind", "/host/bin/codex-code-mode-host", consultationRunPath + "/bin/codex-code-mode-host"},
 		{"--ro-bind-data", "4", consultationCodexHomePath + "/config.toml"},
 		{"--setenv", "HOME", consultationHomePath}, {"--setenv", "CODEX_HOME", consultationCodexHomePath},
 		{"--setenv", "TMPDIR", "/tmp"}, {"--setenv", "TMP", "/tmp"}, {"--setenv", "TEMP", "/tmp"}, {"--chdir", consultationWorkspacePath},
@@ -325,7 +326,8 @@ func TestConsultationSandboxArgumentsUseOnlyApprovedReadBoundary(t *testing.T) {
 	allowedMountSources := map[string]bool{
 		"/usr": true, "/etc/ssl/certs": true, "/etc/ssl/openssl.cnf": true, "/etc/resolv.conf": true,
 		"/etc/hosts": true, "/etc/nsswitch.conf": true, "/etc/gai.conf": true, "/host/bin/codex": true,
-		workingDir: true,
+		"/host/bin/codex-code-mode-host": true,
+		workingDir:                       true,
 	}
 	for i, arg := range args {
 		if arg != "--ro-bind" && arg != "--ro-bind-try" && arg != "--bind" {
@@ -476,6 +478,18 @@ func TestRunnerAskRequiresSandboxBinary(t *testing.T) {
 		_, err := runner.Ask(context.Background(), Request{TaskID: "Q-012345ABCDEF", WorkingDir: t.TempDir(), Prompt: "consult", Timeout: time.Second})
 		if err == nil || !strings.Contains(err.Error(), "consultation sandbox") {
 			t.Fatalf("Ask() error = %v, want sandbox validation error", err)
+		}
+		assertNotCreated(t, recordPath)
+	}
+}
+
+func TestRunnerAskRequiresCodeModeHostBinary(t *testing.T) {
+	for _, companion := range []string{"", filepath.Join(t.TempDir(), "missing-code-mode-host")} {
+		runner, _, recordPath := helperRunner(t)
+		runner.ConsultationCodeModeHostBinary = companion
+		_, err := runner.Ask(context.Background(), Request{TaskID: "Q-012345ABCDEF", WorkingDir: t.TempDir(), Prompt: "consult", Timeout: time.Second})
+		if err == nil || !strings.Contains(err.Error(), "consultation code mode host") {
+			t.Fatalf("Ask() error = %v, want code mode host validation error", err)
 		}
 		assertNotCreated(t, recordPath)
 	}
@@ -962,11 +976,25 @@ func TestConsultationProxyCancellationClosesSlowAuthenticatedBody(t *testing.T) 
 	}
 }
 
-func TestRunnerPlanDoesNotRequireConsultationSandbox(t *testing.T) {
-	runner, req, _ := helperRunner(t)
-	runner.ConsultationSandboxBinary = ""
-	if _, err := runner.Plan(context.Background(), req); err != nil {
-		t.Fatalf("Plan() error = %v", err)
+func TestRunnerTaskInvocationsDoNotRequireConsultationBinaries(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		run  func(Runner, Request) (Result, error)
+	}{
+		{name: "plan", run: func(r Runner, req Request) (Result, error) { return r.Plan(context.Background(), req) }},
+		{name: "execute", run: func(r Runner, req Request) (Result, error) { return r.Execute(context.Background(), req) }},
+		{name: "resume", run: func(r Runner, req Request) (Result, error) { return r.Resume(context.Background(), req) }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			runner, req, _ := helperRunner(t)
+			runner.ConsultationSandboxBinary = ""
+			runner.ConsultationCodeModeHostBinary = ""
+			req.GitCommonDir = t.TempDir()
+			req.SessionID = "thread-123"
+			if _, err := tt.run(runner, req); err != nil {
+				t.Fatalf("%s error = %v", tt.name, err)
+			}
+		})
 	}
 }
 
@@ -2112,10 +2140,11 @@ func helperRunner(t *testing.T) (Runner, Request, string) {
 	workingDir := t.TempDir()
 	logDir := filepath.Join(t.TempDir(), "logs")
 	return Runner{
-			Binary:                    os.Args[0],
-			ConsultationSandboxBinary: "/usr/bin/bwrap",
-			KeepEnv:                   []string{helperEnabled, helperRecord},
-			LogDir:                    logDir,
+			Binary:                         os.Args[0],
+			ConsultationSandboxBinary:      "/usr/bin/bwrap",
+			ConsultationCodeModeHostBinary: os.Args[0],
+			KeepEnv:                        []string{helperEnabled, helperRecord},
+			LogDir:                         logDir,
 		}, Request{
 			TaskID:     "task-123",
 			WorkingDir: workingDir,

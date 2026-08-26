@@ -39,7 +39,7 @@ type sandboxStartupOptions struct {
 	path, root   string
 	trustedUID   uint32
 	probeTimeout time.Duration
-	probe        func(context.Context, string, string, string) error
+	probe        func(context.Context, string, string, string, string) error
 }
 
 func main() {
@@ -185,6 +185,10 @@ func validateStartupWithSandbox(cfg *config.Config, sandbox sandboxStartupOption
 		return err
 	}
 	cfg.Codex.Binary = binary
+	codeModeHostBinary, err := resolveCodexCodeModeHostExecutable(binary)
+	if err != nil {
+		return err
+	}
 	if sandbox.probe == nil || sandbox.probeTimeout <= 0 || validateTrustedSandboxExecutable(sandbox.root, sandbox.path, sandbox.trustedUID) != nil {
 		return errors.New("consultation sandbox is invalid")
 	}
@@ -211,10 +215,11 @@ func validateStartupWithSandbox(cfg *config.Config, sandbox sandboxStartupOption
 	}
 	probeCtx, cancel := context.WithTimeout(context.Background(), sandbox.probeTimeout)
 	defer cancel()
-	if err := sandbox.probe(probeCtx, sandbox.path, cfg.Codex.Binary, cfg.Consultation.Workspace); err != nil || probeCtx.Err() != nil {
+	if err := sandbox.probe(probeCtx, sandbox.path, cfg.Codex.Binary, codeModeHostBinary, cfg.Consultation.Workspace); err != nil || probeCtx.Err() != nil {
 		return errors.New("consultation sandbox probe failed")
 	}
 	cfg.Consultation.SandboxBinary = sandbox.path
+	cfg.Consultation.CodeModeHostBinary = codeModeHostBinary
 	return nil
 }
 
@@ -230,6 +235,15 @@ func resolveCodexExecutable(name string) (string, error) {
 	info, err := os.Stat(binary)
 	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
 		return "", errors.New("codex binary is invalid")
+	}
+	return binary, nil
+}
+
+func resolveCodexCodeModeHostExecutable(codexBinary string) (string, error) {
+	binary := filepath.Join(filepath.Dir(codexBinary), "codex-code-mode-host")
+	info, err := os.Stat(binary)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+		return "", errors.New("codex code mode host is invalid")
 	}
 	return binary, nil
 }
@@ -271,7 +285,7 @@ func validateTrustedSandboxExecutable(root, path string, trustedUID uint32) erro
 	return nil
 }
 
-func probeConsultationSandbox(ctx context.Context, binary, codexBinary, workspace string) error {
+func probeConsultationSandbox(ctx context.Context, binary, codexBinary, codeModeHostBinary, workspace string) error {
 	configFile, err := os.CreateTemp(workspace, ".sandbox-probe-config-*.toml")
 	if err != nil {
 		return err
@@ -285,7 +299,7 @@ func probeConsultationSandbox(ctx context.Context, binary, codexBinary, workspac
 		return err
 	}
 
-	args := codex.ConsultationSandboxProbeArgs(codexBinary, workspace)
+	args := codex.ConsultationSandboxProbeArgs(codexBinary, codeModeHostBinary, workspace)
 	cmd := exec.CommandContext(ctx, binary, args...)
 	cmd.Dir = workspace
 	cmd.Env = []string{"PATH=/usr/bin:/bin"}
@@ -298,7 +312,7 @@ func probeConsultationSandbox(ctx context.Context, binary, codexBinary, workspac
 
 func newCodexRunner(cfg config.Config, logs codex.LogSink) *codex.Runner {
 	return &codex.Runner{
-		Binary: cfg.Codex.Binary, ConsultationSandboxBinary: cfg.Consultation.SandboxBinary,
+		Binary: cfg.Codex.Binary, ConsultationSandboxBinary: cfg.Consultation.SandboxBinary, ConsultationCodeModeHostBinary: cfg.Consultation.CodeModeHostBinary,
 		KeepEnv: cfg.Codex.EnvironmentKeep, LogDir: cfg.LogDir, Log: logs,
 	}
 }

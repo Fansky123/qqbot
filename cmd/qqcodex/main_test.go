@@ -124,8 +124,9 @@ func TestValidateStartupAcceptsValidGitConfig(t *testing.T) {
 func TestCleanupStartupIgnoresConsultationSandbox(t *testing.T) {
 	cfg, _ := validGitConfig(t)
 	cfg.Consultation.SandboxBinary = "/missing/bwrap"
+	cfg.Consultation.CodeModeHostBinary = "/missing/codex-code-mode-host"
 	if err := validateCleanupStartup(&cfg); err != nil {
-		t.Fatalf("cleanup validation required consultation sandbox: %v", err)
+		t.Fatalf("cleanup validation required consultation binaries: %v", err)
 	}
 }
 
@@ -133,9 +134,10 @@ func TestNewCodexRunnerReceivesConsultationSandbox(t *testing.T) {
 	cfg := validConfig(t)
 	cfg.Codex.Binary = "/opt/codex"
 	cfg.Consultation.SandboxBinary = "/usr/bin/bwrap"
+	cfg.Consultation.CodeModeHostBinary = "/opt/codex-code-mode-host"
 	runner := newCodexRunner(cfg, nil)
-	if runner.Binary != cfg.Codex.Binary || runner.ConsultationSandboxBinary != cfg.Consultation.SandboxBinary {
-		t.Fatalf("runner binaries = %q/%q, want %q/%q", runner.Binary, runner.ConsultationSandboxBinary, cfg.Codex.Binary, cfg.Consultation.SandboxBinary)
+	if runner.Binary != cfg.Codex.Binary || runner.ConsultationSandboxBinary != cfg.Consultation.SandboxBinary || runner.ConsultationCodeModeHostBinary != cfg.Consultation.CodeModeHostBinary {
+		t.Fatalf("runner binaries = %q/%q/%q, want %q/%q/%q", runner.Binary, runner.ConsultationSandboxBinary, runner.ConsultationCodeModeHostBinary, cfg.Codex.Binary, cfg.Consultation.SandboxBinary, cfg.Consultation.CodeModeHostBinary)
 	}
 }
 
@@ -521,10 +523,13 @@ func validGitConfig(t *testing.T) (config.Config, string) {
 	if err := os.WriteFile(opsPath, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	codexBinary := filepath.Join(root, "codex")
+	writeExecutable(t, codexBinary)
+	writeExecutable(t, filepath.Join(root, "codex-code-mode-host"))
 	return config.Config{
 		OneBot:       config.OneBotConfig{URL: "ws://127.0.0.1:3001", AccessTokenEnv: "TOKEN", SelfID: "10000", MessageRunes: 1200},
 		DatabasePath: filepath.Join(state, "tasks.db"), LogDir: filepath.Join(root, "logs"), WorktreeRoot: filepath.Join(root, "worktrees"), Consultation: config.ConsultationConfig{Workspace: filepath.Join(root, "consultation"), TimeoutSeconds: 90}, MessageWorkers: 1,
-		Codex: config.CodexConfig{Binary: "/bin/sh"}, OpsCommand: []string{"/bin/true", "-config", opsPath},
+		Codex: config.CodexConfig{Binary: codexBinary}, OpsCommand: []string{"/bin/true", "-config", opsPath},
 		Projects: []config.Project{{ID: "project", Aliases: []string{"p"}, RepoPath: repo, BaseBranch: "main", RCBranch: "rc", Remote: "origin", Checks: [][]string{{"/bin/sh", "-c", "true"}}, DeployAction: "deploy", MaxConcurrent: 1, CodexTimeoutSeconds: 30, LogRetentionDays: 7}},
 	}, opsPath
 }

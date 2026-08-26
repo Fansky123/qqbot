@@ -37,9 +37,10 @@ type CodexConfig struct {
 }
 
 type ConsultationConfig struct {
-	Workspace      string `json:"workspace"`
-	TimeoutSeconds int    `json:"timeout_seconds"`
-	SandboxBinary  string `json:"-"`
+	Workspace          string `json:"workspace"`
+	TimeoutSeconds     int    `json:"timeout_seconds"`
+	SandboxBinary      string `json:"-"`
+	CodeModeHostBinary string `json:"-"`
 }
 
 type Project struct {
