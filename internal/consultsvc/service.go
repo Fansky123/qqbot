@@ -24,8 +24,10 @@ const (
 	maxMessageRunes = 4000
 	maxReplyBytes   = 1 << 20
 	pollInterval    = 20 * time.Millisecond
-	leaseBuffer     = time.Second
-	failureReply    = "咨询暂时失败，请稍后重试。"
+	// Runner cleanup can consume 1s each for process WaitDelay, final-output drain,
+	// and proxy shutdown. Keep extra scheduling margin before another owner reclaims.
+	leaseCleanupBuffer = 10 * time.Second
+	failureReply       = "咨询暂时无法完成，请稍后重试"
 )
 
 var (
@@ -48,12 +50,14 @@ type Service struct {
 	runner     Asker
 	notifier   tasksvc.Notifier
 	redactor   tasksvc.TextRedactor
+	now        func() time.Time
+	wait       func(context.Context, time.Duration) error
 }
 
 func NewService(registry *config.Registry, consultation config.ConsultationConfig, db *store.Store, authorizer auth.Authorizer, runner Asker, notifier tasksvc.Notifier, redactor tasksvc.TextRedactor) *Service {
 	return &Service{
 		registry: registry, config: consultation, db: db, authorizer: authorizer,
-		runner: runner, notifier: notifier, redactor: redactor,
+		runner: runner, notifier: notifier, redactor: redactor, now: time.Now, wait: waitContext,
 	}
 }
 
@@ -67,7 +71,7 @@ func (s *Service) Handle(ctx context.Context, message tasksvc.Message) error {
 	if ctx == nil {
 		return errors.New("context is required")
 	}
-	if s == nil || s.registry == nil || s.db == nil || s.runner == nil || s.notifier == nil || s.redactor == nil || s.config.Workspace == "" || s.config.TimeoutSeconds <= 0 {
+	if s == nil || s.registry == nil || s.db == nil || s.runner == nil || s.notifier == nil || s.redactor == nil || s.now == nil || s.wait == nil || s.config.Workspace == "" || s.config.TimeoutSeconds <= 0 {
 		return errors.New("consultation service is not configured")
 	}
 	if message.GroupID == "" || message.UserID == "" || message.MessageID == "" {
@@ -89,7 +93,7 @@ func (s *Service) Handle(ctx context.Context, message tasksvc.Message) error {
 		return err
 	}
 
-	now := time.Now().UTC()
+	now := s.now().UTC()
 	token, err := newLeaseToken()
 	if err != nil {
 		return fatalStore(err)
@@ -97,7 +101,7 @@ func (s *Service) Handle(ctx context.Context, message tasksvc.Message) error {
 	consultation := &model.Consultation{
 		ID: ConsultationID(message.GroupID, message.MessageID), GroupID: message.GroupID, MessageID: message.MessageID,
 		UserID: message.UserID, ProjectID: projectID, Question: parsed.Body, LeaseToken: token,
-		LeaseExpiresAt: now.Add(s.timeout() + leaseBuffer), CreatedAt: now, UpdatedAt: now,
+		LeaseExpiresAt: now.Add(s.timeout() + leaseCleanupBuffer), CreatedAt: now, UpdatedAt: now,
 	}
 	if err := s.db.CreateConsultation(ctx, consultation); err == nil {
 		return s.runOwned(ctx, message.GroupID, consultation, workingDir)
@@ -146,13 +150,13 @@ func (s *Service) awaitOrReclaim(ctx context.Context, groupID string, expected *
 			return s.send(ctx, groupID, current.Reply)
 		}
 
-		now := time.Now().UTC()
+		now := s.now().UTC()
 		if !current.LeaseExpiresAt.After(now) {
 			token, err := newLeaseToken()
 			if err != nil {
 				return fatalStore(err)
 			}
-			leaseUntil := now.Add(s.timeout() + leaseBuffer)
+			leaseUntil := now.Add(s.timeout() + leaseCleanupBuffer)
 			claimed, err := s.db.TryReclaimConsultation(ctx, current.ID, token, leaseUntil, now)
 			if err != nil {
 				return fatalStore(err)
@@ -166,21 +170,12 @@ func (s *Service) awaitOrReclaim(ctx context.Context, groupID string, expected *
 			continue
 		}
 
-		wait := time.Until(current.LeaseExpiresAt)
+		wait := current.LeaseExpiresAt.Sub(now)
 		if wait > pollInterval {
 			wait = pollInterval
 		}
-		timer := time.NewTimer(wait)
-		select {
-		case <-ctx.Done():
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-			return ctx.Err()
-		case <-timer.C:
+		if err := s.wait(ctx, wait); err != nil {
+			return err
 		}
 	}
 }
@@ -198,7 +193,7 @@ func (s *Service) runOwned(ctx context.Context, groupID string, consultation *mo
 
 	reply, replyErr := s.reply(result, askErr)
 	cause := errors.Join(askErr, replyErr)
-	if err := s.db.CompleteConsultation(ctx, consultation.ID, consultation.LeaseToken, reply, time.Now().UTC()); errors.Is(err, store.ErrConflict) {
+	if err := s.db.CompleteConsultation(ctx, consultation.ID, consultation.LeaseToken, reply, s.now().UTC()); errors.Is(err, store.ErrConflict) {
 		return s.awaitOrReclaim(ctx, groupID, consultation, workingDir)
 	} else if err != nil {
 		return errors.Join(cause, fatalStore(err))
@@ -242,6 +237,17 @@ func newLeaseToken() (string, error) {
 		return "", fmt.Errorf("create consultation lease token: %w", err)
 	}
 	return hex.EncodeToString(token[:]), nil
+}
+
+func waitContext(ctx context.Context, duration time.Duration) error {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func fatalStore(err error) error {

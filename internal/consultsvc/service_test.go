@@ -19,6 +19,8 @@ import (
 	"qqcodex/internal/tasksvc"
 )
 
+const wantFailureReply = "咨询暂时无法完成，请稍后重试"
+
 type fakeAsker struct {
 	mu      sync.Mutex
 	calls   []codex.Request
@@ -27,6 +29,47 @@ type fakeAsker struct {
 	started chan struct{}
 	release <-chan struct{}
 	once    sync.Once
+}
+
+type cleanupAsker struct {
+	mu      sync.Mutex
+	calls   int
+	cleanup chan struct{}
+	release <-chan struct{}
+	once    sync.Once
+}
+
+func (a *cleanupAsker) Ask(ctx context.Context, _ codex.Request) (codex.Result, error) {
+	a.mu.Lock()
+	a.calls++
+	a.mu.Unlock()
+	<-ctx.Done()
+	a.once.Do(func() { close(a.cleanup) })
+	<-a.release
+	return codex.Result{Final: "late answer"}, nil
+}
+
+func (a *cleanupAsker) Calls() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.calls
+}
+
+type fakeClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *fakeClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *fakeClock) Set(now time.Time) {
+	c.mu.Lock()
+	c.now = now
+	c.mu.Unlock()
 }
 
 func (a *fakeAsker) Ask(ctx context.Context, request codex.Request) (codex.Result, error) {
@@ -305,6 +348,94 @@ func TestServiceConcurrentDuplicateAcrossStoresCallsAskOnce(t *testing.T) {
 	}
 }
 
+func TestServiceCleanupLeasePreventsDuplicateAskWhileRunnerUnwinds(t *testing.T) {
+	if leaseCleanupBuffer < 10*time.Second {
+		t.Fatalf("lease cleanup buffer = %v, want at least 10s", leaseCleanupBuffer)
+	}
+
+	path := filepath.Join(t.TempDir(), "consultations.db")
+	firstStore := openTestStore(t, path)
+	secondStore := openTestStore(t, path)
+	cfg := testConfig(t)
+	cfg.Consultation.TimeoutSeconds = 1
+	registry, err := config.NewRegistry(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.UnixMilli(1_788_000_000_000).UTC()
+	clock := &fakeClock{now: start}
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseRunner := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseRunner)
+	runner := &cleanupAsker{cleanup: make(chan struct{}), release: release}
+	notifier := &fakeNotifier{}
+	authorizer := auth.New(cfg.AllowedGroupIDs, cfg.EmployeeIDs, cfg.AdminIDs)
+	first := NewService(registry, cfg.Consultation, firstStore, authorizer, runner, notifier, exactRedactor("never"))
+	second := NewService(registry, cfg.Consultation, secondStore, authorizer, runner, notifier, exactRedactor("never"))
+	first.now = clock.Now
+	second.now = clock.Now
+
+	wake := make(chan struct{})
+	var wakeOnce sync.Once
+	wakeDuplicate := func() { wakeOnce.Do(func() { close(wake) }) }
+	t.Cleanup(wakeDuplicate)
+	waiting := make(chan time.Duration, 1)
+	second.wait = func(ctx context.Context, duration time.Duration) error {
+		select {
+		case waiting <- duration:
+		default:
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-wake:
+			return nil
+		}
+	}
+	message := consultationMessage("g1", "u1", "cleanup-window", "hello")
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- first.Handle(context.Background(), message) }()
+	<-runner.cleanup
+
+	// The real runner has timed out but is still draining output and closing its
+	// process/proxy. Advance past the former timeout+1s lease, but remain inside
+	// the conservative cleanup lease.
+	clock.Set(start.Add(first.timeout() + time.Second + time.Millisecond))
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- second.Handle(context.Background(), message) }()
+	select {
+	case duration := <-waiting:
+		if duration <= 0 {
+			t.Fatalf("duplicate wait duration = %v", duration)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("duplicate did not wait on the live cleanup lease")
+	}
+	if runner.Calls() != 1 {
+		t.Fatalf("Ask calls during cleanup = %d, want 1", runner.Calls())
+	}
+	stored, err := firstStore.GetConsultationByMessage(context.Background(), message.GroupID, message.MessageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remaining := stored.LeaseExpiresAt.Sub(clock.Now()); remaining <= 0 {
+		t.Fatalf("cleanup lease remaining = %v", remaining)
+	}
+
+	releaseRunner()
+	if err := <-firstDone; !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("first cleanup result = %v", err)
+	}
+	wakeDuplicate()
+	if err := <-secondDone; err != nil {
+		t.Fatalf("duplicate replay result = %v", err)
+	}
+	if runner.Calls() != 1 || len(notifier.Messages()) != 2 {
+		t.Fatalf("calls=%d notifications=%v", runner.Calls(), notifier.Messages())
+	}
+}
+
 func TestServiceReclaimsExpiredAttemptAndFencesStaleLease(t *testing.T) {
 	runnerRelease := make(chan struct{})
 	runner := &fakeAsker{result: codex.Result{Final: "new answer"}, started: make(chan struct{}), release: runnerRelease}
@@ -347,14 +478,14 @@ func TestServiceAskFailureStoresAndReplaysFixedReply(t *testing.T) {
 	if err := svc.Handle(context.Background(), message); !errors.Is(err, askErr) || errors.Is(err, tasksvc.ErrFatalStore) {
 		t.Fatalf("Ask error = %v", err)
 	}
-	if got := notifier.Messages(); len(got) != 1 || got[0] != failureReply {
+	if got := notifier.Messages(); len(got) != 1 || got[0] != wantFailureReply {
 		t.Fatalf("failure notification = %v", got)
 	}
 	stored, err := db.GetConsultationByMessage(context.Background(), message.GroupID, message.MessageID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stored.Reply != failureReply || stored.CompletedAt.IsZero() {
+	if stored.Reply != wantFailureReply || stored.CompletedAt.IsZero() {
 		t.Fatalf("stored failed consultation = %#v", stored)
 	}
 	if err := svc.Handle(context.Background(), message); err != nil {
@@ -373,14 +504,14 @@ func TestServiceAskTimeoutStoresFixedReply(t *testing.T) {
 	if err := svc.Handle(context.Background(), message); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("timeout error = %v", err)
 	}
-	if got := notifier.Messages(); len(got) != 1 || got[0] != failureReply {
+	if got := notifier.Messages(); len(got) != 1 || got[0] != wantFailureReply {
 		t.Fatalf("timeout notification = %v", got)
 	}
 	stored, err := db.GetConsultationByMessage(context.Background(), message.GroupID, message.MessageID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stored.Reply != failureReply || stored.CompletedAt.IsZero() {
+	if stored.Reply != wantFailureReply || stored.CompletedAt.IsZero() {
 		t.Fatalf("stored timeout consultation = %#v", stored)
 	}
 }
@@ -416,11 +547,11 @@ func TestServiceInvalidRunnerRepliesUseFixedFailure(t *testing.T) {
 			if err := svc.Handle(context.Background(), message); err == nil {
 				t.Fatal("invalid Ask reply returned nil error")
 			}
-			if got := notifier.Messages(); len(got) != 1 || got[0] != failureReply {
+			if got := notifier.Messages(); len(got) != 1 || got[0] != wantFailureReply {
 				t.Fatalf("invalid reply notification = %v", got)
 			}
 			stored, err := db.GetConsultationByMessage(context.Background(), message.GroupID, message.MessageID)
-			if err != nil || stored.Reply != failureReply || stored.CompletedAt.IsZero() {
+			if err != nil || stored.Reply != wantFailureReply || stored.CompletedAt.IsZero() {
 				t.Fatalf("stored invalid consultation = %#v, %v", stored, err)
 			}
 		})
@@ -429,12 +560,21 @@ func TestServiceInvalidRunnerRepliesUseFixedFailure(t *testing.T) {
 
 func TestServiceWrapsStoreFailureAsFatal(t *testing.T) {
 	runner := &fakeAsker{result: codex.Result{Final: "answer"}}
-	svc, db, _, _ := newTestService(t, runner)
-	if err := db.Close(); err != nil {
+	svc, _, _, cfg := newTestService(t, runner)
+	raw, err := sql.Open("sqlite", cfg.DatabasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := raw.Close(); err != nil {
+			t.Errorf("close schema-break database: %v", err)
+		}
+	}()
+	if _, err := raw.Exec("DROP TABLE consultations"); err != nil {
 		t.Fatal(err)
 	}
 
-	err := svc.Handle(context.Background(), consultationMessage("g1", "u1", "store-failure", "hello"))
+	err = svc.Handle(context.Background(), consultationMessage("g1", "u1", "store-failure", "hello"))
 	if !errors.Is(err, tasksvc.ErrFatalStore) || len(runner.Calls()) != 0 {
 		t.Fatalf("store error = %v calls=%d", err, len(runner.Calls()))
 	}
@@ -516,7 +656,11 @@ func openTestStore(t *testing.T, path string) *store.Store {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = db.Close() })
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close consultation store: %v", err)
+		}
+	})
 	return db
 }
 
@@ -530,7 +674,11 @@ func countRows(t *testing.T, path, table string) int {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close row-count database: %v", err)
+		}
+	}()
 	var count int
 	if err := db.QueryRow("SELECT count(*) FROM " + table).Scan(&count); err != nil {
 		t.Fatal(err)
