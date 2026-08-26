@@ -529,6 +529,53 @@ func TestServiceCallerCancellationIsNotFatalStoreFailure(t *testing.T) {
 	}
 }
 
+func TestServiceCallerCancellationDurablyCompletesBeforeRetry(t *testing.T) {
+	release := make(chan struct{})
+	runner := &fakeAsker{started: make(chan struct{}), release: release}
+	svc, db, notifier, _ := newTestService(t, runner)
+	message := consultationMessage("g1", "u1", "cancel-durable", "hello")
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- svc.Handle(ctx, message) }()
+	<-runner.started
+	cancel()
+
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled Handle error = %v", err)
+	}
+	stored, err := db.GetConsultationByMessage(context.Background(), message.GroupID, message.MessageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Reply != wantFailureReply || stored.CompletedAt.IsZero() {
+		t.Fatalf("canceled consultation was not completed: %#v", stored)
+	}
+	if err := svc.Handle(context.Background(), message); err != nil {
+		t.Fatalf("retry canceled consultation: %v", err)
+	}
+	if len(runner.Calls()) != 1 || len(notifier.Messages()) != 2 || notifier.Messages()[1] != wantFailureReply {
+		t.Fatalf("calls=%d notifications=%v", len(runner.Calls()), notifier.Messages())
+	}
+}
+
+func TestDetachedCompletionStoreErrorRemainsFatalAfterCallerCancellation(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "closed.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	svc := &Service{db: db, now: time.Now}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err = svc.completeConsultation(ctx, &model.Consultation{ID: "Q-0123456789AB", LeaseToken: "lease"}, wantFailureReply)
+	if !errors.Is(err, tasksvc.ErrFatalStore) {
+		t.Fatalf("detached completion error = %v, want ErrFatalStore", err)
+	}
+}
+
 func TestServiceInvalidRunnerRepliesUseFixedFailure(t *testing.T) {
 	tests := []struct {
 		name   string

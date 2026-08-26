@@ -26,8 +26,9 @@ const (
 	pollInterval    = 20 * time.Millisecond
 	// Runner cleanup can consume 1s each for process WaitDelay, final-output drain,
 	// and proxy shutdown. Keep extra scheduling margin before another owner reclaims.
-	leaseCleanupBuffer = 10 * time.Second
-	failureReply       = "咨询暂时无法完成，请稍后重试"
+	leaseCleanupBuffer       = 10 * time.Second
+	completionPersistTimeout = 3 * time.Second
+	failureReply             = "咨询暂时无法完成，请稍后重试"
 )
 
 var (
@@ -193,12 +194,23 @@ func (s *Service) runOwned(ctx context.Context, groupID string, consultation *mo
 
 	reply, replyErr := s.reply(result, askErr)
 	cause := errors.Join(askErr, replyErr)
-	if err := s.db.CompleteConsultation(ctx, consultation.ID, consultation.LeaseToken, reply, s.now().UTC()); errors.Is(err, store.ErrConflict) {
+	if err := s.completeConsultation(ctx, consultation, reply); errors.Is(err, store.ErrConflict) {
 		return s.awaitOrReclaim(ctx, groupID, consultation, workingDir)
 	} else if err != nil {
-		return errors.Join(cause, fatalStore(err))
+		return errors.Join(cause, err)
 	}
 	return errors.Join(cause, s.send(ctx, groupID, reply))
+}
+
+func (s *Service) completeConsultation(parent context.Context, consultation *model.Consultation, reply string) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), completionPersistTimeout)
+	defer cancel()
+	err := s.db.CompleteConsultation(ctx, consultation.ID, consultation.LeaseToken, reply, s.now().UTC())
+	if err == nil || errors.Is(err, store.ErrConflict) {
+		return err
+	}
+	// This timeout belongs to the detached durability step, not the caller.
+	return errors.Join(tasksvc.ErrFatalStore, err)
 }
 
 func (s *Service) reply(result codex.Result, askErr error) (string, error) {
