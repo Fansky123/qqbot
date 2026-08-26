@@ -5,23 +5,23 @@
     "self_id": "10001",
     "message_runes": 1200
   },
-  "database_path": "/var/lib/qqcodex/tasks.db",
-  "log_dir": "/var/log/qqcodex",
-  "worktree_root": "/srv/qqcodex/worktrees",
+  "database_path": "/var/lib/qqcodex-worker/tasks.db",
+  "log_dir": "/var/log/qqcodex-worker",
+  "worktree_root": "/srv/qqcodex-worker/worktrees",
   "message_workers": 4,
   "allowed_group_ids": ["10002"],
-  "employee_ids": ["10001"],
-  "admin_ids": ["10001"],
+  "employee_ids": ["10003", "10004"],
+  "admin_ids": ["10004"],
   "codex": {
     "binary": "codex",
-    "environment_keep": ["PATH"]
+    "environment_keep": []
   },
-  "ops_command": ["/usr/local/libexec/qqcodex-ops", "-config", "/etc/qqcodex/ops.json"],
+  "ops_command": ["/usr/local/libexec/qqcodex-ops-wrapper", "-config", "/etc/qqcodex-ops/ops.json"],
   "projects": [
     {
       "id": "order-api",
       "aliases": ["orders", "订单"],
-      "repo_path": "/srv/repos/order-api",
+      "repo_path": "/srv/qqcodex-worker/repos/order-api",
       "base_branch": "main",
       "rc_branch": "rc",
       "remote": "origin",

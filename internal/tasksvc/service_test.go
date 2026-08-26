@@ -149,6 +149,27 @@ func TestServiceWrapsSQLiteFailureAsFatalStore(t *testing.T) {
 	}
 }
 
+func TestServiceRejectsUnknownUserWithoutSideEffects(t *testing.T) {
+	planner := &fakePlanner{result: planResult()}
+	svc, db, scheduler, notifier := testService(t, planner)
+	message := msg("unknown-user", "not-allowed", "[orders] must not run")
+
+	if err := svc.Handle(context.Background(), message); !errors.Is(err, errUnauthorized) {
+		t.Fatalf("unknown user error = %v, want errUnauthorized", err)
+	}
+	if planner.Calls() != 0 || scheduler.wake != 0 || len(scheduler.cancels) != 0 || len(notifier.Messages()) != 0 {
+		t.Fatalf("unknown user side effects: planner=%d wake=%d cancels=%v notifications=%v",
+			planner.Calls(), scheduler.wake, scheduler.cancels, notifier.Messages())
+	}
+	if _, err := db.GetTask(context.Background(), TaskID(message.GroupID, message.MessageID)); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("unknown user task error = %v, want ErrNotFound", err)
+	}
+	processed, err := db.MessageProcessed(context.Background(), message.GroupID+"\x00"+message.MessageID)
+	if err != nil || processed {
+		t.Fatalf("unknown user processed = %v, %v", processed, err)
+	}
+}
+
 func testService(t *testing.T, planner Planner) (*Service, *store.Store, *fakeScheduler, *fakeNotifier) {
 	return testServiceWithLogs(t, planner, fakeLogs{"OPENAI_API_KEY=raw-secret NAPCAT_ACCESS_TOKEN=raw-token " + strings.Repeat("secret ", 1000)})
 }

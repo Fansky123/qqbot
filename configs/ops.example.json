@@ -2,7 +2,7 @@
   "git_binary": "/usr/bin/git",
   "projects": {
     "order-api": {
-      "repo_path": "/srv/repos/order-api",
+      "repo_path": "/srv/qqcodex-ops/repos/order-api",
       "remote": "origin",
       "remote_url": "https://git.example.com/company/order-api.git",
       "allow_local_remote": false,
