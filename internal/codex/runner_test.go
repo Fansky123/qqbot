@@ -302,6 +302,7 @@ func TestRunnerResumeArgumentsAndWorkingDirectory(t *testing.T) {
 func TestRunnerSanitizesEnvironment(t *testing.T) {
 	runner, req, recordPath := helperRunner(t)
 	setEnv(t, "CODEX_API_KEY", "codex-key")
+	setEnv(t, "OPENAI_API_KEY", "ambient-key-must-not-win")
 	setEnv(t, "PATH", "/bin")
 	setEnv(t, "HOME", "/private/home")
 	unsetEnv(t, "CODEX_HOME")
@@ -311,21 +312,21 @@ func TestRunnerSanitizesEnvironment(t *testing.T) {
 	unsetEnv(t, "TEMP")
 	setEnv(t, "ALLOWED_CUSTOM", "kept")
 	setEnv(t, "UNKNOWN_SECRET", "must-not-leak")
-	runner.KeepEnv = append(runner.KeepEnv, "ALLOWED_CUSTOM", "PATH", "CODEX_API_KEY", "CODEX_HOME", "ALLOWED_CUSTOM")
+	runner.KeepEnv = append(runner.KeepEnv, "ALLOWED_CUSTOM", "PATH", "CODEX_API_KEY", "OPENAI_API_KEY", "CODEX_HOME", "ALLOWED_CUSTOM")
 
 	if _, err := runner.Plan(context.Background(), req); err != nil {
 		t.Fatal(err)
 	}
 	record := readHelperRecord(t, recordPath)
 	want := []string{
-		"CODEX_API_KEY=codex-key", "CODEX_HOME=/private/home/.codex", "PATH=/bin", "HOME=/private/home", "LANG=C.UTF-8", "TMPDIR=/tmp",
+		"CODEX_API_KEY=codex-key", "OPENAI_API_KEY=codex-key", "CODEX_HOME=/private/home/.codex", "PATH=/bin", "HOME=/private/home", "LANG=C.UTF-8", "TMPDIR=/tmp",
 		"GO_WANT_CODEX_HELPER=1", "QQ_CODEX_HELPER_RECORD=" + recordPath, "ALLOWED_CUSTOM=kept",
 	}
 	if !reflect.DeepEqual(record.Env, want) {
 		t.Fatalf("environment = %#v, want %#v", record.Env, want)
 	}
 	for _, arg := range record.Args {
-		if strings.Contains(arg, "filters.CODEX_API_KEY") || strings.Contains(arg, "filters.CODEX_HOME") {
+		if strings.Contains(arg, "filters.CODEX_API_KEY") || strings.Contains(arg, "filters.OPENAI_API_KEY") || strings.Contains(arg, "filters.CODEX_HOME") {
 			t.Fatalf("authentication environment exposed to tool subprocess policy: %q", arg)
 		}
 	}
@@ -1416,7 +1417,7 @@ func expectedPolicyArgs(keep []string) []string {
 	names := append([]string{"PATH", "HOME", "LANG", "TMPDIR", "TMP", "TEMP"}, keep...)
 	seen := make(map[string]struct{}, len(names))
 	for _, name := range names {
-		if name == "CODEX_API_KEY" || name == "CODEX_HOME" {
+		if name == "CODEX_API_KEY" || name == "OPENAI_API_KEY" || name == "CODEX_HOME" {
 			continue
 		}
 		if _, ok := seen[name]; ok {

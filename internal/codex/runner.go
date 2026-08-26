@@ -426,7 +426,11 @@ func sanitizedEnvironment(keep []string) ([]string, []string, error) {
 	}
 	names := toolNames
 	seen := make(map[string]struct{}, len(names))
-	env := []string{"CODEX_API_KEY=" + apiKey, "CODEX_HOME=" + codexHome}
+	env := []string{
+		"CODEX_API_KEY=" + apiKey,
+		"OPENAI_API_KEY=" + apiKey,
+		"CODEX_HOME=" + codexHome,
+	}
 	for _, name := range names {
 		if _, exists := seen[name]; exists {
 			continue
@@ -451,7 +455,7 @@ func toolEnvironmentNames(keep []string) ([]string, error) {
 		if !envNamePattern.MatchString(name) {
 			return nil, fmt.Errorf("invalid environment variable name %q", name)
 		}
-		if name == "CODEX_API_KEY" || name == "CODEX_HOME" {
+		if name == "CODEX_API_KEY" || name == "OPENAI_API_KEY" || name == "CODEX_HOME" {
 			continue
 		}
 		if _, exists := seen[name]; exists {
@@ -516,8 +520,8 @@ func privateTempDir(gitCommonDir string) (string, error) {
 }
 
 func invocationArgs(kind invocation, req Request, schemaPath, lastPath string, toolEnv []string) []string {
-	// The Codex process receives CODEX_API_KEY, while this CLI policy only allows
-	// explicitly named non-auth variables into model-invoked tool subprocesses.
+	// The Codex process receives the API key under both supported names, while
+	// this CLI policy only allows explicitly named non-auth variables into tools.
 	policy := environmentPolicyArgs(toolEnv)
 	switch kind {
 	case invocationPlan:
