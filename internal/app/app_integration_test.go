@@ -81,7 +81,7 @@ func TestEndToEnd(t *testing.T) {
 	scheduler := tasksvc.NewScheduler(registry, db, runner, worktrees, operator, client, logs, discardLogger(), 10*time.Millisecond)
 	service := tasksvc.NewService(registry, db, authorizer, runner, scheduler, client, logs)
 	application := App{
-		Store: db, Client: client, Scheduler: scheduler, Service: service, Groups: authorizer,
+		Store: db, Client: client, Scheduler: scheduler, Service: service, Consultations: noopMessageService, Groups: authorizer,
 		MessageWorkers: cfg.MessageWorkers, Logger: discardLogger(),
 	}
 
@@ -157,8 +157,8 @@ func TestRunRecoversBeforeLoopsAndHoldsRuntimeLock(t *testing.T) {
 	schedulerStarted := make(chan struct{})
 	first := App{
 		Store: db, Client: blockingClient{started: clientStarted}, Scheduler: blockingScheduler{started: schedulerStarted},
-		Service: serviceFunc(func(context.Context, tasksvc.Message) error { return nil }),
-		Groups:  groupFunc(func(string) bool { return true }), MessageWorkers: 1, Logger: discardLogger(),
+		Service: serviceFunc(func(context.Context, tasksvc.Message) error { return nil }), Consultations: noopMessageService,
+		Groups: groupFunc(func(string) bool { return true }), MessageWorkers: 1, Logger: discardLogger(),
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -178,8 +178,8 @@ func TestRunRecoversBeforeLoopsAndHoldsRuntimeLock(t *testing.T) {
 	secondScheduler := &countingScheduler{}
 	err = (App{
 		Store: secondDB, Client: secondClient, Scheduler: secondScheduler,
-		Service: serviceFunc(func(context.Context, tasksvc.Message) error { return nil }),
-		Groups:  groupFunc(func(string) bool { return true }), MessageWorkers: 1, Logger: discardLogger(),
+		Service: serviceFunc(func(context.Context, tasksvc.Message) error { return nil }), Consultations: noopMessageService,
+		Groups: groupFunc(func(string) bool { return true }), MessageWorkers: 1, Logger: discardLogger(),
 	}).Run(context.Background())
 	if !errors.Is(err, store.ErrRuntimeLocked) {
 		t.Fatalf("second Run error = %v, want ErrRuntimeLocked", err)
@@ -203,8 +203,8 @@ func TestRunDoesNotStartLoopsWhenRecoveryFails(t *testing.T) {
 	cancel()
 	err := (App{
 		Store: db, Client: client, Scheduler: scheduler,
-		Service: serviceFunc(func(context.Context, tasksvc.Message) error { return nil }),
-		Groups:  groupFunc(func(string) bool { return true }), MessageWorkers: 1, Logger: discardLogger(),
+		Service: serviceFunc(func(context.Context, tasksvc.Message) error { return nil }), Consultations: noopMessageService,
+		Groups: groupFunc(func(string) bool { return true }), MessageWorkers: 1, Logger: discardLogger(),
 	}).Run(ctx)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run error = %v, want canceled recovery", err)
@@ -248,7 +248,7 @@ func TestRunFiltersGroupsAndRetriesOnlyNotificationDelivery(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- (App{
-			Store: db, Client: client, Scheduler: blockingScheduler{}, Service: service,
+			Store: db, Client: client, Scheduler: blockingScheduler{}, Service: noopMessageService, Consultations: service,
 			Groups:         groupFunc(func(groupID string) bool { return groupID == "100" }),
 			MessageWorkers: 1, Logger: discardLogger(),
 		}).Run(ctx)
@@ -292,7 +292,7 @@ func TestRunDoesNotRetryBusinessErrorsOrLogMessageText(t *testing.T) {
 	go func() {
 		done <- (App{
 			Store: db, Client: emittingClient{messages: []onebot.GroupMessage{{GroupID: "100", UserID: "200", MessageID: "300", Text: secretText}}},
-			Scheduler: blockingScheduler{}, Service: service, Groups: groupFunc(func(string) bool { return true }),
+			Scheduler: blockingScheduler{}, Service: service, Consultations: noopMessageService, Groups: groupFunc(func(string) bool { return true }),
 			MessageWorkers: 1, Logger: logger,
 		}).Run(ctx)
 	}()
@@ -344,7 +344,7 @@ func TestRunBoundsMessageWorkers(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- (App{
-			Store: db, Client: emittingClient{messages: messages}, Scheduler: blockingScheduler{}, Service: service,
+			Store: db, Client: emittingClient{messages: messages}, Scheduler: blockingScheduler{}, Service: service, Consultations: noopMessageService,
 			Groups: groupFunc(func(string) bool { return true }), MessageWorkers: workerCount, Logger: discardLogger(),
 		}).Run(ctx)
 	}()
@@ -374,8 +374,8 @@ func TestRunTreatsEarlySchedulerReturnAsFatal(t *testing.T) {
 		Store:     db,
 		Client:    clientFunc(func(ctx context.Context, _ onebot.Handler) error { <-ctx.Done(); close(clientStopped); return nil }),
 		Scheduler: schedulerFunc(func(context.Context) error { return nil }),
-		Service:   serviceFunc(func(context.Context, tasksvc.Message) error { return nil }),
-		Groups:    groupFunc(func(string) bool { return true }), MessageWorkers: 1, Logger: discardLogger(),
+		Service:   serviceFunc(func(context.Context, tasksvc.Message) error { return nil }), Consultations: noopMessageService,
+		Groups: groupFunc(func(string) bool { return true }), MessageWorkers: 1, Logger: discardLogger(),
 	}).Run(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "scheduler") {
 		t.Fatalf("Run error = %v, want scheduler fatal error", err)
@@ -392,8 +392,8 @@ func TestRunTreatsEarlyOneBotReturnAsFatal(t *testing.T) {
 		Store:     db,
 		Client:    clientFunc(func(context.Context, onebot.Handler) error { return errors.New("invalid onebot configuration") }),
 		Scheduler: schedulerFunc(func(ctx context.Context) error { <-ctx.Done(); close(schedulerStopped); return nil }),
-		Service:   serviceFunc(func(context.Context, tasksvc.Message) error { return nil }),
-		Groups:    groupFunc(func(string) bool { return true }), MessageWorkers: 1, Logger: discardLogger(),
+		Service:   serviceFunc(func(context.Context, tasksvc.Message) error { return nil }), Consultations: noopMessageService,
+		Groups: groupFunc(func(string) bool { return true }), MessageWorkers: 1, Logger: discardLogger(),
 	}).Run(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "onebot") {
 		t.Fatalf("Run error = %v, want OneBot fatal error", err)
@@ -422,7 +422,7 @@ func TestRunDrainsAcceptedMessagesAfterCancellation(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- (App{
-			Store: db, Client: client, Scheduler: blockingScheduler{}, Service: service,
+			Store: db, Client: client, Scheduler: blockingScheduler{}, Service: service, Consultations: noopMessageService,
 			Groups: groupFunc(func(string) bool { return true }), MessageWorkers: 1, Logger: discardLogger(),
 		}).Run(ctx)
 	}()
@@ -464,7 +464,7 @@ func TestRunStopsOnFatalStoreError(t *testing.T) {
 			close(clientStopped)
 			return nil
 		}),
-		Scheduler: blockingScheduler{}, Service: service, Groups: groupFunc(func(string) bool { return true }),
+		Scheduler: blockingScheduler{}, Service: service, Consultations: noopMessageService, Groups: groupFunc(func(string) bool { return true }),
 		MessageWorkers: 1, Logger: discardLogger(),
 	}).Run(context.Background())
 	waitClosed(t, called, "fatal service error")
@@ -498,7 +498,7 @@ func TestRunReturnsFatalStoreDiscoveredWhileDrainingAfterCancellation(t *testing
 	done := make(chan error, 1)
 	go func() {
 		done <- (App{
-			Store: db, Client: client, Scheduler: blockingScheduler{}, Service: service,
+			Store: db, Client: client, Scheduler: blockingScheduler{}, Service: service, Consultations: noopMessageService,
 			Groups: groupFunc(func(string) bool { return true }), MessageWorkers: 1, Logger: discardLogger(),
 		}).Run(ctx)
 	}()
@@ -524,8 +524,8 @@ func TestRunReturnsFatalStoreFromJoinedScheduler(t *testing.T) {
 			<-ctx.Done()
 			return errors.Join(tasksvc.ErrFatalStore, errors.New("scheduler store failed"))
 		}),
-		Service: serviceFunc(func(context.Context, tasksvc.Message) error { return nil }),
-		Groups:  groupFunc(func(string) bool { return true }), MessageWorkers: 1, Logger: discardLogger(),
+		Service: serviceFunc(func(context.Context, tasksvc.Message) error { return nil }), Consultations: noopMessageService,
+		Groups: groupFunc(func(string) bool { return true }), MessageWorkers: 1, Logger: discardLogger(),
 	}).Run(context.Background())
 	if !errors.Is(err, tasksvc.ErrFatalStore) {
 		t.Fatalf("Run error = %v, want joined scheduler ErrFatalStore", err)
@@ -553,8 +553,8 @@ func TestRunTreatsParentCancellationAsNormalWhenLoopResultWinsSelect(t *testing.
 				<-releaseScheduler
 				return nil
 			}),
-			Service: serviceFunc(func(context.Context, tasksvc.Message) error { return nil }),
-			Groups:  groupFunc(func(string) bool { return true }), MessageWorkers: 1, Logger: discardLogger(),
+			Service: serviceFunc(func(context.Context, tasksvc.Message) error { return nil }), Consultations: noopMessageService,
+			Groups: groupFunc(func(string) bool { return true }), MessageWorkers: 1, Logger: discardLogger(),
 		}).Run(ctx)
 	}()
 	close(returnClient)
@@ -583,7 +583,7 @@ func TestRunShutdownTimeoutCancelsInFlightWorker(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- (App{
-			Store: db, Client: client, Scheduler: blockingScheduler{}, Service: service,
+			Store: db, Client: client, Scheduler: blockingScheduler{}, Service: service, Consultations: noopMessageService,
 			Groups: groupFunc(func(string) bool { return true }), MessageWorkers: 1, Logger: discardLogger(),
 			ShutdownTimeout: 40 * time.Millisecond,
 		}).Run(ctx)
@@ -616,7 +616,7 @@ func TestRunShutdownTimeoutReturnsWhenServiceIgnoresCancellationAndRetainsLock(t
 	done := make(chan error, 1)
 	go func() {
 		done <- (App{
-			Store: db, Client: client, Scheduler: blockingScheduler{}, Service: service,
+			Store: db, Client: client, Scheduler: blockingScheduler{}, Service: service, Consultations: noopMessageService,
 			Groups: groupFunc(func(string) bool { return true }), MessageWorkers: 1, Logger: discardLogger(),
 			ShutdownTimeout: 30 * time.Millisecond,
 		}).Run(ctx)
@@ -655,8 +655,8 @@ func TestRunShutdownTimeoutReturnsWhenLoopsIgnoreCancellationAndRetainsLock(t *t
 				close(schedulerStarted)
 				select {}
 			}),
-			Service: serviceFunc(func(context.Context, tasksvc.Message) error { return nil }),
-			Groups:  groupFunc(func(string) bool { return true }), MessageWorkers: 1, Logger: discardLogger(),
+			Service: serviceFunc(func(context.Context, tasksvc.Message) error { return nil }), Consultations: noopMessageService,
+			Groups: groupFunc(func(string) bool { return true }), MessageWorkers: 1, Logger: discardLogger(),
 			ShutdownTimeout: 30 * time.Millisecond,
 		}).Run(ctx)
 	}()
@@ -724,7 +724,7 @@ func TestRunFatalStoreCancelsOtherWorkerBeforeSlowLoopsExit(t *testing.T) {
 				<-releaseLoops
 				return nil
 			}),
-			Service: service, Groups: groupFunc(func(string) bool { return true }),
+			Service: service, Consultations: noopMessageService, Groups: groupFunc(func(string) bool { return true }),
 			MessageWorkers: 2, Logger: discardLogger(), ShutdownTimeout: time.Second,
 		}).Run(context.Background())
 	}()
@@ -760,7 +760,7 @@ func TestMessageWorkerFatalCancelsIdleWorkerBeforeQueuedDispatch(t *testing.T) {
 		close(queuedProcessed)
 		return nil
 	})
-	a := App{Service: service}
+	a := App{Service: service, Consultations: noopMessageService}
 	var workers sync.WaitGroup
 	for range 2 {
 		workers.Add(1)
@@ -803,8 +803,8 @@ func TestRunShutdownTimeoutPreservesReadySchedulerFatal(t *testing.T) {
 		Scheduler: schedulerFunc(func(context.Context) error {
 			return errors.Join(tasksvc.ErrFatalStore, errors.New("scheduler store failed"))
 		}),
-		Service: serviceFunc(func(context.Context, tasksvc.Message) error { return nil }),
-		Groups:  groupFunc(func(string) bool { return true }), MessageWorkers: 1, Logger: discardLogger(),
+		Service: serviceFunc(func(context.Context, tasksvc.Message) error { return nil }), Consultations: noopMessageService,
+		Groups: groupFunc(func(string) bool { return true }), MessageWorkers: 1, Logger: discardLogger(),
 		ShutdownTimeout: 30 * time.Millisecond,
 	}).Run(context.Background())
 	if !errors.Is(err, tasksvc.ErrFatalStore) || !errors.Is(err, ErrShutdownTimeout) {
@@ -1422,6 +1422,8 @@ type serviceFunc func(context.Context, tasksvc.Message) error
 func (f serviceFunc) Handle(ctx context.Context, message tasksvc.Message) error {
 	return f(ctx, message)
 }
+
+var noopMessageService = serviceFunc(func(context.Context, tasksvc.Message) error { return nil })
 
 type groupFunc func(string) bool
 

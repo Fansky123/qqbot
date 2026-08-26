@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"qqcodex/internal/command"
 	"qqcodex/internal/config"
 	"qqcodex/internal/onebot"
 	"qqcodex/internal/store"
@@ -109,16 +110,17 @@ type TaskLogRemover interface {
 
 // App coordinates the process-wide runtime owner, message workers, and task scheduler.
 type App struct {
-	Store     *store.Store
-	Client    Client
-	Scheduler Scheduler
-	Service   Service
-	Groups    GroupAuthorizer
-	Logger    *slog.Logger
-	Projects  ProjectLookup
-	Worktrees WorktreeRemover
-	Logs      TaskLogRemover
-	Now       func() time.Time
+	Store         *store.Store
+	Client        Client
+	Scheduler     Scheduler
+	Service       Service
+	Consultations Service
+	Groups        GroupAuthorizer
+	Logger        *slog.Logger
+	Projects      ProjectLookup
+	Worktrees     WorktreeRemover
+	Logs          TaskLogRemover
+	Now           func() time.Time
 
 	MessageWorkers int
 	// ShutdownTimeout bounds graceful draining after parent cancellation.
@@ -277,7 +279,7 @@ func (a App) validate(ctx context.Context) error {
 	if ctx == nil {
 		return errors.New("application context is required")
 	}
-	if a.Store == nil || a.Client == nil || a.Scheduler == nil || a.Service == nil || a.Groups == nil {
+	if a.Store == nil || a.Client == nil || a.Scheduler == nil || a.Service == nil || a.Consultations == nil || a.Groups == nil {
 		return errors.New("application dependencies are required")
 	}
 	if a.MessageWorkers <= 0 {
@@ -437,8 +439,13 @@ func (a App) messageWorker(ctx context.Context, logger *slog.Logger, messages <-
 }
 
 func (a App) handleMessage(ctx context.Context, message tasksvc.Message) error {
+	handler := a.Service
+	if parsed, err := command.Parse(message.Text, message.Mentioned); err == nil &&
+		(parsed.Kind == command.KindConsult || parsed.Kind == command.KindProjectConsult) {
+		handler = a.Consultations
+	}
 	for attempt := 1; attempt <= notificationAttempts; attempt++ {
-		err := a.Service.Handle(ctx, message)
+		err := handler.Handle(ctx, message)
 		if err == nil || !errors.Is(err, tasksvc.ErrNotificationDelivery) || attempt == notificationAttempts {
 			return err
 		}

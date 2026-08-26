@@ -119,6 +119,64 @@ func TestValidateStartupAcceptsValidGitConfig(t *testing.T) {
 	if err := validateStartup(&cfg); err != nil {
 		t.Fatalf("validateStartup(valid) = %v", err)
 	}
+	want, err := exec.LookPath("bwrap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err = filepath.Abs(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Consultation.SandboxBinary != want {
+		t.Fatalf("consultation sandbox = %q, want %q", cfg.Consultation.SandboxBinary, want)
+	}
+}
+
+func TestValidateStartupRejectsMissingOrInvalidBubblewrap(t *testing.T) {
+	t.Run("missing", func(t *testing.T) {
+		cfg, _ := validGitConfig(t)
+		err := validateStartupWithLookPath(&cfg, func(name string) (string, error) {
+			if name == "bwrap" {
+				return "", exec.ErrNotFound
+			}
+			return exec.LookPath(name)
+		})
+		if err == nil || !strings.Contains(err.Error(), "consultation sandbox") {
+			t.Fatalf("validateStartup error = %v, want unavailable consultation sandbox", err)
+		}
+	})
+
+	t.Run("not regular", func(t *testing.T) {
+		cfg, _ := validGitConfig(t)
+		dir := t.TempDir()
+		err := validateStartupWithLookPath(&cfg, func(name string) (string, error) {
+			if name == "bwrap" {
+				return dir, nil
+			}
+			return exec.LookPath(name)
+		})
+		if err == nil || !strings.Contains(err.Error(), "consultation sandbox") {
+			t.Fatalf("validateStartup error = %v, want invalid consultation sandbox", err)
+		}
+	})
+}
+
+func TestCleanupStartupIgnoresConsultationSandbox(t *testing.T) {
+	cfg, _ := validGitConfig(t)
+	cfg.Consultation.SandboxBinary = "/missing/bwrap"
+	if err := validateCleanupStartup(&cfg); err != nil {
+		t.Fatalf("cleanup validation required consultation sandbox: %v", err)
+	}
+}
+
+func TestNewCodexRunnerReceivesConsultationSandbox(t *testing.T) {
+	cfg := validConfig(t)
+	cfg.Codex.Binary = "/opt/codex"
+	cfg.Consultation.SandboxBinary = "/usr/bin/bwrap"
+	runner := newCodexRunner(cfg, nil)
+	if runner.Binary != cfg.Codex.Binary || runner.ConsultationSandboxBinary != cfg.Consultation.SandboxBinary {
+		t.Fatalf("runner binaries = %q/%q, want %q/%q", runner.Binary, runner.ConsultationSandboxBinary, cfg.Codex.Binary, cfg.Consultation.SandboxBinary)
+	}
 }
 
 func TestValidateStartupCreatesPrivateConsultationWorkspace(t *testing.T) {

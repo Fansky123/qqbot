@@ -18,6 +18,7 @@ import (
 	"qqcodex/internal/auth"
 	"qqcodex/internal/codex"
 	"qqcodex/internal/config"
+	"qqcodex/internal/consultsvc"
 	"qqcodex/internal/gitwork"
 	"qqcodex/internal/onebot"
 	"qqcodex/internal/ops"
@@ -118,14 +119,15 @@ func buildAndRun(ctx context.Context, cfg config.Config, token string, getenv fu
 			return errors.Join(errors.New("ops project preflight failed"), db.Close())
 		}
 	}
-	runner := &codex.Runner{Binary: cfg.Codex.Binary, KeepEnv: cfg.Codex.EnvironmentKeep, LogDir: cfg.LogDir, Log: logs}
+	runner := newCodexRunner(cfg, logs)
 	worktrees := &gitwork.Manager{Root: cfg.WorktreeRoot}
 	authorizer := auth.New(cfg.AllowedGroupIDs, cfg.EmployeeIDs, cfg.AdminIDs)
 	client := &onebot.Client{URL: cfg.OneBot.URL, Token: token, SelfID: cfg.OneBot.SelfID, MessageRunes: cfg.OneBot.MessageRunes}
 	scheduler := tasksvc.NewScheduler(registry, db, runner, worktrees, operator, client, logs, logger, 0)
 	service := tasksvc.NewService(registry, db, authorizer, runner, scheduler, client, logs)
+	consultations := consultsvc.NewService(registry, cfg.Consultation, db, authorizer, runner, client, logs)
 	application := app.App{
-		Store: db, Client: client, Scheduler: scheduler, Service: service, Groups: authorizer,
+		Store: db, Client: client, Scheduler: scheduler, Service: service, Consultations: consultations, Groups: authorizer,
 		Projects: registry, Worktrees: worktrees, Logs: logs,
 		MessageWorkers: cfg.MessageWorkers, Logger: logger,
 	}
@@ -155,22 +157,26 @@ func buildAndCleanup(ctx context.Context, cfg config.Config) error {
 }
 
 func validateStartup(cfg *config.Config) error {
+	return validateStartupWithLookPath(cfg, exec.LookPath)
+}
+
+func validateStartupWithLookPath(cfg *config.Config, lookPath func(string) (string, error)) error {
 	if cfg == nil {
 		return errors.New("configuration is required")
 	}
-	binary, err := exec.LookPath(cfg.Codex.Binary)
-	if err != nil {
-		return errors.New("codex binary is unavailable")
+	if lookPath == nil {
+		return errors.New("executable lookup is required")
 	}
-	binary, err = filepath.Abs(binary)
+	binary, err := resolveExecutable(cfg.Codex.Binary, "codex binary", lookPath)
 	if err != nil {
-		return errors.New("codex binary is invalid")
-	}
-	info, err := os.Stat(binary)
-	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
-		return errors.New("codex binary is invalid")
+		return err
 	}
 	cfg.Codex.Binary = binary
+	sandboxBinary, err := resolveExecutable("bwrap", "consultation sandbox", lookPath)
+	if err != nil {
+		return err
+	}
+	cfg.Consultation.SandboxBinary = sandboxBinary
 
 	if err := validateDatabasePath(cfg.DatabasePath); err != nil {
 		return errors.New("database directory is invalid")
@@ -193,6 +199,29 @@ func validateStartup(cfg *config.Config) error {
 		return errors.New("configured paths overlap")
 	}
 	return nil
+}
+
+func resolveExecutable(name, label string, lookPath func(string) (string, error)) (string, error) {
+	binary, err := lookPath(name)
+	if err != nil {
+		return "", fmt.Errorf("%s is unavailable", label)
+	}
+	binary, err = filepath.Abs(binary)
+	if err != nil {
+		return "", fmt.Errorf("%s is invalid", label)
+	}
+	info, err := os.Stat(binary)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+		return "", fmt.Errorf("%s is invalid", label)
+	}
+	return binary, nil
+}
+
+func newCodexRunner(cfg config.Config, logs codex.LogSink) *codex.Runner {
+	return &codex.Runner{
+		Binary: cfg.Codex.Binary, ConsultationSandboxBinary: cfg.Consultation.SandboxBinary,
+		KeepEnv: cfg.Codex.EnvironmentKeep, LogDir: cfg.LogDir, Log: logs,
+	}
 }
 
 func validateCleanupStartup(cfg *config.Config) error {
