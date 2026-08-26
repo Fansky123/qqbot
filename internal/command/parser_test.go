@@ -19,6 +19,24 @@ func TestParse(t *testing.T) {
 			want:      Command{Kind: KindCreate, ProjectAlias: "订单", Body: "implement order search"},
 		},
 		{
+			name:      "generic consultation",
+			text:      "  这个报错是什么意思？  ",
+			mentioned: true,
+			want:      Command{Kind: KindConsult, Body: "这个报错是什么意思？"},
+		},
+		{
+			name:      "project consultation",
+			text:      "问 [orders] 为什么会死锁？",
+			mentioned: true,
+			want:      Command{Kind: KindProjectConsult, ProjectAlias: "orders", Body: "为什么会死锁？"},
+		},
+		{
+			name:      "bracketed text remains create",
+			text:      "[orders] 修复死锁",
+			mentioned: true,
+			want:      Command{Kind: KindCreate, ProjectAlias: "orders", Body: "修复死锁"},
+		},
+		{
 			name: "confirm",
 			text: "确认 #" + taskID,
 			want: Command{Kind: KindConfirm, TaskID: taskID},
@@ -80,6 +98,12 @@ func TestParseRejectsInvalidCommands(t *testing.T) {
 		mentioned bool
 	}{
 		{name: "unknown command", text: "帮助"},
+		{name: "plain consultation without mention", text: "这个报错是什么意思？"},
+		{name: "empty mentioned text", text: "   ", mentioned: true},
+		{name: "project consultation missing body", text: "问", mentioned: true},
+		{name: "project consultation missing body after alias", text: "问 [orders]", mentioned: true},
+		{name: "project consultation invalid alias", text: "问 [bad alias] x", mentioned: true},
+		{name: "project consultation missing alias", text: "问 something", mentioned: true},
 		{name: "create without mention", text: "[orders] add search"},
 		{name: "create empty body", text: "[orders]   ", mentioned: true},
 		{name: "create alias with space", text: "[order api] add search", mentioned: true},

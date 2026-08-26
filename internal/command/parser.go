@@ -9,14 +9,16 @@ import (
 type Kind string
 
 const (
-	KindCreate        Kind = "create"
-	KindConfirm       Kind = "confirm"
-	KindSupplement    Kind = "supplement"
-	KindCancel        Kind = "cancel"
-	KindStatus        Kind = "status"
-	KindLog           Kind = "log"
-	KindApproveMerge  Kind = "approve_merge"
-	KindApproveDeploy Kind = "approve_deploy"
+	KindCreate         Kind = "create"
+	KindConfirm        Kind = "confirm"
+	KindSupplement     Kind = "supplement"
+	KindCancel         Kind = "cancel"
+	KindStatus         Kind = "status"
+	KindLog            Kind = "log"
+	KindApproveMerge   Kind = "approve_merge"
+	KindApproveDeploy  Kind = "approve_deploy"
+	KindConsult        Kind = "consult"
+	KindProjectConsult Kind = "project_consult"
 )
 
 type Command struct {
@@ -29,6 +31,8 @@ type Command struct {
 const taskIDPattern = `T-[A-F0-9]{12}`
 
 var createPattern = regexp.MustCompile(`(?s)^\[([\p{L}\p{N}_-]+)\]\s+(.+)$`)
+
+var projectConsultPattern = regexp.MustCompile(`(?s)^问\s+\[([\p{L}\p{N}_-]+)\]\s+(.+)$`)
 
 var fixedCommands = []struct {
 	kind    Kind
@@ -47,17 +51,6 @@ var fixedCommands = []struct {
 func Parse(text string, mentioned bool) (Command, error) {
 	text = strings.TrimSpace(text)
 
-	if matches := createPattern.FindStringSubmatch(text); matches != nil {
-		if !mentioned {
-			return Command{}, errors.New("create commands require a bot mention")
-		}
-		body := strings.TrimSpace(matches[2])
-		if body == "" {
-			return Command{}, errors.New("create command requires a task description")
-		}
-		return Command{Kind: KindCreate, ProjectAlias: matches[1], Body: body}, nil
-	}
-
 	for _, command := range fixedCommands {
 		matches := command.pattern.FindStringSubmatch(text)
 		if matches == nil {
@@ -72,6 +65,38 @@ func Parse(text string, mentioned bool) (Command, error) {
 			}
 		}
 		return parsed, nil
+	}
+
+	if matches := createPattern.FindStringSubmatch(text); matches != nil {
+		if !mentioned {
+			return Command{}, errors.New("create commands require a bot mention")
+		}
+		body := strings.TrimSpace(matches[2])
+		if body == "" {
+			return Command{}, errors.New("create command requires a task description")
+		}
+		return Command{Kind: KindCreate, ProjectAlias: matches[1], Body: body}, nil
+	}
+
+	if matches := projectConsultPattern.FindStringSubmatch(text); matches != nil {
+		if !mentioned {
+			return Command{}, errors.New("consult commands require a bot mention")
+		}
+		body := strings.TrimSpace(matches[2])
+		if body == "" {
+			return Command{}, errors.New("project consultation requires a question")
+		}
+		return Command{Kind: KindProjectConsult, ProjectAlias: matches[1], Body: body}, nil
+	}
+
+	if strings.HasPrefix(text, "问") {
+		return Command{}, errors.New("invalid project consultation")
+	}
+	if strings.HasPrefix(text, "[") {
+		return Command{}, errors.New("invalid create command")
+	}
+	if mentioned && text != "" {
+		return Command{Kind: KindConsult, Body: text}, nil
 	}
 
 	return Command{}, errors.New("unrecognized command")
