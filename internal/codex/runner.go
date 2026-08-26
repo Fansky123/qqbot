@@ -348,7 +348,27 @@ func (r Runner) validate(req Request, kind invocation) (string, string, []string
 	if err != nil {
 		return "", "", nil, nil, err
 	}
+	if kind == invocationConsult {
+		if err := validateConsultationConfig(env); err != nil {
+			return "", "", nil, nil, err
+		}
+	}
 	return binary, sandboxBinary, env, toolEnv, nil
+}
+
+func validateConsultationConfig(env []string) error {
+	path := filepath.Join(environmentValue(env, "CODEX_HOME"), "config.toml")
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect Codex config.toml: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return errors.New("Codex config.toml must be a non-symlink regular file")
+	}
+	return nil
 }
 
 func resolveExecutable(path, label string) (string, error) {

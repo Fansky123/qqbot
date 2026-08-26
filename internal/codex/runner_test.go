@@ -437,6 +437,25 @@ func TestRunnerAskRequiresSandboxBinary(t *testing.T) {
 	}
 }
 
+func TestRunnerAskRejectsSymlinkedCodexConfigBeforeSpawning(t *testing.T) {
+	runner, req, recordPath := helperRunner(t)
+	codexHome := filepath.Join(os.Getenv("HOME"), ".codex")
+	if err := os.Mkdir(codexHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(t.TempDir(), filepath.Join(codexHome, "config.toml")); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := runner.Ask(context.Background(), Request{
+		TaskID: "Q-012345ABCDEF", WorkingDir: req.WorkingDir, Prompt: "consult", Timeout: time.Second,
+	})
+	if err == nil || !strings.Contains(err.Error(), "config.toml") || !strings.Contains(err.Error(), "regular") {
+		t.Fatalf("Ask() error = %v, want rejected symlinked config", err)
+	}
+	assertNotCreated(t, recordPath)
+}
+
 func TestRunnerPlanDoesNotRequireConsultationSandbox(t *testing.T) {
 	runner, req, _ := helperRunner(t)
 	runner.ConsultationSandboxBinary = ""
