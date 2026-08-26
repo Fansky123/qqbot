@@ -397,6 +397,11 @@ func pathContains(parent, child string) bool {
 
 func logRunFailure(logger *slog.Logger, err error) {
 	class := "service"
+	var cleanupErr *app.CleanupError
+	if errors.As(err, &cleanupErr) {
+		logger.Error("qqcodex stopped", "class", "cleanup", "task_ids", cleanupErr.TaskIDs())
+		return
+	}
 	if errors.Is(err, store.ErrRuntimeLocked) {
 		class = "runtime_lock"
 	}

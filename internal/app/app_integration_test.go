@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -982,6 +983,113 @@ func TestCleanupExpiredKeepsLogOnWorktreeFailureAndRetriesAfterLogFailure(t *tes
 	}
 	if removeLogCalls != 2 {
 		t.Fatalf("log removal calls = %d, want 2", removeLogCalls)
+	}
+}
+
+func TestCleanupExpiredStopsBeforeNextLogAfterCancellation(t *testing.T) {
+	now := time.Now().UTC()
+	db := openStore(t, filepath.Join(t.TempDir(), "tasks.db"))
+	defer closeStore(t, db)
+	project := config.Project{ID: "project", RepoPath: "/unused", LogRetentionDays: 7}
+	for i, id := range []string{"T-000000000301", "T-000000000302"} {
+		updated := now.Add(time.Duration(-9+i) * 24 * time.Hour)
+		if err := db.CreateTask(context.Background(), &model.Task{
+			ID: id, ProjectID: project.ID, GroupID: "1", CreatorID: "2", Requirement: "cleanup",
+			Status: model.StatusFailed, CreatedAt: updated.Add(-time.Hour), UpdatedAt: updated,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var logCalls []string
+	err := (App{
+		Store: db, Projects: projectLookupFunc(func(string) (config.Project, bool) { return project, true }),
+		Worktrees: worktreeRemoveFunc(func(context.Context, string, string) error { t.Fatal("empty worktree was removed"); return nil }),
+		Logs: taskLogRemoveFunc(func(taskID string) error {
+			logCalls = append(logCalls, taskID)
+			cancel()
+			return nil
+		}),
+		Now: func() time.Time { return now },
+	}).CleanupExpired(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("CleanupExpired error = %v, want context canceled", err)
+	}
+	if want := []string{"T-000000000301"}; !slices.Equal(logCalls, want) {
+		t.Fatalf("log calls = %v, want %v", logCalls, want)
+	}
+}
+
+func TestCleanupExpiredStopsAfterWorktreeReturnsCancellation(t *testing.T) {
+	now := time.Now().UTC()
+	db := openStore(t, filepath.Join(t.TempDir(), "tasks.db"))
+	defer closeStore(t, db)
+	project := config.Project{ID: "project", RepoPath: "/unused", LogRetentionDays: 7}
+	for i, id := range []string{"T-000000000311", "T-000000000312"} {
+		updated := now.Add(time.Duration(-9+i) * 24 * time.Hour)
+		if err := db.CreateTask(context.Background(), &model.Task{
+			ID: id, ProjectID: project.ID, GroupID: "1", CreatorID: "2", Requirement: "cleanup",
+			Status: model.StatusFailed, Worktree: "/unused/" + id,
+			CreatedAt: updated.Add(-time.Hour), UpdatedAt: updated,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var worktreeCalls []string
+	logCalls := 0
+	err := (App{
+		Store: db, Projects: projectLookupFunc(func(string) (config.Project, bool) { return project, true }),
+		Worktrees: worktreeRemoveFunc(func(_ context.Context, _ string, worktree string) error {
+			worktreeCalls = append(worktreeCalls, worktree)
+			cancel()
+			return context.Canceled
+		}),
+		Logs: taskLogRemoveFunc(func(string) error { logCalls++; return nil }),
+		Now:  func() time.Time { return now },
+	}).CleanupExpired(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("CleanupExpired error = %v, want context canceled", err)
+	}
+	if want := []string{"/unused/T-000000000311"}; !slices.Equal(worktreeCalls, want) {
+		t.Fatalf("worktree calls = %v, want %v", worktreeCalls, want)
+	}
+	if logCalls != 0 {
+		t.Fatalf("log calls = %d, want 0", logCalls)
+	}
+	var cleanupErr *CleanupError
+	if !errors.As(err, &cleanupErr) || !slices.Equal(cleanupErr.TaskIDs(), []string{"T-000000000311"}) {
+		t.Fatalf("cleanup error = %#v", cleanupErr)
+	}
+}
+
+func TestCleanupErrorIsSafeSortedDeduplicatedAndImmutable(t *testing.T) {
+	cause := errors.New("secret failure at /private/company/repository")
+	err := newCleanupError([]string{
+		"T-000000000322", "../../private", "T-000000000321", "T-000000000322",
+	}, cause)
+	var cleanupErr *CleanupError
+	if !errors.As(err, &cleanupErr) {
+		t.Fatalf("error type = %T, want *CleanupError", err)
+	}
+	if got, want := cleanupErr.Error(), "cleanup failed for tasks: T-000000000321, T-000000000322"; got != want {
+		t.Fatalf("Error() = %q, want %q", got, want)
+	}
+	if strings.Contains(cleanupErr.Error(), "secret") || strings.Contains(cleanupErr.Error(), "private") || !errors.Is(cleanupErr, cause) {
+		t.Fatalf("unsafe or unwrapped cleanup error: %v", cleanupErr)
+	}
+	ids := cleanupErr.TaskIDs()
+	ids[0] = "changed"
+	if got := cleanupErr.TaskIDs(); !slices.Equal(got, []string{"T-000000000321", "T-000000000322"}) {
+		t.Fatalf("TaskIDs mutated through caller: %v", got)
+	}
+
+	contextOnly := newCleanupError(nil, context.Canceled)
+	var contextCleanup *CleanupError
+	if !errors.Is(contextOnly, context.Canceled) || !errors.As(contextOnly, &contextCleanup) || len(contextCleanup.TaskIDs()) != 0 || contextCleanup.Error() != "cleanup failed" {
+		t.Fatalf("context-only cleanup error = %#v", contextOnly)
 	}
 }
 

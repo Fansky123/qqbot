@@ -5,6 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,6 +25,54 @@ const (
 
 // ErrShutdownTimeout means at least one application component ignored graceful cancellation.
 var ErrShutdownTimeout = errors.New("application shutdown timed out")
+
+var cleanupTaskIDPattern = regexp.MustCompile(`^T-[A-F0-9]{12}$`)
+
+// CleanupError reports cleanup failures without exposing their underlying paths or causes.
+type CleanupError struct {
+	taskIDs []string
+	cause   error
+}
+
+func (e *CleanupError) Error() string {
+	if e == nil || len(e.taskIDs) == 0 {
+		return "cleanup failed"
+	}
+	return "cleanup failed for tasks: " + strings.Join(e.taskIDs, ", ")
+}
+
+func (e *CleanupError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+// TaskIDs returns an independent, sorted list of tasks whose cleanup failed.
+func (e *CleanupError) TaskIDs() []string {
+	if e == nil {
+		return nil
+	}
+	return append([]string(nil), e.taskIDs...)
+}
+
+func newCleanupError(taskIDs []string, cause error) error {
+	if cause == nil {
+		return nil
+	}
+	unique := make(map[string]struct{}, len(taskIDs))
+	for _, taskID := range taskIDs {
+		if cleanupTaskIDPattern.MatchString(taskID) {
+			unique[taskID] = struct{}{}
+		}
+	}
+	safeIDs := make([]string, 0, len(unique))
+	for taskID := range unique {
+		safeIDs = append(safeIDs, taskID)
+	}
+	slices.Sort(safeIDs)
+	return &CleanupError{taskIDs: safeIDs, cause: cause}
+}
 
 var retainedRuntimeLocks struct {
 	sync.Mutex
@@ -157,7 +208,16 @@ func (a App) CleanupExpired(ctx context.Context) (runErr error) {
 	if err != nil {
 		return fmt.Errorf("acquire application runtime lock: %w", err)
 	}
-	defer func() { runErr = errors.Join(runErr, lock.Close()) }()
+	defer func() {
+		if closeErr := lock.Close(); closeErr != nil {
+			var cleanupErr *CleanupError
+			var taskIDs []string
+			if errors.As(runErr, &cleanupErr) {
+				taskIDs = cleanupErr.TaskIDs()
+			}
+			runErr = newCleanupError(taskIDs, errors.Join(runErr, closeErr))
+		}
+	}()
 
 	now := time.Now().UTC()
 	if a.Now != nil {
@@ -165,29 +225,52 @@ func (a App) CleanupExpired(ctx context.Context) (runErr error) {
 	}
 	tasks, err := a.Store.ListCleanupCandidates(ctx, now)
 	if err != nil {
-		return fmt.Errorf("list cleanup candidates: %w", err)
+		return newCleanupError(nil, fmt.Errorf("list cleanup candidates: %w", err))
 	}
-	var cleanupErr error
+	var causes []error
+	var failedTaskIDs []string
+	record := func(taskID string, err error) {
+		failedTaskIDs = append(failedTaskIDs, taskID)
+		causes = append(causes, err)
+	}
+	finish := func(extra error) error {
+		return newCleanupError(failedTaskIDs, errors.Join(errors.Join(causes...), extra))
+	}
 	for _, task := range tasks {
+		if err := ctx.Err(); err != nil {
+			return finish(err)
+		}
 		project, ok := a.Projects.ProjectByID(task.ProjectID)
 		if !ok || project.LogRetentionDays <= 0 {
-			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("cleanup task %s: project retention is unavailable", task.ID))
+			record(task.ID, fmt.Errorf("cleanup task %s: project retention is unavailable", task.ID))
 			continue
 		}
 		if !task.UpdatedAt.Before(now.AddDate(0, 0, -project.LogRetentionDays)) {
 			continue
 		}
 		if task.Worktree != "" {
+			if err := ctx.Err(); err != nil {
+				return finish(err)
+			}
 			if err := a.Worktrees.Remove(ctx, project.RepoPath, task.Worktree); err != nil {
-				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("cleanup task %s worktree: %w", task.ID, err))
+				record(task.ID, fmt.Errorf("cleanup task %s worktree: %w", task.ID, err))
+				if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					return finish(ctx.Err())
+				}
 				continue
 			}
 		}
+		if err := ctx.Err(); err != nil {
+			return finish(err)
+		}
 		if err := a.Logs.Remove(task.ID); err != nil {
-			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("cleanup task %s log: %w", task.ID, err))
+			record(task.ID, fmt.Errorf("cleanup task %s log: %w", task.ID, err))
+			if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return finish(ctx.Err())
+			}
 		}
 	}
-	return cleanupErr
+	return finish(ctx.Err())
 }
 
 func (a App) validate(ctx context.Context) error {

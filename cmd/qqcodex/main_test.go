@@ -10,11 +10,16 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
+	"qqcodex/internal/app"
 	"qqcodex/internal/config"
+	"qqcodex/internal/model"
 	"qqcodex/internal/ops"
+	"qqcodex/internal/store"
 )
 
 func TestValidateStartupDoesNotChangeExistingPrivateDirectoryMode(t *testing.T) {
@@ -233,6 +238,61 @@ func TestRunRejectsMissingTokenWithoutLoggingSecrets(t *testing.T) {
 	}
 }
 
+func TestLogRunFailureReportsCleanupTaskIDsWithoutCause(t *testing.T) {
+	root := t.TempDir()
+	db, err := store.Open(filepath.Join(root, "tasks.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Now().UTC()
+	project := config.Project{ID: "project", RepoPath: "/private/source", LogRetentionDays: 7}
+	for i, id := range []string{"T-000000000402", "T-000000000401"} {
+		updated := now.Add(time.Duration(-10+i) * 24 * time.Hour)
+		if err := db.CreateTask(context.Background(), &model.Task{
+			ID: id, ProjectID: project.ID, GroupID: "1", CreatorID: "2", Requirement: "cleanup",
+			Status: model.StatusFailed, Worktree: "/private/worktrees/" + id,
+			CreatedAt: updated.Add(-time.Hour), UpdatedAt: updated,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const secret = "cleanup-secret-path-/private/company"
+	err = (app.App{
+		Store: db,
+		Projects: cleanupProjectLookupFunc(func(string) (config.Project, bool) {
+			return project, true
+		}),
+		Worktrees: cleanupWorktreeRemoveFunc(func(context.Context, string, string) error {
+			return errors.New(secret)
+		}),
+		Logs: cleanupLogRemoveFunc(func(string) error {
+			t.Fatal("log removal must not follow worktree failure")
+			return nil
+		}),
+		Now: func() time.Time { return now },
+	}).CleanupExpired(context.Background())
+	if err == nil || strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), "/private") {
+		t.Fatalf("unsafe cleanup error = %v", err)
+	}
+
+	var output bytes.Buffer
+	logRunFailure(slog.New(slog.NewJSONHandler(&output, nil)), errors.Join(err, errors.New("outer-"+secret)))
+	if strings.Contains(output.String(), secret) || strings.Contains(output.String(), "/private") {
+		t.Fatalf("cleanup log leaked cause or path: %s", output.String())
+	}
+	var record struct {
+		Class   string   `json:"class"`
+		TaskIDs []string `json:"task_ids"`
+	}
+	if err := json.Unmarshal(output.Bytes(), &record); err != nil {
+		t.Fatal(err)
+	}
+	if record.Class != "cleanup" || !slices.Equal(record.TaskIDs, []string{"T-000000000401", "T-000000000402"}) {
+		t.Fatalf("cleanup log = %#v", record)
+	}
+}
+
 func unexpectedStart(t *testing.T) starter {
 	t.Helper()
 	return func(context.Context, config.Config, string, func(string) string, *slog.Logger, bool) error {
@@ -240,6 +300,22 @@ func unexpectedStart(t *testing.T) starter {
 		return nil
 	}
 }
+
+type cleanupProjectLookupFunc func(string) (config.Project, bool)
+
+func (f cleanupProjectLookupFunc) ProjectByID(projectID string) (config.Project, bool) {
+	return f(projectID)
+}
+
+type cleanupWorktreeRemoveFunc func(context.Context, string, string) error
+
+func (f cleanupWorktreeRemoveFunc) Remove(ctx context.Context, repoPath, worktree string) error {
+	return f(ctx, repoPath, worktree)
+}
+
+type cleanupLogRemoveFunc func(string) error
+
+func (f cleanupLogRemoveFunc) Remove(taskID string) error { return f(taskID) }
 
 func validConfig(t *testing.T) config.Config {
 	t.Helper()
