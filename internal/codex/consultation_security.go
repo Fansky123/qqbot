@@ -212,7 +212,7 @@ func consultationConfigTOML(config consultationConfig, proxyURL string) string {
 	return "model = " + strconv.Quote(config.Model) + "\n" +
 		"model_provider = " + strconv.Quote(consultationProviderName) + "\n" +
 		"model_reasoning_effort = " + strconv.Quote(config.ReasoningEffort) + "\n" +
-		"disable_response_storage = " + strconv.FormatBool(config.DisableResponseStorage) + "\n\n" +
+		"disable_response_storage = true\n\n" +
 		"[model_providers." + consultationProviderName + "]\n" +
 		"name = \"QQ consultation proxy\"\n" +
 		"wire_api = \"responses\"\n" +
@@ -222,6 +222,10 @@ func consultationConfigTOML(config consultationConfig, proxyURL string) string {
 
 type consultationProxy struct {
 	mu       sync.RWMutex
+	once     sync.Once
+	ctx      context.Context
+	cancel   context.CancelFunc
+	wg       sync.WaitGroup
 	listener net.Listener
 	server   *http.Server
 	token    []byte
@@ -243,9 +247,11 @@ func startConsultationProxy(ctx context.Context, baseURL *url.URL, apiKey string
 		return errors.New("consultation proxy redirects are not allowed")
 	}
 	client = &clientCopy
-	p := &consultationProxy{listener: listener, token: append([]byte(nil), token...), baseURL: baseURL, apiKey: apiKey, client: client}
+	proxyCtx, cancel := context.WithCancel(ctx)
+	p := &consultationProxy{ctx: proxyCtx, cancel: cancel, listener: listener, token: append([]byte(nil), token...), baseURL: baseURL, apiKey: apiKey, client: client}
 	p.server = &http.Server{Handler: http.HandlerFunc(p.serveHTTP), ReadHeaderTimeout: 5 * time.Second, MaxHeaderBytes: 16 << 10}
-	go func() { _ = p.server.Serve(listener) }()
+	p.wg.Add(1)
+	go func() { defer p.wg.Done(); _ = p.server.Serve(listener) }()
 	go func() { <-ctx.Done(); _ = p.Close() }()
 	return p, nil
 }
@@ -253,12 +259,24 @@ func startConsultationProxy(ctx context.Context, baseURL *url.URL, apiKey string
 func (p *consultationProxy) URL() string { return "http://" + p.listener.Addr().String() }
 
 func (p *consultationProxy) Close() error {
-	p.mu.Lock()
-	p.token = nil
-	p.mu.Unlock()
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	return p.server.Shutdown(ctx)
+	var closeErr error
+	p.once.Do(func() {
+		p.mu.Lock()
+		p.token = nil
+		p.mu.Unlock()
+		p.cancel()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		closeErr = p.server.Shutdown(ctx)
+		if errors.Is(closeErr, context.DeadlineExceeded) {
+			closeErr = errors.Join(closeErr, p.server.Close())
+		}
+		if closer, ok := p.client.Transport.(interface{ CloseIdleConnections() }); ok {
+			closer.CloseIdleConnections()
+		}
+		p.wg.Wait()
+	})
+	return closeErr
 }
 
 func (p *consultationProxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
@@ -280,7 +298,10 @@ func (p *consultationProxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	upstream := *p.baseURL
 	upstream.Path = pathpkg.Join(p.baseURL.Path, "responses")
-	request, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstream.String(), bytes.NewReader(body))
+	requestCtx, cancel := context.WithCancel(p.ctx)
+	stop := context.AfterFunc(r.Context(), cancel)
+	defer func() { stop(); cancel() }()
+	request, err := http.NewRequestWithContext(requestCtx, http.MethodPost, upstream.String(), bytes.NewReader(body))
 	if err != nil {
 		http.Error(w, "upstream request failed", http.StatusBadGateway)
 		return

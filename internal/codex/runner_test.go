@@ -353,8 +353,8 @@ func TestRunnerAskArgumentsWithoutGitOrSession(t *testing.T) {
 		t.Fatalf("Ask wrote helper record outside sandbox: %v", err)
 	}
 	record := readHelperRecordEvent(t, result.EventsJSONL)
-	want := []string{"exec", "-c", "shell_environment_policy.inherit=all", "-c", "shell_environment_policy.ignore_default_excludes=false",
-		"--ask-for-approval", "never", "--strict-config", "--ignore-rules",
+	want := []string{"--ask-for-approval", "never", "exec", "-c", "shell_environment_policy.inherit=all", "-c", "shell_environment_policy.ignore_default_excludes=false",
+		"--strict-config", "--ignore-rules",
 		"--disable", "plugins", "--disable", "apps", "--disable", "browser_use", "--disable", "computer_use", "--disable", "image_generation", "--disable", "search_tool",
 		"-C", consultationWorkspacePath, "--sandbox", "read-only", "--ephemeral", "--skip-git-repo-check", "--json", "-o", record.LastPath, "--", "consult"}
 	if !reflect.DeepEqual(record.Args, want) {
@@ -538,6 +538,24 @@ func TestConsultationConfigSnapshotDropsUnrelatedTopLevelFields(t *testing.T) {
 	}
 	if strings.Contains(string(data), "personality") || strings.Contains(string(data), "sandbox_mode") {
 		t.Fatalf("snapshot retained unrelated configuration: %s", data)
+	}
+}
+
+func TestConsultationSnapshotForcesResponseStorageDisabled(t *testing.T) {
+	codexHome := t.TempDir()
+	config := strings.Replace(validConsultationConfig, "disable_response_storage = true", "disable_response_storage = false", 1)
+	writeConsultationConfig(t, codexHome, config)
+	snapshot, err := loadConsultationConfig(codexHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.file.Close()
+	data, err := io.ReadAll(snapshot.file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "disable_response_storage = true") || strings.Contains(string(data), "disable_response_storage = false") {
+		t.Fatalf("snapshot response storage setting = %s", data)
 	}
 }
 

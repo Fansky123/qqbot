@@ -609,8 +609,8 @@ func invocationArgs(kind invocation, req Request, schemaPath, lastPath string, t
 		args = append(args, workspaceTempPolicyArgs()...)
 		return append(args, "--json", "-o", lastPath, "--", req.SessionID, req.Prompt)
 	case invocationConsult:
-		args := append([]string{"exec"}, policy...)
-		args = append(args, "--ask-for-approval", "never", "--strict-config", "--ignore-rules",
+		args := append([]string{"--ask-for-approval", "never", "exec"}, policy...)
+		args = append(args, "--strict-config", "--ignore-rules",
 			"--disable", "plugins", "--disable", "apps", "--disable", "browser_use", "--disable", "computer_use", "--disable", "image_generation", "--disable", "search_tool")
 		return append(args, "-C", consultationWorkspacePath, "--sandbox", "read-only", "--ephemeral", "--skip-git-repo-check",
 			"--json", "-o", lastPath, "--", req.Prompt)
