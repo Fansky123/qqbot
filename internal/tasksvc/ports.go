@@ -52,6 +52,11 @@ type Notifier interface {
 	Send(context.Context, string, string) error
 }
 
+// TextRedactor removes exact configured secret values from user-visible text.
+type TextRedactor interface {
+	RedactText(string) string
+}
+
 // LogReader returns a redacted, bounded task-log summary.
 type LogReader interface {
 	Summary(taskID string, maxRunes int) (string, error)

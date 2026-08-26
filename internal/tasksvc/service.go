@@ -50,16 +50,12 @@ type Service struct {
 	scheduler  SchedulerControl
 	notifier   Notifier
 	logs       LogReader
-	redactor   textRedactor
+	redactor   TextRedactor
 	locks      keyedLocks
 }
 
-type textRedactor interface {
-	RedactText(string) string
-}
-
 func NewService(registry *config.Registry, db *store.Store, authorizer auth.Authorizer, planner Planner, scheduler SchedulerControl, notifier Notifier, logs LogReader) *Service {
-	redactor, _ := logs.(textRedactor)
+	redactor, _ := logs.(TextRedactor)
 	return &Service{
 		registry:   registry,
 		db:         db,
@@ -570,13 +566,24 @@ func fatalStore(err error) error {
 }
 
 func (s *Service) boundNotification(text string) string {
-	return bound(s.sanitize(text))
+	return NotificationText(s.redactor, text)
 }
 
 func (s *Service) sanitize(text string) string {
+	return sanitizeText(s.redactor, text)
+}
+
+// NotificationText applies the same credential redaction and QQ message bound as task notifications.
+func NotificationText(redactor TextRedactor, text string) string {
+	return bound(sanitizeText(redactor, text))
+}
+
+func sanitizeText(redactor TextRedactor, text string) string {
+	text = strings.ToValidUTF8(text, "�")
 	text = notificationSecretAssignment.ReplaceAllString(text, "[REDACTED]")
 	text = notificationBearer.ReplaceAllString(text, "Bearer [REDACTED]")
-	return s.redactor.RedactText(text)
+	text = redactor.RedactText(text)
+	return strings.ToValidUTF8(text, "�")
 }
 
 func (s *Service) sanitizePlan(plan codex.Plan) codex.Plan {

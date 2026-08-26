@@ -939,10 +939,7 @@ func (s *Scheduler) notify(ctx context.Context, groupID, message string) {
 }
 
 func (s *Scheduler) safeText(value string) string {
-	value = strings.ToValidUTF8(value, "�")
-	value = notificationSecretAssignment.ReplaceAllString(value, "[REDACTED]")
-	value = notificationBearer.ReplaceAllString(value, "Bearer [REDACTED]")
-	return s.logs.RedactText(value)
+	return sanitizeText(s.logs, value)
 }
 
 func (s *Scheduler) cancelAll() {
