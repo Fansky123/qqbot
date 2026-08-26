@@ -264,6 +264,10 @@ func (c *Client) serve(ctx context.Context, cfg clientConfig, events chan<- Grou
 			continue
 		default:
 			session.shutdown(fmt.Errorf("%w: message handler backlog is full", ErrDisconnected))
+			select {
+			case events <- message:
+			case <-ctx.Done():
+			}
 			return connectedAt
 		}
 	}

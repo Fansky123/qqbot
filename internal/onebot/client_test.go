@@ -830,6 +830,138 @@ func TestClientCancellationWaitsForContextAwareHandler(t *testing.T) {
 	receive(t, returned)
 }
 
+func TestClientBacklogDisconnectPreservesOverflowEvent(t *testing.T) {
+	t.Parallel()
+
+	const eventCount = eventQueueSize + 2
+	handlerStarted := make(chan struct{})
+	releaseHandler := make(chan struct{})
+	firstClosed := make(chan struct{})
+	reconnected := make(chan struct{}, 1)
+	var connections atomic.Int32
+	server := newWebSocketServer(t, func(ctx context.Context, conn *websocket.Conn, _ *http.Request) {
+		if connections.Add(1) != 1 {
+			reconnected <- struct{}{}
+			<-ctx.Done()
+			return
+		}
+		if wsjson.Write(ctx, conn, groupEvent(1)) != nil {
+			return
+		}
+		select {
+		case <-handlerStarted:
+		case <-ctx.Done():
+			return
+		}
+		for id := 2; id <= eventCount; id++ {
+			if wsjson.Write(ctx, conn, groupEvent(id)) != nil {
+				return
+			}
+		}
+		var ignored json.RawMessage
+		_ = wsjson.Read(ctx, conn, &ignored)
+		close(firstClosed)
+	})
+	defer server.Close()
+
+	client := &Client{URL: webSocketURL(server.URL), Token: "token", SelfID: "4", MessageRunes: 1200}
+	client.sleep = func(context.Context, time.Duration) error { return nil }
+	runCtx, stop := context.WithCancel(context.Background())
+	runErr := make(chan error, 1)
+	processed := make(chan string, eventCount)
+	go func() {
+		runErr <- client.Run(runCtx, func(_ context.Context, message GroupMessage) error {
+			if message.MessageID == "1" {
+				close(handlerStarted)
+				<-releaseHandler
+			}
+			processed <- string(message.MessageID)
+			return nil
+		})
+	}()
+
+	receive(t, firstClosed)
+	close(releaseHandler)
+	receive(t, reconnected)
+	for id := 1; id <= eventCount; id++ {
+		select {
+		case got := <-processed:
+			if want := fmt.Sprint(id); got != want {
+				t.Fatalf("processed message %d = %q, want %q", id, got, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("message %d was not processed", id)
+		}
+	}
+	select {
+	case duplicate := <-processed:
+		t.Fatalf("message %q was processed more than once", duplicate)
+	default:
+	}
+
+	stop()
+	if err := receive(t, runErr); err != nil {
+		t.Fatalf("Run returned %v", err)
+	}
+}
+
+func TestClientCancellationWhileBacklogFullReturnsPromptly(t *testing.T) {
+	t.Parallel()
+
+	handlerStarted := make(chan struct{})
+	firstClosed := make(chan struct{})
+	server := newWebSocketServer(t, func(ctx context.Context, conn *websocket.Conn, _ *http.Request) {
+		if wsjson.Write(ctx, conn, groupEvent(1)) != nil {
+			return
+		}
+		select {
+		case <-handlerStarted:
+		case <-ctx.Done():
+			return
+		}
+		for id := 2; id <= eventQueueSize+2; id++ {
+			if wsjson.Write(ctx, conn, groupEvent(id)) != nil {
+				return
+			}
+		}
+		var ignored json.RawMessage
+		_ = wsjson.Read(ctx, conn, &ignored)
+		close(firstClosed)
+	})
+	defer server.Close()
+
+	client := &Client{URL: webSocketURL(server.URL), Token: "token", SelfID: "4", MessageRunes: 1200}
+	runCtx, stop := context.WithCancel(context.Background())
+	runErr := make(chan error, 1)
+	go func() {
+		runErr <- client.Run(runCtx, func(ctx context.Context, message GroupMessage) error {
+			if message.MessageID == "1" {
+				close(handlerStarted)
+				<-ctx.Done()
+			}
+			return nil
+		})
+	}()
+	receive(t, firstClosed)
+	stop()
+	select {
+	case err := <-runErr:
+		if err != nil {
+			t.Fatalf("Run returned %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run did not return after cancellation with a full backlog")
+	}
+}
+
+func groupEvent(messageID int) map[string]any {
+	return map[string]any{
+		"post_type": "message", "message_type": "group",
+		"message_id": messageID, "group_id": 2, "user_id": 3, "self_id": 4,
+		"message": []any{map[string]any{"type": "text", "data": map[string]any{"text": fmt.Sprintf("event-%d", messageID)}}},
+	}
+}
+
 func newWebSocketServer(t *testing.T, handle func(context.Context, *websocket.Conn, *http.Request)) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
