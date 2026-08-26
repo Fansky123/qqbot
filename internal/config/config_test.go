@@ -187,10 +187,18 @@ func TestLoadValidatesConsultationConfig(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name: "non-positive timeout",
+			name: "zero timeout",
 			consultation: map[string]any{
 				"workspace":       filepath.Join(t.TempDir(), "consultation"),
 				"timeout_seconds": 0,
+			},
+			wantErr: true,
+		},
+		{
+			name: "negative timeout",
+			consultation: map[string]any{
+				"workspace":       filepath.Join(t.TempDir(), "consultation"),
+				"timeout_seconds": -1,
 			},
 			wantErr: true,
 		},

@@ -158,6 +158,15 @@ func TestValidateStartupRejectsConsultationWorkspaceOverlap(t *testing.T) {
 	}{
 		{name: "database parent", workspace: func(cfg config.Config) string { return filepath.Dir(cfg.DatabasePath) }},
 		{name: "log root", workspace: func(cfg config.Config) string { return cfg.LogDir }},
+		{name: "nested under log root", workspace: func(cfg config.Config) string { return filepath.Join(cfg.LogDir, "consultation") }},
+		{
+			name:      "contains protected roots",
+			workspace: func(cfg config.Config) string { return filepath.Dir(cfg.LogDir) },
+			prepare: func(cfg *config.Config) error {
+				cfg.Projects = nil
+				return nil
+			},
+		},
 		{name: "worktree root", workspace: func(cfg config.Config) string { return cfg.WorktreeRoot }},
 		{
 			name:      "project repository",
