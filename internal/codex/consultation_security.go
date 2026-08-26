@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -32,10 +33,9 @@ const (
 )
 
 type consultationConfig struct {
-	Model                  string
-	ReasoningEffort        string
-	DisableResponseStorage bool
-	BaseURL                *url.URL
+	Model           string
+	ReasoningEffort string
+	BaseURL         *url.URL
 }
 
 type consultationSnapshot struct {
@@ -157,8 +157,8 @@ func parseConsultationConfig(data []byte) (consultationConfig, error) {
 		return consultationConfig{}, errors.New("codex config.toml requires model_reasoning_effort")
 	}
 	disableStorage, ok := root["disable_response_storage"].(bool)
-	if !ok {
-		return consultationConfig{}, errors.New("codex config.toml requires disable_response_storage")
+	if !ok || !disableStorage {
+		return consultationConfig{}, errors.New("codex config.toml requires disable_response_storage = true")
 	}
 	providers, ok := root["model_providers"].(map[string]any)
 	if !ok {
@@ -189,7 +189,7 @@ func parseConsultationConfig(data []byte) (consultationConfig, error) {
 	if err != nil {
 		return consultationConfig{}, err
 	}
-	return consultationConfig{Model: model, ReasoningEffort: reasoning, DisableResponseStorage: disableStorage, BaseURL: parsed}, nil
+	return consultationConfig{Model: model, ReasoningEffort: reasoning, BaseURL: parsed}, nil
 }
 
 func parseConsultationBaseURL(raw string) (*url.URL, error) {
@@ -211,8 +211,7 @@ func parseConsultationBaseURL(raw string) (*url.URL, error) {
 func consultationConfigTOML(config consultationConfig, proxyURL string) string {
 	return "model = " + strconv.Quote(config.Model) + "\n" +
 		"model_provider = " + strconv.Quote(consultationProviderName) + "\n" +
-		"model_reasoning_effort = " + strconv.Quote(config.ReasoningEffort) + "\n" +
-		"disable_response_storage = true\n\n" +
+		"model_reasoning_effort = " + strconv.Quote(config.ReasoningEffort) + "\n\n" +
 		"[model_providers." + consultationProviderName + "]\n" +
 		"name = \"QQ consultation proxy\"\n" +
 		"wire_api = \"responses\"\n" +
@@ -296,6 +295,11 @@ func (p *consultationProxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
+	body, err = consultationRequestBody(body)
+	if err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
 	upstream := *p.baseURL
 	upstream.Path = pathpkg.Join(p.baseURL.Path, "responses")
 	requestCtx, cancel := context.WithCancel(p.ctx)
@@ -332,6 +336,15 @@ func (p *consultationProxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+}
+
+func consultationRequestBody(body []byte) ([]byte, error) {
+	var request map[string]json.RawMessage
+	if err := json.Unmarshal(body, &request); err != nil || request == nil {
+		return nil, errors.New("consultation request must be a JSON object")
+	}
+	request["store"] = json.RawMessage("false")
+	return json.Marshal(request)
 }
 
 func validConsultationBearer(value string, token []byte) bool {

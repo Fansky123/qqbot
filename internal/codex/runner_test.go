@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -543,21 +544,207 @@ func TestConsultationConfigSnapshotDropsUnrelatedTopLevelFields(t *testing.T) {
 	}
 }
 
-func TestConsultationSnapshotForcesResponseStorageDisabled(t *testing.T) {
+func TestConsultationConfigRejectsResponseStorageEnabled(t *testing.T) {
 	codexHome := t.TempDir()
 	config := strings.Replace(validConsultationConfig, "disable_response_storage = true", "disable_response_storage = false", 1)
 	writeConsultationConfig(t, codexHome, config)
+	if _, err := loadConsultationConfig(codexHome); err == nil || !strings.Contains(err.Error(), "disable_response_storage") {
+		t.Fatalf("loadConsultationConfig() error = %v, want response storage rejection", err)
+	}
+}
+
+func TestConsultationSnapshotOmitsLegacyResponseStorageField(t *testing.T) {
+	codexHome := t.TempDir()
+	writeConsultationConfig(t, codexHome, validConsultationConfig)
 	snapshot, err := loadConsultationConfig(codexHome)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer snapshot.file.Close()
+	defer func() {
+		if err := snapshot.file.Close(); err != nil {
+			t.Errorf("close consultation snapshot: %v", err)
+		}
+	}()
 	data, err := io.ReadAll(snapshot.file)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(data), "disable_response_storage = true") || strings.Contains(string(data), "disable_response_storage = false") {
-		t.Fatalf("snapshot response storage setting = %s", data)
+	if strings.Contains(string(data), "disable_response_storage") {
+		t.Fatalf("snapshot retained unsupported response storage field: %s", data)
+	}
+}
+
+func TestConsultationSnapshotAcceptedByInstalledStrictCodex(t *testing.T) {
+	binary, err := exec.LookPath("codex")
+	if errors.Is(err, exec.ErrNotFound) {
+		t.Skip("installed Codex CLI is unavailable")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	reached := make(chan struct{}, 1)
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == consultationResponsesPath {
+			select {
+			case reached <- struct{}{}:
+			default:
+			}
+		}
+		http.Error(w, "probe complete", http.StatusBadGateway)
+	}))
+	defer proxy.Close()
+
+	home := t.TempDir()
+	writeConsultationConfig(t, home, consultationConfigTOML(consultationConfig{
+		Model: "gpt-test", ReasoningEffort: "low",
+	}, proxy.URL+"/v1"))
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, binary,
+		"--ask-for-approval", "never", "exec", "--strict-config", "--ignore-rules",
+		"--disable", "plugins", "--disable", "apps", "--disable", "browser_use",
+		"--disable", "computer_use", "--disable", "image_generation", "--disable", "search_tool",
+		"-C", t.TempDir(), "--sandbox", "read-only", "--ephemeral", "--skip-git-repo-check", "--json", "--", "probe",
+	)
+	cmd.Env = []string{
+		"HOME=" + home, "CODEX_HOME=" + home,
+		"CODEX_API_KEY=probe-key", "OPENAI_API_KEY=probe-key",
+		"PATH=" + os.Getenv("PATH"),
+	}
+	output := &bytes.Buffer{}
+	cmd.Stdout, cmd.Stderr = output, output
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case <-reached:
+		cancel()
+		<-done
+	case err := <-done:
+		t.Fatalf("installed Codex exited before reaching the provider: %v\n%s", err, output)
+	case <-ctx.Done():
+		<-done
+		t.Fatalf("installed Codex did not accept the generated strict config: %v\n%s", ctx.Err(), output)
+	}
+}
+
+func TestConsultationProxyForcesResponseStorageDisabled(t *testing.T) {
+	requests := make(chan []byte, 1)
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		requests <- body
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: ok\n\n")
+	}))
+	defer upstream.Close()
+	base, err := parseConsultationBaseURL(upstream.URL + "/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy, err := startConsultationProxy(context.Background(), base, "real-key", []byte("storage-token"), upstream.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := proxy.Close(); err != nil {
+			t.Errorf("close consultation proxy: %v", err)
+		}
+	}()
+
+	for _, tt := range []struct {
+		name string
+		body string
+	}{
+		{name: "omitted", body: `{"input":"hello","temperature":0.25}`},
+		{name: "enabled", body: `{"input":"hello","store":true}`},
+		{name: "duplicate enabled", body: `{"store":true,"input":"hello","store":true}`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			request, err := http.NewRequest(http.MethodPost, proxy.URL()+consultationResponsesPath, strings.NewReader(tt.body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			request.Header.Set("Authorization", "Bearer storage-token")
+			response, err := http.DefaultClient.Do(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := response.Body.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if response.StatusCode != http.StatusOK {
+				t.Fatalf("proxy status = %d", response.StatusCode)
+			}
+			forwarded := <-requests
+			var got map[string]json.RawMessage
+			if err := json.Unmarshal(forwarded, &got); err != nil {
+				t.Fatalf("decode forwarded request: %v", err)
+			}
+			if string(got["store"]) != "false" {
+				t.Fatalf("forwarded store = %s, want false: %s", got["store"], forwarded)
+			}
+			if string(got["input"]) != `"hello"` {
+				t.Fatalf("forwarded input = %s, want preserved", got["input"])
+			}
+			if count := bytes.Count(forwarded, []byte(`"store"`)); count != 1 {
+				t.Fatalf("forwarded store key count = %d, want 1: %s", count, forwarded)
+			}
+			if tt.name == "omitted" && string(got["temperature"]) != "0.25" {
+				t.Fatalf("forwarded temperature = %s, want preserved", got["temperature"])
+			}
+		})
+	}
+}
+
+func TestConsultationProxyRejectsInvalidJSONBeforeUpstream(t *testing.T) {
+	var requests atomic.Int32
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	base, err := parseConsultationBaseURL(upstream.URL + "/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy, err := startConsultationProxy(context.Background(), base, "real-key", []byte("json-token"), upstream.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := proxy.Close(); err != nil {
+			t.Errorf("close consultation proxy: %v", err)
+		}
+	}()
+
+	for _, tt := range []struct{ name, body string }{
+		{name: "malformed", body: `{"input":`},
+		{name: "array", body: `[]`},
+		{name: "null", body: `null`},
+		{name: "trailing JSON", body: `{"input":"hello"} {}`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			request, err := http.NewRequest(http.MethodPost, proxy.URL()+consultationResponsesPath, strings.NewReader(tt.body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			request.Header.Set("Authorization", "Bearer json-token")
+			response, err := http.DefaultClient.Do(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := response.Body.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if response.StatusCode != http.StatusBadRequest {
+				t.Fatalf("proxy status = %d, want bad request", response.StatusCode)
+			}
+			if got := requests.Load(); got != 0 {
+				t.Fatalf("invalid JSON reached upstream %d times", got)
+			}
+		})
 	}
 }
 
@@ -605,7 +792,7 @@ func TestConsultationProxyForwardsOnlyAuthenticatedResponses(t *testing.T) {
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("proxy status = %d", response.StatusCode)
 	}
-	if got.Path != "/v1/responses" || got.Authorization != "Bearer real-key" || got.Cookie != "" || got.Forwarded != "" || got.Body != `{"input":"hello"}` {
+	if got.Path != "/v1/responses" || got.Authorization != "Bearer real-key" || got.Cookie != "" || got.Forwarded != "" || got.Body != `{"input":"hello","store":false}` {
 		t.Fatalf("upstream request = %#v", got)
 	}
 
