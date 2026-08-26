@@ -34,7 +34,7 @@ func TestValidateStartupDoesNotChangeExistingPrivateDirectoryMode(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := validateStartup(&cfg); err == nil {
+	if err := validateStartupForTest(t, &cfg); err == nil {
 		t.Fatal("validateStartup accepted group-readable log directory")
 	}
 	after, err := os.Stat(cfg.LogDir)
@@ -72,7 +72,7 @@ func TestValidateStartupRejectsRootAndSymlinkAndOverlap(t *testing.T) {
 				}
 			}
 			test.edit(&cfg, root)
-			if err := validateStartup(&cfg); err == nil {
+			if err := validateStartupForTest(t, &cfg); err == nil {
 				t.Fatal("validateStartup accepted unsafe path")
 			}
 		})
@@ -88,7 +88,7 @@ func TestValidateStartupRejectsNonGitMissingRefCheckAndOpsMismatch(t *testing.T)
 		if err := os.Mkdir(cfg.WorktreeRoot, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		if err := validateStartup(&cfg); err == nil {
+		if err := validateStartupForTest(t, &cfg); err == nil {
 			t.Fatal("accepted non-Git repository")
 		}
 	})
@@ -97,7 +97,7 @@ func TestValidateStartupRejectsNonGitMissingRefCheckAndOpsMismatch(t *testing.T)
 		cfg, opsPath := validGitConfig(t)
 		cfg.Projects[0].Checks = [][]string{{"qqcodex-check-does-not-exist"}}
 		cfg.OpsCommand = []string{"/bin/true", "-config", opsPath}
-		if err := validateStartup(&cfg); err == nil {
+		if err := validateStartupForTest(t, &cfg); err == nil {
 			t.Fatal("accepted missing check executable")
 		}
 	})
@@ -106,7 +106,7 @@ func TestValidateStartupRejectsNonGitMissingRefCheckAndOpsMismatch(t *testing.T)
 		cfg, opsPath := validGitConfig(t)
 		cfg.OpsCommand = []string{"/bin/true", "-config", opsPath}
 		cfg.Projects[0].BaseBranch = "does-not-exist"
-		if err := validateStartup(&cfg); err == nil {
+		if err := validateStartupForTest(t, &cfg); err == nil {
 			t.Fatal("accepted missing base ref")
 		}
 	})
@@ -116,49 +116,9 @@ func TestValidateStartupRejectsNonGitMissingRefCheckAndOpsMismatch(t *testing.T)
 func TestValidateStartupAcceptsValidGitConfig(t *testing.T) {
 	cfg, _ := validGitConfig(t)
 	cfg.OpsCommand[2] = filepath.Join(t.TempDir(), "worker-must-not-read-ops.json")
-	if err := validateStartup(&cfg); err != nil {
+	if err := validateStartupForTest(t, &cfg); err != nil {
 		t.Fatalf("validateStartup(valid) = %v", err)
 	}
-	want, err := exec.LookPath("bwrap")
-	if err != nil {
-		t.Fatal(err)
-	}
-	want, err = filepath.Abs(want)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.Consultation.SandboxBinary != want {
-		t.Fatalf("consultation sandbox = %q, want %q", cfg.Consultation.SandboxBinary, want)
-	}
-}
-
-func TestValidateStartupRejectsMissingOrInvalidBubblewrap(t *testing.T) {
-	t.Run("missing", func(t *testing.T) {
-		cfg, _ := validGitConfig(t)
-		err := validateStartupWithLookPath(&cfg, func(name string) (string, error) {
-			if name == "bwrap" {
-				return "", exec.ErrNotFound
-			}
-			return exec.LookPath(name)
-		})
-		if err == nil || !strings.Contains(err.Error(), "consultation sandbox") {
-			t.Fatalf("validateStartup error = %v, want unavailable consultation sandbox", err)
-		}
-	})
-
-	t.Run("not regular", func(t *testing.T) {
-		cfg, _ := validGitConfig(t)
-		dir := t.TempDir()
-		err := validateStartupWithLookPath(&cfg, func(name string) (string, error) {
-			if name == "bwrap" {
-				return dir, nil
-			}
-			return exec.LookPath(name)
-		})
-		if err == nil || !strings.Contains(err.Error(), "consultation sandbox") {
-			t.Fatalf("validateStartup error = %v, want invalid consultation sandbox", err)
-		}
-	})
 }
 
 func TestCleanupStartupIgnoresConsultationSandbox(t *testing.T) {
@@ -184,7 +144,7 @@ func TestValidateStartupCreatesPrivateConsultationWorkspace(t *testing.T) {
 		name     string
 		validate func(*config.Config) error
 	}{
-		{name: "runtime", validate: validateStartup},
+		{name: "runtime", validate: func(cfg *config.Config) error { return validateStartupForTest(t, cfg) }},
 		{name: "cleanup", validate: validateCleanupStartup},
 	}
 
@@ -244,7 +204,7 @@ func TestValidateStartupRejectsConsultationWorkspaceOverlap(t *testing.T) {
 				}
 			}
 			cfg = loadConfigWithConsultation(t, cfg, tt.workspace(cfg), 90)
-			if err := validateStartup(&cfg); err == nil || err.Error() != "configured paths overlap" {
+			if err := validateStartupForTest(t, &cfg); err == nil || err.Error() != "configured paths overlap" {
 				t.Fatalf("validateStartup() error = %v, want configured paths overlap", err)
 			}
 		})
@@ -256,7 +216,7 @@ func TestValidateStartupRejectsUnsafeOrDuplicateBranches(t *testing.T) {
 		t.Run("base "+branch, func(t *testing.T) {
 			cfg, _ := validGitConfig(t)
 			cfg.Projects[0].BaseBranch = branch
-			if err := validateStartup(&cfg); err == nil {
+			if err := validateStartupForTest(t, &cfg); err == nil {
 				t.Fatalf("accepted unsafe base branch %q", branch)
 			}
 		})
@@ -264,7 +224,7 @@ func TestValidateStartupRejectsUnsafeOrDuplicateBranches(t *testing.T) {
 	t.Run("same branches", func(t *testing.T) {
 		cfg, _ := validGitConfig(t)
 		cfg.Projects[0].RCBranch = cfg.Projects[0].BaseBranch
-		if err := validateStartup(&cfg); err == nil {
+		if err := validateStartupForTest(t, &cfg); err == nil {
 			t.Fatal("accepted identical base and RC branches")
 		}
 	})

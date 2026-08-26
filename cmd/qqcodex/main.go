@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"qqcodex/internal/app"
 	"qqcodex/internal/auth"
@@ -28,6 +29,18 @@ import (
 )
 
 type starter func(context.Context, config.Config, string, func(string) string, *slog.Logger, bool) error
+
+const (
+	productionSandboxPath         = "/usr/bin/bwrap"
+	productionSandboxProbeTimeout = 3 * time.Second
+)
+
+type sandboxStartupOptions struct {
+	path, root   string
+	trustedUID   uint32
+	probeTimeout time.Duration
+	probe        func(context.Context, string, string) error
+}
 
 func main() {
 	os.Exit(mainCode())
@@ -157,26 +170,24 @@ func buildAndCleanup(ctx context.Context, cfg config.Config) error {
 }
 
 func validateStartup(cfg *config.Config) error {
-	return validateStartupWithLookPath(cfg, exec.LookPath)
+	return validateStartupWithSandbox(cfg, sandboxStartupOptions{
+		path: productionSandboxPath, root: "/", trustedUID: 0,
+		probeTimeout: productionSandboxProbeTimeout, probe: probeConsultationSandbox,
+	})
 }
 
-func validateStartupWithLookPath(cfg *config.Config, lookPath func(string) (string, error)) error {
+func validateStartupWithSandbox(cfg *config.Config, sandbox sandboxStartupOptions) error {
 	if cfg == nil {
 		return errors.New("configuration is required")
 	}
-	if lookPath == nil {
-		return errors.New("executable lookup is required")
-	}
-	binary, err := resolveExecutable(cfg.Codex.Binary, "codex binary", lookPath)
+	binary, err := resolveCodexExecutable(cfg.Codex.Binary)
 	if err != nil {
 		return err
 	}
 	cfg.Codex.Binary = binary
-	sandboxBinary, err := resolveExecutable("bwrap", "consultation sandbox", lookPath)
-	if err != nil {
-		return err
+	if sandbox.probe == nil || sandbox.probeTimeout <= 0 || validateTrustedSandboxExecutable(sandbox.root, sandbox.path, sandbox.trustedUID) != nil {
+		return errors.New("consultation sandbox is invalid")
 	}
-	cfg.Consultation.SandboxBinary = sandboxBinary
 
 	if err := validateDatabasePath(cfg.DatabasePath); err != nil {
 		return errors.New("database directory is invalid")
@@ -198,23 +209,89 @@ func validateStartupWithLookPath(cfg *config.Config, lookPath func(string) (stri
 	if err := validatePathOverlap(cfg); err != nil {
 		return errors.New("configured paths overlap")
 	}
+	probeCtx, cancel := context.WithTimeout(context.Background(), sandbox.probeTimeout)
+	defer cancel()
+	if err := sandbox.probe(probeCtx, sandbox.path, cfg.Consultation.Workspace); err != nil || probeCtx.Err() != nil {
+		return errors.New("consultation sandbox probe failed")
+	}
+	cfg.Consultation.SandboxBinary = sandbox.path
 	return nil
 }
 
-func resolveExecutable(name, label string, lookPath func(string) (string, error)) (string, error) {
-	binary, err := lookPath(name)
+func resolveCodexExecutable(name string) (string, error) {
+	binary, err := exec.LookPath(name)
 	if err != nil {
-		return "", fmt.Errorf("%s is unavailable", label)
+		return "", errors.New("codex binary is unavailable")
 	}
 	binary, err = filepath.Abs(binary)
 	if err != nil {
-		return "", fmt.Errorf("%s is invalid", label)
+		return "", errors.New("codex binary is invalid")
 	}
 	info, err := os.Stat(binary)
 	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
-		return "", fmt.Errorf("%s is invalid", label)
+		return "", errors.New("codex binary is invalid")
 	}
 	return binary, nil
+}
+
+func validateTrustedSandboxExecutable(root, path string, trustedUID uint32) error {
+	root, path = filepath.Clean(root), filepath.Clean(path)
+	if !filepath.IsAbs(root) || !filepath.IsAbs(path) || path != filepath.Join(root, "usr", "bin", "bwrap") {
+		return errors.New("sandbox path is not absolute")
+	}
+	relative, err := filepath.Rel(root, path)
+	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return errors.New("sandbox path is outside trusted root")
+	}
+
+	components := append([]string{root}, strings.Split(relative, string(filepath.Separator))...)
+	current := components[0]
+	for index, component := range components {
+		if index > 0 {
+			current = filepath.Join(current, component)
+		}
+		info, err := os.Lstat(current)
+		if err != nil || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o022 != 0 {
+			return errors.New("sandbox path component is unsafe")
+		}
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok || stat.Uid != trustedUID {
+			return errors.New("sandbox path component owner is unsafe")
+		}
+		if index < len(components)-1 {
+			if !info.IsDir() {
+				return errors.New("sandbox path parent is not a directory")
+			}
+			continue
+		}
+		if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 || stat.Nlink != 1 {
+			return errors.New("sandbox executable is unsafe")
+		}
+	}
+	return nil
+}
+
+func probeConsultationSandbox(ctx context.Context, binary, workspace string) error {
+	cmd := exec.CommandContext(ctx, binary, consultationSandboxProbeArgs()...)
+	cmd.Dir = workspace
+	cmd.Env = []string{"PATH=/usr/bin:/bin"}
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	cmd.WaitDelay = time.Second
+	return cmd.Run()
+}
+
+func consultationSandboxProbeArgs() []string {
+	return []string{
+		"--die-with-parent", "--new-session", "--unshare-all", "--share-net", "--unshare-user", "--cap-drop", "ALL",
+		"--ro-bind", "/usr", "/usr",
+		"--symlink", "usr/bin", "/bin",
+		"--symlink", "usr/sbin", "/sbin",
+		"--symlink", "usr/lib", "/lib",
+		"--symlink", "usr/lib64", "/lib64",
+		"--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", "/run",
+		"--dir", "/workspace", "--chdir", "/workspace", "/bin/true",
+	}
 }
 
 func newCodexRunner(cfg config.Config, logs codex.LogSink) *codex.Runner {
