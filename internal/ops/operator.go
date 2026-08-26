@@ -318,7 +318,11 @@ func (o *Operator) MergeRC(ctx context.Context, projectID, taskID, taskCommit st
 	}
 	added = true
 	if _, err := o.runGit(ctx, worktree, "merge", "--no-ff", "--no-edit", taskCommit); err != nil {
-		return "", ErrMergeConflict
+		conflicts, inspectErr := o.runGit(ctx, worktree, "diff", "--name-only", "--diff-filter=U", "--")
+		if inspectErr == nil && conflicts != "" {
+			return "", ErrMergeConflict
+		}
+		return "", errors.New("RC merge failed")
 	}
 	merged, err := o.resolveCommit(ctx, worktree, "HEAD")
 	if err != nil {

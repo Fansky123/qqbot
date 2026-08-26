@@ -326,6 +326,8 @@ type Project struct {
 
 Implement `Load(path string) (Config, error)`, `Validate(Config) error`, and immutable `Registry.Project(alias string) (Project, bool)`. Validation must use `filepath.IsAbs`, reject aliases with surrounding whitespace, and accept only Unicode letters, Unicode digits, `_`, and `-` by checking each rune with `unicode.IsLetter`/`unicode.IsDigit`. Require at least one non-empty check argv, require every admin to also be an employee, and default `MessageRunes` to 1200 and `MessageWorkers` to 4 only during `Load`.
 
+The database path also defines one fixed sibling runtime-lock file. Task 14 must acquire its non-blocking OS advisory lock before recovery or any scheduler/message loop, keep the lock handle open for the entire application lifetime, and fail startup if another process already owns it. Do not substitute a TTL database lease: a paused first process must remain the sole owner because deployment cannot be replayed safely.
+
 - [ ] **Step 4: Add a secret-free example config**
 
 Create `configs/qqcodex.example.json` using `/srv/repos/order-api`, `/srv/qqcodex/worktrees`, environment variable name `NAPCAT_ACCESS_TOKEN`, example numeric IDs `10001` and `10002`, `go test ./...` as the check argv, and `./qqcodex-ops -config ./configs/ops.json` as `ops_command`. Do not include an actual token, Codex key, or Git credential.
@@ -1207,7 +1209,7 @@ Expected: FAIL because `App` and command wiring do not exist.
 
 Define `App.Run(ctx)` to:
 
-1. Call `Store.RecoverInterrupted` before starting external loops.
+1. Acquire the SQLite sibling runtime lock with `Store.AcquireRuntimeLock`, hold it until every application goroutine exits, then pass that same held guard to `Store.RecoverInterrupted`. Fail startup if the non-blocking lock is already owned. Never call recovery before acquiring the guard and never use a TTL lease for this process-level exclusion.
 2. Start scheduler in a goroutine.
 3. Run OneBot client and pass only messages from configured groups.
 4. Process each accepted message in a worker pool bounded by `Config.MessageWorkers` so Codex planning cannot block the WebSocket reader.

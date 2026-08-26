@@ -31,7 +31,8 @@ const taskColumns = `
 	version, created_at, updated_at`
 
 type Store struct {
-	db *sql.DB
+	db   *sql.DB
+	path string
 }
 
 func Open(path string) (*Store, error) {
@@ -67,7 +68,7 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	return &Store{db: db}, nil
+	return &Store{db: db, path: absolutePath}, nil
 }
 
 func ensureTaskTextColumn(db *sql.DB, column, description string) error {
@@ -774,7 +775,16 @@ func (s *Store) ReleaseSchedulerLease(ctx context.Context, taskID, owner string)
 	return nil
 }
 
-func (s *Store) RecoverInterrupted(ctx context.Context) error {
+func (s *Store) RecoverInterrupted(ctx context.Context, lock *RuntimeLock) error {
+	if lock == nil {
+		return ErrRuntimeLockRequired
+	}
+	return lock.withStore(s, func() error {
+		return s.recoverInterrupted(ctx)
+	})
+}
+
+func (s *Store) recoverInterrupted(ctx context.Context) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin interrupted task recovery: %w", err)

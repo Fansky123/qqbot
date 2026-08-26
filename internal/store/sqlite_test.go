@@ -653,7 +653,7 @@ func TestRecoverInterrupted(t *testing.T) {
 	}
 
 	before := time.Now().Add(-time.Second)
-	if err := db.RecoverInterrupted(ctx); err != nil {
+	if err := db.RecoverInterrupted(ctx, acquireTestRuntimeLock(t, db)); err != nil {
 		t.Fatal(err)
 	}
 	after := time.Now().Add(time.Second)
@@ -726,7 +726,7 @@ func TestRecoverInterruptedReleasesApprovalProjectLock(t *testing.T) {
 	if err := db.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM approval_execution_locks").Scan(&lockCount); err != nil || lockCount != 1 {
 		t.Fatalf("approval lock count = %d, %v", lockCount, err)
 	}
-	if err := db.RecoverInterrupted(ctx); err != nil {
+	if err := db.RecoverInterrupted(ctx, acquireTestRuntimeLock(t, db)); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := db.GetTask(ctx, interrupted.ID); err != nil || got.Status != model.StatusDeployFailed {
@@ -766,7 +766,7 @@ func TestRecoverInterruptedRollsBackOnFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := db.RecoverInterrupted(ctx); err == nil {
+	if err := db.RecoverInterrupted(ctx, acquireTestRuntimeLock(t, db)); err == nil {
 		t.Fatal("RecoverInterrupted succeeded despite rejecting trigger")
 	}
 	for _, status := range []model.Status{model.StatusRunning, model.StatusMerging} {

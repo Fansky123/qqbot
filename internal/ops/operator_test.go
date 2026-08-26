@@ -638,6 +638,25 @@ func TestOperatorMergeRCFailureLeavesRemoteUnchanged(t *testing.T) {
 			},
 		},
 		{
+			name: "merge command failure without conflicts",
+			prepare: func(t *testing.T, fixture *opsFixture) string {
+				branch, commit := fixture.createTaskCommit(t, testTaskID, "feature.txt", "feature\n")
+				if err := pushTaskBundle(t, fixture.operator, fixture.projectID, fixture.repo, testTaskID, branch, commit, nil); err != nil {
+					t.Fatal(err)
+				}
+				real := realGit(t)
+				wrapper := writeExecutable(t, filepath.Join(privateTempDir(t), "merge-failing-git"), `#!/bin/sh
+case " $* " in
+  *" merge --no-ff --no-edit "*) exit 88 ;;
+esac
+exec "`+real+`" "$@"
+`)
+				fixture.config.GitBinary = wrapper
+				fixture.operator = mustNewOperator(t, fixture.config)
+				return commit
+			},
+		},
+		{
 			name:      "merge conflict",
 			wantTyped: ErrMergeConflict,
 			prepare: func(t *testing.T, fixture *opsFixture) string {
@@ -673,6 +692,9 @@ func TestOperatorMergeRCFailureLeavesRemoteUnchanged(t *testing.T) {
 			}
 			if tt.wantTyped != nil && !errors.Is(mergeErr, tt.wantTyped) {
 				t.Fatalf("MergeRC() error = %v, want %v", mergeErr, tt.wantTyped)
+			}
+			if tt.wantTyped == nil && errors.Is(mergeErr, ErrMergeConflict) {
+				t.Fatalf("MergeRC() error = %v, want generic failure", mergeErr)
 			}
 			if got := fixture.remoteRef(t, "rc"); got != oldRC {
 				t.Fatalf("failed merge changed remote RC to %q, want %q", got, oldRC)
