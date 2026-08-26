@@ -64,7 +64,7 @@ CREATE TABLE IF NOT EXISTS processed_messages (
 );
 
 CREATE TABLE IF NOT EXISTS consultations (
-    id TEXT PRIMARY KEY,
+    id TEXT NOT NULL PRIMARY KEY,
     group_id TEXT NOT NULL,
     message_id TEXT NOT NULL,
     user_id TEXT NOT NULL,

@@ -1079,6 +1079,25 @@ func TestCreateConsultationDuplicateMessageConflicts(t *testing.T) {
 	}
 }
 
+func TestConsultationSchemaRejectsNullID(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	db := openTestStore(t)
+	now := time.UnixMilli(1_787_600_000_000).UTC()
+	_, err := db.db.ExecContext(ctx, `
+		INSERT INTO consultations (
+			id, group_id, message_id, user_id, project_id, question, reply, lease_token,
+			lease_expires_at, completed_at, created_at, updated_at
+		) VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		"group-1", "message-1", "user-1", "project-1", "question", "", "lease-1",
+		now.Add(time.Minute).UnixMilli(), 0, now.UnixMilli(), now.UnixMilli(),
+	)
+	if err == nil {
+		t.Fatal("consultation insert with NULL id succeeded")
+	}
+}
+
 func TestConsultationReclaimFencesCompletion(t *testing.T) {
 	t.Parallel()
 
