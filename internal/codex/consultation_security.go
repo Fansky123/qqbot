@@ -87,7 +87,7 @@ func (s *consultationSnapshot) setProxyURL(proxyURL string) error {
 
 func readPrivateConsultationConfig(codexHome string) ([]byte, error) {
 	if !filepath.IsAbs(codexHome) {
-		return nil, errors.New("Codex home must be absolute")
+		return nil, errors.New("codex home must be absolute")
 	}
 	rootFD, err := unix.Open("/", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
@@ -107,7 +107,7 @@ func readPrivateConsultationConfig(codexHome string) ([]byte, error) {
 		return nil, fmt.Errorf("stat Codex home: %w", err)
 	}
 	if homeStat.Uid != uint32(os.Getuid()) || homeStat.Mode&0o077 != 0 {
-		return nil, errors.New("Codex home is not private")
+		return nil, errors.New("codex home is not private")
 	}
 	fd, err := unix.Openat2(homeFD, "config.toml", &unix.OpenHow{
 		Flags:   unix.O_RDONLY | unix.O_CLOEXEC,
@@ -123,7 +123,7 @@ func readPrivateConsultationConfig(codexHome string) ([]byte, error) {
 		return nil, fmt.Errorf("stat Codex config.toml: %w", err)
 	}
 	if before.Uid != uint32(os.Getuid()) || before.Mode&unix.S_IFMT != unix.S_IFREG || before.Nlink != 1 || before.Mode&0o077 != 0 || before.Size < 0 || before.Size > maxConsultationConfigBytes {
-		return nil, errors.New("Codex config.toml is not a private regular file")
+		return nil, errors.New("codex config.toml is not a private regular file")
 	}
 	data := make([]byte, before.Size)
 	if _, err := io.ReadFull(file, data); err != nil {
@@ -134,7 +134,7 @@ func readPrivateConsultationConfig(codexHome string) ([]byte, error) {
 		return nil, fmt.Errorf("restat Codex config.toml: %w", err)
 	}
 	if before.Dev != after.Dev || before.Ino != after.Ino || before.Size != after.Size || before.Mtim != after.Mtim || before.Ctim != after.Ctim || before.Nlink != after.Nlink {
-		return nil, errors.New("Codex config.toml changed while reading")
+		return nil, errors.New("codex config.toml changed while reading")
 	}
 	return data, nil
 }
@@ -146,44 +146,44 @@ func parseConsultationConfig(data []byte) (consultationConfig, error) {
 	}
 	model, ok := root["model"].(string)
 	if !ok || model == "" {
-		return consultationConfig{}, errors.New("Codex config.toml requires model")
+		return consultationConfig{}, errors.New("codex config.toml requires model")
 	}
 	providerName, ok := root["model_provider"].(string)
 	if !ok || providerName == "" {
-		return consultationConfig{}, errors.New("Codex config.toml requires model_provider")
+		return consultationConfig{}, errors.New("codex config.toml requires model_provider")
 	}
 	reasoning, ok := root["model_reasoning_effort"].(string)
 	if !ok || reasoning == "" {
-		return consultationConfig{}, errors.New("Codex config.toml requires model_reasoning_effort")
+		return consultationConfig{}, errors.New("codex config.toml requires model_reasoning_effort")
 	}
 	disableStorage, ok := root["disable_response_storage"].(bool)
 	if !ok {
-		return consultationConfig{}, errors.New("Codex config.toml requires disable_response_storage")
+		return consultationConfig{}, errors.New("codex config.toml requires disable_response_storage")
 	}
 	providers, ok := root["model_providers"].(map[string]any)
 	if !ok {
-		return consultationConfig{}, errors.New("Codex config.toml requires model_providers")
+		return consultationConfig{}, errors.New("codex config.toml requires model_providers")
 	}
 	provider, ok := providers[providerName].(map[string]any)
 	if !ok {
-		return consultationConfig{}, errors.New("Codex config.toml active provider is missing")
+		return consultationConfig{}, errors.New("codex config.toml active provider is missing")
 	}
 	for key := range provider {
 		switch key {
 		case "name", "wire_api", "base_url", "requires_openai_auth":
 		default:
-			return consultationConfig{}, fmt.Errorf("Codex provider field %q is not allowed for consultation", key)
+			return consultationConfig{}, fmt.Errorf("codex provider field %q is not allowed for consultation", key)
 		}
 	}
 	if wire, ok := provider["wire_api"].(string); !ok || wire != "responses" {
-		return consultationConfig{}, errors.New("Codex provider must use responses wire API")
+		return consultationConfig{}, errors.New("codex provider must use responses wire API")
 	}
 	if auth, ok := provider["requires_openai_auth"].(bool); !ok || !auth {
-		return consultationConfig{}, errors.New("Codex provider must require OpenAI authentication")
+		return consultationConfig{}, errors.New("codex provider must require OpenAI authentication")
 	}
 	base, ok := provider["base_url"].(string)
 	if !ok {
-		return consultationConfig{}, errors.New("Codex provider requires base_url")
+		return consultationConfig{}, errors.New("codex provider requires base_url")
 	}
 	parsed, err := parseConsultationBaseURL(base)
 	if err != nil {
@@ -195,14 +195,14 @@ func parseConsultationConfig(data []byte) (consultationConfig, error) {
 func parseConsultationBaseURL(raw string) (*url.URL, error) {
 	u, err := url.Parse(raw)
 	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
-		return nil, errors.New("Codex provider base_url must be an absolute HTTPS URL without userinfo, query, or fragment")
+		return nil, errors.New("codex provider base_url must be an absolute HTTPS URL without userinfo, query, or fragment")
 	}
 	clean := pathpkg.Clean("/" + strings.TrimPrefix(u.Path, "/"))
 	if clean == "/." {
 		clean = "/"
 	}
 	if len(clean) > 512 || u.EscapedPath() != "" && u.Path != clean {
-		return nil, errors.New("Codex provider base_url has an invalid path")
+		return nil, errors.New("codex provider base_url has an invalid path")
 	}
 	u.Path, u.RawPath = clean, ""
 	return u, nil
