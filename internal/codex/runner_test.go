@@ -1,11 +1,14 @@
 package codex
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -45,6 +48,18 @@ const (
 	helperProbeOutside = "QQ_CODEX_HELPER_PROBE_OUTSIDE"
 	helperProbeWrite   = "QQ_CODEX_HELPER_PROBE_WRITE"
 )
+
+const validConsultationConfig = `model = "gpt-test"
+model_provider = "test"
+model_reasoning_effort = "medium"
+disable_response_storage = true
+
+[model_providers.test]
+name = "Test"
+wire_api = "responses"
+base_url = "https://api.example.test/v1"
+requires_openai_auth = true
+`
 
 type helperRecordData struct {
 	PID            int      `json:"pid"`
@@ -214,7 +229,7 @@ func sandboxRecordEnvironment(env []string) []string {
 	for _, entry := range env {
 		name, _, _ := strings.Cut(entry, "=")
 		switch name {
-		case "HOME", "CODEX_HOME", "TMPDIR", "TMP", "TEMP", "PATH":
+		case "HOME", "CODEX_HOME", "TMPDIR", "TMP", "TEMP", "PATH", "CODEX_API_KEY", "OPENAI_API_KEY", "KEEP_SECRET":
 			filtered = append(filtered, entry)
 		}
 	}
@@ -283,11 +298,10 @@ func TestRunnerPlanArgumentsAndTemporaryFiles(t *testing.T) {
 
 func TestConsultationSandboxArgumentsUseOnlyApprovedReadBoundary(t *testing.T) {
 	workingDir := "/host/projects/selected"
-	codexHome := "/host/codex-home"
-	args := consultationSandboxArgs("/host/bin/codex", Request{WorkingDir: workingDir}, []string{"CODEX_HOME=" + codexHome})
+	args := consultationSandboxArgs("/host/bin/codex", Request{WorkingDir: workingDir}, 4)
 
 	for _, sequence := range [][]string{
-		{"--die-with-parent", "--new-session", "--unshare-all", "--share-net", "--unshare-user", "--disable-userns", "--cap-drop", "ALL"},
+		{"--die-with-parent", "--new-session", "--unshare-all", "--share-net", "--unshare-user", "--cap-drop", "ALL"},
 		{"--ro-bind", "/usr", "/usr"},
 		{"--symlink", "usr/bin", "/bin"}, {"--symlink", "usr/sbin", "/sbin"}, {"--symlink", "usr/lib", "/lib"}, {"--symlink", "usr/lib64", "/lib64"},
 		{"--dev", "/dev"}, {"--proc", "/proc"}, {"--tmpfs", "/tmp"},
@@ -295,7 +309,7 @@ func TestConsultationSandboxArgumentsUseOnlyApprovedReadBoundary(t *testing.T) {
 		{"--ro-bind-try", "/etc/ssl/openssl.cnf", "/etc/ssl/openssl.cnf"}, {"--ro-bind-try", "/etc/resolv.conf", "/etc/resolv.conf"},
 		{"--ro-bind-try", "/etc/hosts", "/etc/hosts"}, {"--ro-bind-try", "/etc/nsswitch.conf", "/etc/nsswitch.conf"}, {"--ro-bind-try", "/etc/gai.conf", "/etc/gai.conf"},
 		{"--tmpfs", "/run"}, {"--ro-bind", "/host/bin/codex", consultationCodexPath}, {"--ro-bind", workingDir, consultationWorkspacePath},
-		{"--ro-bind-try", codexHome + "/config.toml", consultationCodexHomePath + "/config.toml"},
+		{"--ro-bind-data", "4", consultationCodexHomePath + "/config.toml"},
 		{"--setenv", "HOME", consultationHomePath}, {"--setenv", "CODEX_HOME", consultationCodexHomePath},
 		{"--setenv", "TMPDIR", "/tmp"}, {"--setenv", "TMP", "/tmp"}, {"--setenv", "TEMP", "/tmp"}, {"--chdir", consultationWorkspacePath},
 		{"--setenv", "PATH", consultationPATH},
@@ -308,7 +322,7 @@ func TestConsultationSandboxArgumentsUseOnlyApprovedReadBoundary(t *testing.T) {
 	allowedMountSources := map[string]bool{
 		"/usr": true, "/etc/ssl/certs": true, "/etc/ssl/openssl.cnf": true, "/etc/resolv.conf": true,
 		"/etc/hosts": true, "/etc/nsswitch.conf": true, "/etc/gai.conf": true, "/host/bin/codex": true,
-		workingDir: true, codexHome + "/config.toml": true,
+		workingDir: true,
 	}
 	for i, arg := range args {
 		if arg != "--ro-bind" && arg != "--ro-bind-try" && arg != "--bind" {
@@ -339,8 +353,10 @@ func TestRunnerAskArgumentsWithoutGitOrSession(t *testing.T) {
 		t.Fatalf("Ask wrote helper record outside sandbox: %v", err)
 	}
 	record := readHelperRecordEvent(t, result.EventsJSONL)
-	want := append([]string{"exec"}, expectedPolicyArgs(runner.KeepEnv)...)
-	want = append(want, "-C", consultationWorkspacePath, "--sandbox", "read-only", "--ephemeral", "--skip-git-repo-check", "--json", "-o", record.LastPath, "--", "consult")
+	want := []string{"exec", "-c", "shell_environment_policy.inherit=all", "-c", "shell_environment_policy.ignore_default_excludes=false",
+		"--ask-for-approval", "never", "--strict-config", "--ignore-rules",
+		"--disable", "plugins", "--disable", "apps", "--disable", "browser_use", "--disable", "computer_use", "--disable", "image_generation", "--disable", "search_tool",
+		"-C", consultationWorkspacePath, "--sandbox", "read-only", "--ephemeral", "--skip-git-repo-check", "--json", "-o", record.LastPath, "--", "consult"}
 	if !reflect.DeepEqual(record.Args, want) {
 		t.Fatalf("argv = %#v, want %#v", record.Args, want)
 	}
@@ -425,6 +441,31 @@ func TestRunnerAskBubblewrapConfinement(t *testing.T) {
 	}
 }
 
+func TestRunnerAskChildEnvironmentContainsOnlySyntheticCredentials(t *testing.T) {
+	runner, _, _ := helperRunner(t)
+	setEnv(t, "KEEP_SECRET", "keep-secret-must-not-reach-child")
+	setEnv(t, helperRecordEvent, "1")
+	runner.KeepEnv = askHelperEnvironment(append(runner.KeepEnv, "KEEP_SECRET"), helperRecordEvent)
+	result, err := runner.Ask(context.Background(), Request{TaskID: "Q-012345ABCDEF", WorkingDir: t.TempDir(), Prompt: "consult", Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := readHelperRecordEvent(t, result.EventsJSONL)
+	values := make(map[string]string)
+	for _, entry := range record.Env {
+		name, value, _ := strings.Cut(entry, "=")
+		values[name] = value
+	}
+	for _, name := range []string{"CODEX_API_KEY", "OPENAI_API_KEY"} {
+		if !strings.HasPrefix(values[name], "qqc_") || values[name] == os.Getenv("CODEX_API_KEY") {
+			t.Fatalf("%s = %q, want synthetic credential", name, values[name])
+		}
+	}
+	if values["KEEP_SECRET"] != "" || strings.Contains(string(result.EventsJSONL), "keep-secret-must-not-reach-child") {
+		t.Fatalf("Ask exposed KeepEnv secret: %#v", record.Env)
+	}
+}
+
 func TestRunnerAskRequiresSandboxBinary(t *testing.T) {
 	for _, sandboxBinary := range []string{"", filepath.Join(t.TempDir(), "missing-bwrap")} {
 		runner, _, recordPath := helperRunner(t)
@@ -440,7 +481,7 @@ func TestRunnerAskRequiresSandboxBinary(t *testing.T) {
 func TestRunnerAskRejectsSymlinkedCodexConfigBeforeSpawning(t *testing.T) {
 	runner, req, recordPath := helperRunner(t)
 	codexHome := filepath.Join(os.Getenv("HOME"), ".codex")
-	if err := os.Mkdir(codexHome, 0o700); err != nil {
+	if err := os.Remove(filepath.Join(codexHome, "config.toml")); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Symlink(t.TempDir(), filepath.Join(codexHome, "config.toml")); err != nil {
@@ -450,10 +491,164 @@ func TestRunnerAskRejectsSymlinkedCodexConfigBeforeSpawning(t *testing.T) {
 	_, err := runner.Ask(context.Background(), Request{
 		TaskID: "Q-012345ABCDEF", WorkingDir: req.WorkingDir, Prompt: "consult", Timeout: time.Second,
 	})
-	if err == nil || !strings.Contains(err.Error(), "config.toml") || !strings.Contains(err.Error(), "regular") {
+	if err == nil || !strings.Contains(err.Error(), "config.toml") {
 		t.Fatalf("Ask() error = %v, want rejected symlinked config", err)
 	}
 	assertNotCreated(t, recordPath)
+}
+
+func TestConsultationConfigSnapshotRejectsUnsafeFiles(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		mutate func(*testing.T, string)
+	}{
+		{"symlink", func(t *testing.T, path string) { replaceWithSymlink(t, path, t.TempDir()) }},
+		{"directory", func(t *testing.T, path string) { replaceWithDirectory(t, path) }},
+		{"hardlink", func(t *testing.T, path string) { addHardlink(t, path) }},
+		{"world readable", func(t *testing.T, path string) { chmodFile(t, path, 0o644) }},
+		{"oversized", func(t *testing.T, path string) {
+			writeFile(t, path, bytes.Repeat([]byte("x"), maxConsultationConfigBytes+1), 0o600)
+		}},
+		{"malformed", func(t *testing.T, path string) { writeFile(t, path, []byte("model = ["), 0o600) }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			codexHome := t.TempDir()
+			path := filepath.Join(codexHome, "config.toml")
+			writeConsultationConfig(t, codexHome, validConsultationConfig)
+			tt.mutate(t, path)
+			if _, err := loadConsultationConfig(codexHome); err == nil {
+				t.Fatal("loadConsultationConfig() error = nil, want unsafe config rejection")
+			}
+		})
+	}
+}
+
+func TestConsultationConfigSnapshotDropsUnrelatedTopLevelFields(t *testing.T) {
+	codexHome := t.TempDir()
+	config := strings.Replace(validConsultationConfig, "disable_response_storage = true\n", "disable_response_storage = true\npersonality = \"friendly\"\nsandbox_mode = \"danger-full-access\"\n", 1)
+	writeConsultationConfig(t, codexHome, config)
+	snapshot, err := loadConsultationConfig(codexHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.file.Close()
+	data, err := io.ReadAll(snapshot.file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "personality") || strings.Contains(string(data), "sandbox_mode") {
+		t.Fatalf("snapshot retained unrelated configuration: %s", data)
+	}
+}
+
+func TestConsultationProxyForwardsOnlyAuthenticatedResponses(t *testing.T) {
+	var got struct {
+		Path          string
+		Authorization string
+		Cookie        string
+		Forwarded     string
+		Body          string
+	}
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got.Path = r.URL.Path
+		got.Authorization = r.Header.Get("Authorization")
+		got.Cookie = r.Header.Get("Cookie")
+		got.Forwarded = r.Header.Get("Forwarded")
+		body, _ := io.ReadAll(r.Body)
+		got.Body = string(body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: ok\n\n")
+	}))
+	defer upstream.Close()
+	upstreamURL, err := parseConsultationBaseURL(upstream.URL + "/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy, err := startConsultationProxy(context.Background(), upstreamURL, "real-key", []byte("synthetic-token"), upstream.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proxy.Close()
+
+	request, err := http.NewRequest(http.MethodPost, proxy.URL()+consultationResponsesPath, strings.NewReader(`{"input":"hello"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer synthetic-token")
+	request.Header.Set("Cookie", "private")
+	request.Header.Set("Forwarded", "for=bad")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("proxy status = %d", response.StatusCode)
+	}
+	if got.Path != "/v1/responses" || got.Authorization != "Bearer real-key" || got.Cookie != "" || got.Forwarded != "" || got.Body != `{"input":"hello"}` {
+		t.Fatalf("upstream request = %#v", got)
+	}
+
+	for _, tt := range []struct{ name, method, path, auth string }{
+		{"bad token", http.MethodPost, consultationResponsesPath, "Bearer another-token"},
+		{"query", http.MethodPost, consultationResponsesPath + "?x=1", "Bearer synthetic-token"},
+		{"wrong path", http.MethodPost, "/other", "Bearer synthetic-token"},
+		{"wrong method", http.MethodGet, consultationResponsesPath, "Bearer synthetic-token"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			r, err := http.NewRequest(tt.method, proxy.URL()+tt.path, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r.Header.Set("Authorization", tt.auth)
+			res, err := http.DefaultClient.Do(r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer res.Body.Close()
+			if res.StatusCode != http.StatusForbidden {
+				t.Fatalf("status = %d, want forbidden", res.StatusCode)
+			}
+		})
+	}
+}
+
+func TestConsultationProxyRevokesTokenOnCloseAndAcrossInvocations(t *testing.T) {
+	base, err := parseConsultationBaseURL("https://api.example.test/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := startConsultationProxy(context.Background(), base, "real", []byte("first-token"), &http.Client{Transport: rejectingTransport{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := startConsultationProxy(context.Background(), base, "real", []byte("second-token"), &http.Client{Transport: rejectingTransport{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	request, err := http.NewRequest(http.MethodPost, second.URL()+consultationResponsesPath, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer first-token")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusForbidden {
+		t.Fatalf("cross invocation status = %d, want forbidden", response.StatusCode)
+	}
+	url := first.URL()
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_, err = http.Post(url+consultationResponsesPath, "application/json", nil)
+	if err == nil {
+		t.Fatal("closed proxy accepted a request")
+	}
 }
 
 func TestRunnerPlanDoesNotRequireConsultationSandbox(t *testing.T) {
@@ -701,7 +896,7 @@ func TestRunnerRejectsDefaultHomeAuthenticationWithExplicitCodexHome(t *testing.
 	runner, req, recordPath := helperRunner(t)
 	setEnv(t, "CODEX_HOME", t.TempDir())
 	defaultCodexHome := filepath.Join(os.Getenv("HOME"), ".codex")
-	if err := os.Mkdir(defaultCodexHome, 0o700); err != nil {
+	if err := os.MkdirAll(defaultCodexHome, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(defaultCodexHome, "auth.json"), []byte(`{"token":"cached"}`), 0o600); err != nil {
@@ -1591,6 +1786,10 @@ func helperRunner(t *testing.T) (Runner, Request, string) {
 	setEnv(t, "CODEX_API_KEY", "test-codex-api-key")
 	setEnv(t, "HOME", t.TempDir())
 	unsetEnv(t, "CODEX_HOME")
+	if err := os.Mkdir(filepath.Join(os.Getenv("HOME"), ".codex"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeConsultationConfig(t, filepath.Join(os.Getenv("HOME"), ".codex"), validConsultationConfig)
 	setEnv(t, helperEnabled, "1")
 	setEnv(t, helperRecord, recordPath)
 	for _, name := range []string{
@@ -1612,6 +1811,58 @@ func helperRunner(t *testing.T) (Runner, Request, string) {
 			Prompt:     "test prompt",
 			Timeout:    5 * time.Second,
 		}, recordPath
+}
+
+func writeConsultationConfig(t *testing.T, home, content string) {
+	t.Helper()
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(home, "config.toml"), []byte(content), 0o600)
+}
+
+func writeFile(t *testing.T, path string, data []byte, mode os.FileMode) {
+	t.Helper()
+	if err := os.WriteFile(path, data, mode); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func replaceWithSymlink(t *testing.T, path, target string) {
+	t.Helper()
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func replaceWithDirectory(t *testing.T, path string) {
+	t.Helper()
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func addHardlink(t *testing.T, path string) {
+	t.Helper()
+	if err := os.Link(path, path+".link"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func chmodFile(t *testing.T, path string, mode os.FileMode) {
+	t.Helper()
+	if err := os.Chmod(path, mode); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func assertNoSecretForms(t *testing.T, value string, secrets []string) {
@@ -1670,6 +1921,12 @@ type logEntry struct {
 type recordingLogSink struct {
 	mu      sync.Mutex
 	entries []logEntry
+}
+
+type rejectingTransport struct{}
+
+func (rejectingTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errors.New("upstream must not be called")
 }
 
 func (s *recordingLogSink) Append(taskID, stream string, data []byte) error {

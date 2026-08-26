@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -37,6 +38,7 @@ const (
 	consultationCodexHomePath = consultationRunPath + "/codex-home"
 	consultationCodexPath     = consultationRunPath + "/bin/codex"
 	consultationPATH          = "/usr/bin:/bin"
+	consultationConfigFD      = 4
 )
 
 // ErrFinalTooLarge reports that Result.Final was replaced with a fixed marker.
@@ -155,20 +157,45 @@ func (r Runner) run(parent context.Context, req Request, kind invocation) (resul
 		temporaryPaths = append(temporaryPaths, schemaPath)
 	}
 
-	args := invocationArgs(kind, req, schemaPath, finalOutputPath, toolEnv)
-	command := binary
-	if kind == invocationConsult {
-		args = append(consultationSandboxArgs(binary, req, env), args...)
-		command = sandboxBinary
-	}
 	ctx, cancel := context.WithTimeout(parent, req.Timeout)
 	defer cancel()
+	args := invocationArgs(kind, req, schemaPath, finalOutputPath, toolEnv)
+	command := binary
+	commandEnv := env
+	var snapshot *consultationSnapshot
+	var proxy *consultationProxy
+	if kind == invocationConsult {
+		snapshot, err = loadConsultationConfig(environmentValue(env, "CODEX_HOME"))
+		if err != nil {
+			return Result{}, err
+		}
+		defer snapshot.file.Close()
+		token, err := newConsultationToken()
+		if err != nil {
+			return Result{}, err
+		}
+		proxy, err = startConsultationProxy(ctx, snapshot.config.BaseURL, environmentValue(env, "CODEX_API_KEY"), token, nil)
+		if err != nil {
+			return Result{}, err
+		}
+		defer proxy.Close()
+		if err := snapshot.setProxyURL(proxy.URL() + "/v1"); err != nil {
+			return Result{}, err
+		}
+		args = invocationArgs(kind, req, schemaPath, finalOutputPath, nil)
+		args = append(consultationSandboxArgs(binary, req, consultationConfigFD), args...)
+		command = sandboxBinary
+		commandEnv = consultationEnvironment(env, binary, token)
+	}
 	cmd := exec.CommandContext(ctx, command, args...)
 	if kind != invocationConsult {
 		cmd.Dir = req.WorkingDir
 	}
-	cmd.Env = env
+	cmd.Env = commandEnv
 	cmd.ExtraFiles = []*os.File{finalWriter}
+	if snapshot != nil {
+		cmd.ExtraFiles = append(cmd.ExtraFiles, snapshot.file)
+	}
 	var stderr boundedCapture
 	cmd.Stderr = &stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -348,27 +375,7 @@ func (r Runner) validate(req Request, kind invocation) (string, string, []string
 	if err != nil {
 		return "", "", nil, nil, err
 	}
-	if kind == invocationConsult {
-		if err := validateConsultationConfig(env); err != nil {
-			return "", "", nil, nil, err
-		}
-	}
 	return binary, sandboxBinary, env, toolEnv, nil
-}
-
-func validateConsultationConfig(env []string) error {
-	path := filepath.Join(environmentValue(env, "CODEX_HOME"), "config.toml")
-	info, err := os.Lstat(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("inspect Codex config.toml: %w", err)
-	}
-	if !info.Mode().IsRegular() {
-		return errors.New("Codex config.toml must be a non-symlink regular file")
-	}
-	return nil
 }
 
 func resolveExecutable(path, label string) (string, error) {
@@ -603,6 +610,8 @@ func invocationArgs(kind invocation, req Request, schemaPath, lastPath string, t
 		return append(args, "--json", "-o", lastPath, "--", req.SessionID, req.Prompt)
 	case invocationConsult:
 		args := append([]string{"exec"}, policy...)
+		args = append(args, "--ask-for-approval", "never", "--strict-config", "--ignore-rules",
+			"--disable", "plugins", "--disable", "apps", "--disable", "browser_use", "--disable", "computer_use", "--disable", "image_generation", "--disable", "search_tool")
 		return append(args, "-C", consultationWorkspacePath, "--sandbox", "read-only", "--ephemeral", "--skip-git-repo-check",
 			"--json", "-o", lastPath, "--", req.Prompt)
 	default:
@@ -610,10 +619,9 @@ func invocationArgs(kind invocation, req Request, schemaPath, lastPath string, t
 	}
 }
 
-func consultationSandboxArgs(binary string, req Request, env []string) []string {
-	codexHome := environmentValue(env, "CODEX_HOME")
+func consultationSandboxArgs(binary string, req Request, configFD int) []string {
 	args := []string{
-		"--die-with-parent", "--new-session", "--unshare-all", "--share-net", "--unshare-user", "--disable-userns", "--cap-drop", "ALL",
+		"--die-with-parent", "--new-session", "--unshare-all", "--share-net", "--unshare-user", "--cap-drop", "ALL",
 		"--ro-bind", "/usr", "/usr",
 		"--symlink", "usr/bin", "/bin",
 		"--symlink", "usr/sbin", "/sbin",
@@ -638,7 +646,7 @@ func consultationSandboxArgs(binary string, req Request, env []string) []string 
 		"--dir", consultationRunPath + "/bin",
 		"--ro-bind", binary, consultationCodexPath,
 		"--ro-bind", req.WorkingDir, consultationWorkspacePath,
-		"--ro-bind-try", filepath.Join(codexHome, "config.toml"), consultationCodexHomePath + "/config.toml",
+		"--ro-bind-data", strconv.Itoa(configFD), consultationCodexHomePath + "/config.toml",
 		"--setenv", "HOME", consultationHomePath,
 		"--setenv", "CODEX_HOME", consultationCodexHomePath,
 		"--setenv", "TMPDIR", "/tmp",
@@ -649,6 +657,30 @@ func consultationSandboxArgs(binary string, req Request, env []string) []string 
 		consultationCodexPath,
 	}
 	return args
+}
+
+func consultationEnvironment(env []string, binary string, token []byte) []string {
+	result := []string{
+		"CODEX_API_KEY=" + string(token),
+		"OPENAI_API_KEY=" + string(token),
+		"CODEX_HOME=" + consultationCodexHomePath,
+		"HOME=" + consultationHomePath,
+		"TMPDIR=/tmp", "TMP=/tmp", "TEMP=/tmp", "PATH=" + consultationPATH,
+	}
+	if lang := environmentValue(env, "LANG"); lang != "" {
+		result = append(result, "LANG="+lang)
+	}
+	// The Go test executable uses these non-production controls to expose its
+	// observations through JSONL instead of an unmounted host file.
+	if strings.HasSuffix(binary, ".test") {
+		for _, entry := range env {
+			name, _, _ := strings.Cut(entry, "=")
+			if name == "GO_WANT_CODEX_HELPER" || strings.HasPrefix(name, "QQ_CODEX_HELPER_") {
+				result = append(result, entry)
+			}
+		}
+	}
+	return result
 }
 
 func workspaceTempPolicyArgs() []string {
