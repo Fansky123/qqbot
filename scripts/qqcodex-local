@@ -60,6 +60,9 @@ SPAWNED_NAPCAT_START=
 SPAWNED_WORKER_START=
 LOCK_FD=
 LOCK_HELD=0
+ACTIVE_PROBE_PID=
+ACTIVE_PROBE_START=
+ACTIVE_PROBE_OUTPUT=
 
 # A caller-provided value must never reach NapCat or Worker.
 unset NAPCAT_ACCESS_TOKEN
@@ -232,6 +235,13 @@ release_command_lock() {
   exec {LOCK_FD}>&-
   LOCK_FD=
   LOCK_HELD=0
+}
+
+run_child_without_lock() {
+  if [[ -n ${LOCK_FD:-} ]]; then
+    exec {LOCK_FD}>&-
+  fi
+  exec "$@"
 }
 
 validate_webui() {
@@ -562,16 +572,38 @@ refuse_unmanaged_conflicts() {
 }
 
 run_probe_once() {
-  local attempt_timeout=$1 token output status
+  local attempt_timeout=$1 token output status pid start temp
   token=$(<"$TOKEN_FILE")
   [[ -n $token ]] || return 1
+  temp=$(mktemp "$RUN_DIR/.probe-output.XXXXXX") || return 1
+  if ! chmod 0600 "$temp"; then
+    rm -f -- "$temp"
+    return 1
+  fi
+  ACTIVE_PROBE_OUTPUT=$temp
+  NAPCAT_ACCESS_TOKEN=$token run_child_without_lock \
+    "$TIMEOUT" --kill-after=1s "$attempt_timeout" \
+    "$PROBE" -config "$CONFIG" >"$temp" 2>/dev/null &
+  pid=$!
+  ACTIVE_PROBE_PID=$pid
+  start=$(process_start_time "$pid" 2>/dev/null || true)
+  ACTIVE_PROBE_START=$start
+  token=
   set +e
-  output=$(NAPCAT_ACCESS_TOKEN=$token "$TIMEOUT" --kill-after=1s "$attempt_timeout" \
-    "$PROBE" -config "$CONFIG" 2>/dev/null)
+  wait "$pid"
   status=$?
   set -e
+  ACTIVE_PROBE_PID=
+  ACTIVE_PROBE_START=
   unset NAPCAT_ACCESS_TOKEN
-  token=
+  if file_is_owned_regular "$temp" 1; then
+    output=$(<"$temp")
+  else
+    output=
+    status=1
+  fi
+  rm -f -- "$temp"
+  ACTIVE_PROBE_OUTPUT=
   (( status == 0 )) || return 1
   "$JQ" -e '
     type == "object" and
@@ -581,6 +613,18 @@ run_probe_once() {
     (.missing_group_ids | type == "array" and all(.[]; type == "string"))
   ' <<<"$output" >/dev/null 2>&1 || return 1
   PROBE_JSON=$output
+}
+
+terminate_active_probe() {
+  local pid=${ACTIVE_PROBE_PID:-} start=${ACTIVE_PROBE_START:-} output=${ACTIVE_PROBE_OUTPUT:-}
+  if pid_matches_start_identity "$pid" "$start"; then
+    kill -TERM "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  fi
+  [[ -z $output ]] || rm -f -- "$output"
+  ACTIVE_PROBE_PID=
+  ACTIVE_PROBE_START=
+  ACTIVE_PROBE_OUTPUT=
 }
 
 probe_until_online() {
@@ -617,7 +661,7 @@ require_all_groups() {
 }
 
 launch_napcat() {
-  "$NAPCAT_LAUNCHER" "$@" &
+  run_child_without_lock "$NAPCAT_LAUNCHER" "$@" &
   local pid=$! start
   SPAWNED_NAPCAT_PID=$pid
   start=$(process_start_time "$pid") || die 'failed to capture NapCat process identity'
@@ -634,7 +678,7 @@ launch_napcat() {
 }
 
 launch_worker_foreground() {
-  "$WORKER_LAUNCHER" &
+  run_child_without_lock "$WORKER_LAUNCHER" &
   local pid=$! start status
   SPAWNED_WORKER_PID=$pid
   start=$(process_start_time "$pid") || die 'failed to capture Worker process identity'
@@ -715,6 +759,7 @@ cleanup() {
   trap - EXIT INT TERM HUP
   unset NAPCAT_ACCESS_TOKEN
   set +e
+  terminate_active_probe
   if terminate_tracked_pid "$NEW_WORKER_PID" "$WORKER_EXECUTABLE" "$NEW_WORKER_START" 'Worker'; then
     remove_pid_file_for "$WORKER_PID_FILE" "$WORKER_START_FILE" \
       "$NEW_WORKER_PID" "$NEW_WORKER_START"

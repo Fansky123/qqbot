@@ -116,6 +116,24 @@ process_start_time() {
   printf '%s\n' "${20}"
 }
 
+process_parent_pid() {
+  local stat_line fields
+  stat_line=$(<"/proc/$1/stat") || return 1
+  fields=${stat_line##*) }
+  # shellcheck disable=SC2086
+  set -- $fields
+  [[ ${2-} =~ ^[1-9][0-9]*$ ]] || return 1
+  printf '%s\n' "$2"
+}
+
+assert_process_does_not_hold_file() {
+  local pid=$1 forbidden=$2 message=$3 fd target
+  for fd in "/proc/$pid/fd"/*; do
+    target=$(readlink -f -- "$fd" 2>/dev/null || true)
+    [[ $target != "$forbidden" ]] || fail "$message: PID $pid inherited $forbidden"
+  done
+}
+
 write_managed_identity() {
   local pid=$1 pid_file=$2 start_file=$3
   printf '%s\n' "$pid" >"$pid_file"
@@ -201,8 +219,15 @@ mode=$(<"$QQCODEX_TEST_PROBE_MODE")
   case "$mode" in
   success) ;;
   error) exit 1 ;;
+  break-restore)
+    chmod 0500 "$(dirname -- "$QQCODEX_TEST_WEBUI")"
+    exit 1
+    ;;
   invalid) printf '%s\n' '{"self_id":123,"nickname":"bad","group_ids":[],"missing_group_ids":[]}' ; exit 0 ;;
-  hang) exec /bin/sleep 60 ;;
+  hang)
+    printf '%s\n' "$$" >"$QQCODEX_TEST_PROBE_PARENT"
+    exec /bin/sleep 60
+    ;;
   ignore-term)
     printf '%s\n' "$$" >"$QQCODEX_TEST_PROBE_PARENT"
     /bin/bash -c 'trap "" TERM; printf "%s\n" "$$" >"$QQCODEX_TEST_PROBE_CHILD"; while :; do /bin/sleep 1; done' &
@@ -437,6 +462,8 @@ test_start_first_account() {
   assert_eq 600 "$(stat -c '%a' "$RUN_DIR/worker.pid")" 'Worker PID file mode'
   assert_eq 600 "$(stat -c '%a' "$WORKER_START")" 'Worker identity file mode'
   assert_eq 600 "$(stat -c '%a' "$LOCK_FILE")" 'transaction lock file mode'
+  assert_process_does_not_hold_file "$napcat_pid" "$LOCK_FILE" 'NapCat lock descriptor'
+  assert_process_does_not_hold_file "$worker_pid" "$LOCK_FILE" 'Worker lock descriptor'
   assert_eq '<-config>' "$(sed -n '1p' "$PROBE_ARGS")" 'probe flag'
   assert_eq "<$CONFIG>" "$(sed -n '2p' "$PROBE_ARGS")" 'probe config path'
   assert_eq '<>' "$(<"$WORKER_ARGS")" 'Worker receives no token arguments'
@@ -658,6 +685,37 @@ test_switch_rollbacks() {
   pass 'failed, timed-out/invalid, and missing-group switches roll back byte-for-byte'
 }
 
+test_failed_restore_retains_private_snapshots() {
+  setup_fixture failed-restore-retention
+  state_dir=$(dirname -- "$WEBUI")
+  printf '111111\n' >"$ACCOUNT"
+  chmod 0600 "$ACCOUNT"
+  cp "$WEBUI" "$FIXTURE/webui.before"
+  cp "$ACCOUNT" "$FIXTURE/account.before"
+  printf 'break-restore\n' >"$PROBE_MODE_FILE"
+
+  capture failed-restore switch-account
+  chmod 0700 "$state_dir"
+  assert_eq 1 "$LAST_STATUS" 'failed restore command status'
+  assert_contains "$LAST_ERR" 'snapshots retained' 'failed restore retention report'
+  for snapshot in "$RUN_DIR/webui.snapshot" "$RUN_DIR/account.snapshot"; do
+    [[ -f $snapshot && ! -L $snapshot ]] || fail "retained snapshot is not a regular file: $snapshot"
+    assert_eq 600 "$(stat -c '%a' "$snapshot")" "retained snapshot mode for $snapshot"
+  done
+  cmp -s "$FIXTURE/webui.before" "$RUN_DIR/webui.snapshot" || \
+    fail 'retained WebUI snapshot bytes changed'
+  cmp -s "$FIXTURE/account.before" "$RUN_DIR/account.snapshot" || \
+    fail 'retained account snapshot bytes changed'
+
+  cp "$RUN_DIR/webui.snapshot" "$WEBUI"
+  cp "$RUN_DIR/account.snapshot" "$ACCOUNT"
+  chmod 0600 "$WEBUI" "$ACCOUNT"
+  unlink "$RUN_DIR/webui.snapshot"
+  unlink "$RUN_DIR/account.snapshot"
+  assert_no_secret_output
+  pass 'failed rollback retains both private regular snapshots for recovery'
+}
+
 test_switch_cancel_rollback() {
   setup_fixture switch-cancel
   printf '111111\n' >"$ACCOUNT"
@@ -753,6 +811,96 @@ test_lock_file_is_private_and_not_followed() {
   assert_eq 1 "$LAST_STATUS" 'outside lock status'
   assert_contains "$LAST_ERR" 'inside the run directory' 'outside lock report'
   pass 'transaction lock is private, non-symlinked, and confined to the run directory'
+}
+
+test_launcher_children_do_not_retain_transaction_lock() {
+  setup_fixture child-lock-inheritance
+  printf 'hang\n' >"$PROBE_MODE_FILE"
+  export QQCODEX_LOCAL_LOGIN_TIMEOUT=60
+
+  start_background inherited-lock start
+  wrapper_pid=$WRAPPER_PID
+  wait_for_file "$RUN_DIR/napcat.pid"
+  wait_for_file "$PROBE_PARENT"
+  napcat_pid=$(<"$RUN_DIR/napcat.pid")
+  probe_pid=$(<"$PROBE_PARENT")
+  timeout_pid=$(process_parent_pid "$probe_pid") || fail 'cannot identify timeout wrapper PID'
+  track_pid "$napcat_pid"
+  track_pid "$probe_pid"
+  track_pid "$timeout_pid"
+
+  kill -KILL "$wrapper_pid"
+  set +e
+  wait "$wrapper_pid" 2>/dev/null
+  wrapper_status=$?
+  set -e
+  assert_eq 137 "$wrapper_status" 'SIGKILLed launcher status'
+
+  capture lock-after-kill stop
+  assert_eq 0 "$LAST_STATUS" 'lock acquisition after launcher SIGKILL'
+  wait_for_dead "$napcat_pid"
+  kill -TERM "$timeout_pid" 2>/dev/null || true
+  wait_for_dead "$timeout_pid"
+  wait_for_dead "$probe_pid"
+  assert_no_secret_output
+  pass 'surviving launcher children cannot retain the transaction lock'
+}
+
+test_probe_cancellation_is_prompt_and_transactional() {
+  setup_fixture prompt-probe-cancel
+  printf '111111\n' >"$ACCOUNT"
+  chmod 0600 "$ACCOUNT"
+  cp "$WEBUI" "$FIXTURE/webui.before"
+  cp "$ACCOUNT" "$FIXTURE/account.before"
+  printf 'hang\n' >"$PROBE_MODE_FILE"
+  export QQCODEX_LOCAL_LOGIN_TIMEOUT=60
+
+  start_background prompt-cancel switch-account
+  wrapper_pid=$WRAPPER_PID
+  wait_for_file "$RUN_DIR/napcat.pid"
+  wait_for_file "$PROBE_PARENT"
+  napcat_pid=$(<"$RUN_DIR/napcat.pid")
+  probe_pid=$(<"$PROBE_PARENT")
+  timeout_pid=$(process_parent_pid "$probe_pid") || fail 'cannot identify cancellable timeout PID'
+  track_pid "$napcat_pid"
+  track_pid "$probe_pid"
+  track_pid "$timeout_pid"
+  shopt -s nullglob
+  probe_outputs=("$RUN_DIR"/.probe-output.*)
+  shopt -u nullglob
+  assert_eq 1 "${#probe_outputs[@]}" 'active probe output file count'
+  [[ -f ${probe_outputs[0]} && ! -L ${probe_outputs[0]} ]] || \
+    fail 'active probe output is not a regular non-symlink file'
+  assert_eq 600 "$(stat -c '%a' "${probe_outputs[0]}")" 'active probe output mode'
+
+  kill -TERM "$wrapper_pid"
+  for attempt in {1..100}; do
+    kill -0 "$wrapper_pid" 2>/dev/null || break
+    sleep 0.02
+  done
+  if kill -0 "$wrapper_pid" 2>/dev/null; then
+    kill -KILL "$wrapper_pid" 2>/dev/null || true
+    wait "$wrapper_pid" 2>/dev/null || true
+    fail 'launcher did not cancel a hanging probe within two seconds'
+  fi
+  set +e
+  wait "$wrapper_pid"
+  wrapper_status=$?
+  set -e
+  assert_eq 143 "$wrapper_status" 'cancelled probe launcher status'
+  wait_for_dead "$napcat_pid"
+  wait_for_dead "$timeout_pid"
+  wait_for_dead "$probe_pid"
+  cmp -s "$FIXTURE/webui.before" "$WEBUI" || fail 'prompt cancellation did not restore WebUI bytes'
+  cmp -s "$FIXTURE/account.before" "$ACCOUNT" || fail 'prompt cancellation did not restore account bytes'
+  assert_file_absent "$RUN_DIR/webui.snapshot" 'prompt cancellation WebUI snapshot cleanup'
+  assert_file_absent "$RUN_DIR/account.snapshot" 'prompt cancellation account snapshot cleanup'
+  shopt -s nullglob
+  probe_outputs=("$RUN_DIR"/.probe-output.*)
+  shopt -u nullglob
+  assert_eq 0 "${#probe_outputs[@]}" 'cancelled probe output cleanup'
+  assert_no_secret_output
+  pass 'probe cancellation is prompt, complete, and transactional'
 }
 
 test_hanging_probe_obeys_timeout() {
@@ -1157,10 +1305,13 @@ test_first_account_commit_rollback
 test_cleanup_timeout_keeps_managed_pid
 test_switch_success
 test_switch_rollbacks
+test_failed_restore_retains_private_snapshots
 test_switch_cancel_rollback
 test_concurrent_mutation_is_refused
 test_snapshot_symlinks_are_replaced_safely
 test_lock_file_is_private_and_not_followed
+test_probe_cancellation_is_prompt_and_transactional
+test_launcher_children_do_not_retain_transaction_lock
 test_hanging_probe_obeys_timeout
 test_term_ignoring_probe_is_killed
 test_central_input_validation
