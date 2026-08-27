@@ -36,7 +36,7 @@ QQ 群
 
 普通 QQ 账号使用第三方机器人框架仍有登录受限、风控或封号风险，应用无法消除该风险。先用专用账号和测试群验证，账号异常时立即停止服务。
 
-本地启动器使用 `onebot.self_id: "auto"`；它会探测本次登录的账号，而不是在配置中固定 QQ 号。`allowed_group_ids` 可以配置多个群，但选中的机器人必须已加入每一个配置群；`employee_ids` 与 `admin_ids` 仍是相互独立的白名单。
+本地启动器使用 `onebot.self_id: "auto"`；它会探测本次登录的账号，而不是在配置中固定 QQ 号。`allowed_group_ids` 可以配置多个群，但选中的机器人必须已加入每一个配置群；`employee_ids` 与 `admin_ids` 都必须显式配置，且每个 `admin_id` 都必须同时出现在 `employee_ids` 中。
 
 ```bash
 qqcodex-local start
