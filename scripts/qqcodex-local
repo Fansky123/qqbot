@@ -786,6 +786,28 @@ install_cleanup() {
   trap 'exit 129' HUP
 }
 
+status_probe_cleanup() {
+  local status=$?
+  trap - EXIT INT TERM HUP
+  unset NAPCAT_ACCESS_TOKEN
+  set +e
+  terminate_active_probe
+  return "$status"
+}
+
+install_status_probe_cleanup() {
+  trap status_probe_cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+}
+
+clear_status_probe_cleanup() {
+  trap - EXIT INT TERM HUP
+  terminate_active_probe
+  unset NAPCAT_ACCESS_TOKEN
+}
+
 read_saved_account() {
   local saved
   [[ -e $ACCOUNT_FILE ]] || return 1
@@ -897,6 +919,7 @@ status_command() {
   fi
 
   release_command_lock
+  install_status_probe_cleanup
 
   if (( online_hint == 1 )) && command_available "$JQ" && \
     command_available "$TIMEOUT" && \
@@ -910,7 +933,7 @@ status_command() {
   else
     printf '%s\n' 'OneBot: offline'
   fi
-  unset NAPCAT_ACCESS_TOKEN
+  clear_status_probe_cleanup
   return 0
 }
 

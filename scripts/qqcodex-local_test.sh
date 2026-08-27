@@ -903,6 +903,55 @@ test_probe_cancellation_is_prompt_and_transactional() {
   pass 'probe cancellation is prompt, complete, and transactional'
 }
 
+test_status_probe_cancellation_is_prompt_and_probe_only() {
+  setup_fixture prompt-status-cancel
+  printf '123456\n' >"$ACCOUNT"
+  chmod 0600 "$ACCOUNT"
+  printf 'hang\n' >"$PROBE_MODE_FILE"
+  export QQCODEX_LOCAL_STATUS_TIMEOUT=60
+  "$QQ_EXEC" 60 &
+  managed_pid=$!
+  track_pid "$managed_pid"
+  write_managed_identity "$managed_pid" "$RUN_DIR/napcat.pid" "$NAPCAT_START"
+
+  start_background status-cancel status
+  wrapper_pid=$WRAPPER_PID
+  wait_for_file "$PROBE_PARENT"
+  probe_pid=$(<"$PROBE_PARENT")
+  timeout_pid=$(process_parent_pid "$probe_pid") || fail 'cannot identify status timeout PID'
+  track_pid "$probe_pid"
+  track_pid "$timeout_pid"
+
+  kill -TERM "$wrapper_pid"
+  for attempt in {1..100}; do
+    kill -0 "$wrapper_pid" 2>/dev/null || break
+    sleep 0.02
+  done
+  if kill -0 "$wrapper_pid" 2>/dev/null; then
+    kill -KILL "$wrapper_pid" 2>/dev/null || true
+    wait "$wrapper_pid" 2>/dev/null || true
+    fail 'status did not cancel a hanging probe within two seconds'
+  fi
+  set +e
+  wait "$wrapper_pid"
+  wrapper_status=$?
+  set -e
+  assert_eq 143 "$wrapper_status" 'cancelled status probe exit status'
+  wait_for_dead "$timeout_pid"
+  wait_for_dead "$probe_pid"
+  kill -0 "$managed_pid" 2>/dev/null || fail 'status cancellation stopped managed NapCat'
+  shopt -s nullglob
+  probe_outputs=("$RUN_DIR"/.probe-output.*)
+  shopt -u nullglob
+  assert_eq 0 "${#probe_outputs[@]}" 'cancelled status probe output cleanup'
+  assert_no_secret_output
+
+  kill -TERM "$managed_pid"
+  wait "$managed_pid" 2>/dev/null || true
+  rm -f -- "$RUN_DIR/napcat.pid" "$NAPCAT_START"
+  pass 'status cancellation cleans only its disposable probe process tree'
+}
+
 test_hanging_probe_obeys_timeout() {
   setup_fixture hanging-probe
   printf '111111\n' >"$ACCOUNT"
@@ -1036,19 +1085,23 @@ test_failed_launcher_transition_cleans_owned_child() {
   local case_name toggle spawned
   for case_name in wrong-exec hanging-launcher; do
     setup_fixture "$case_name"
-    export QQCODEX_LOCAL_PROCESS_TIMEOUT=0
+    export QQCODEX_LOCAL_PROCESS_TIMEOUT=1
     if [[ $case_name == wrong-exec ]]; then
       toggle=QQCODEX_TEST_NAPCAT_WRONG_EXEC
     else
       toggle=QQCODEX_TEST_NAPCAT_HANG
     fi
     export "$toggle=1"
-    capture failed-transition start
-    assert_eq 1 "$LAST_STATUS" "$case_name transition status"
-    assert_contains "$LAST_ERR" 'did not transition' "$case_name transition report"
+    start_background failed-transition start
     wait_for_file "$QQCODEX_TEST_NAPCAT_SPAWNED"
     spawned=$(<"$QQCODEX_TEST_NAPCAT_SPAWNED")
     track_pid "$spawned"
+    set +e
+    wait "$WRAPPER_PID"
+    LAST_STATUS=$?
+    set -e
+    assert_eq 1 "$LAST_STATUS" "$case_name transition status"
+    assert_contains "$LAST_ERR" 'did not transition' "$case_name transition report"
     wait_for_dead "$spawned"
     assert_file_absent "$RUN_DIR/napcat.pid" "$case_name managed PID file"
     assert_file_absent "$WORKER_ARGS" "$case_name Worker invocation"
@@ -1311,6 +1364,7 @@ test_concurrent_mutation_is_refused
 test_snapshot_symlinks_are_replaced_safely
 test_lock_file_is_private_and_not_followed
 test_probe_cancellation_is_prompt_and_transactional
+test_status_probe_cancellation_is_prompt_and_probe_only
 test_launcher_children_do_not_retain_transaction_lock
 test_hanging_probe_obeys_timeout
 test_term_ignoring_probe_is_killed
