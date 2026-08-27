@@ -28,7 +28,9 @@ SLEEP=${QQCODEX_LOCAL_SLEEP:-sleep}
 TIMEOUT=${QQCODEX_LOCAL_TIMEOUT:-timeout}
 PGREP=${QQCODEX_LOCAL_PGREP:-pgrep}
 PORT_CHECK=${QQCODEX_LOCAL_PORT_CHECK:-}
+SS=${QQCODEX_LOCAL_SS:-ss}
 PROC_ROOT=${QQCODEX_LOCAL_PROC_ROOT:-/proc}
+PROCESS_START_TIME=${QQCODEX_LOCAL_PROCESS_START_TIME:-}
 JQ=${QQCODEX_LOCAL_JQ:-jq}
 
 NAPCAT_PID_FILE=$RUN_DIR/napcat.pid
@@ -125,8 +127,14 @@ preflight_files() {
   command_available "$SLEEP" || die "sleep command is unavailable: $SLEEP"
   command_available "$TIMEOUT" || die "timeout command is unavailable: $TIMEOUT"
   command_available "$PGREP" || die "process discovery command is unavailable: $PGREP"
+  if [[ -n $PROCESS_START_TIME ]]; then
+    command_available "$PROCESS_START_TIME" || \
+      die "process identity command is unavailable: $PROCESS_START_TIME"
+  fi
   if [[ -n $PORT_CHECK ]]; then
     command_available "$PORT_CHECK" || die "port discovery command is unavailable: $PORT_CHECK"
+  else
+    command_available "$SS" || die "port discovery command is unavailable: $SS"
   fi
   is_nonnegative_integer "$LOGIN_TIMEOUT" || die 'login timeout must be a non-negative integer'
   is_nonnegative_integer "$STATUS_TIMEOUT" || die 'status timeout must be a non-negative integer'
@@ -162,6 +170,12 @@ pid_matches_executable() {
 process_start_time() {
   local pid=$1 stat_line fields
   is_positive_pid "$pid" || return 1
+  if [[ -n $PROCESS_START_TIME ]]; then
+    stat_line=$("$PROCESS_START_TIME" "$pid") || return 1
+    is_positive_pid "$stat_line" || return 1
+    printf '%s\n' "$stat_line"
+    return
+  fi
   stat_line=$(<"$PROC_ROOT/$pid/stat") || return 1
   fields=${stat_line##*) }
   # shellcheck disable=SC2086
@@ -260,12 +274,14 @@ atomic_update_webui() {
   fi
 }
 
-wait_for_identity() {
-  local pid=$1 expected=$2 deadline
+wait_for_expected_executable() {
+  local pid=$1 expected=$2 original_start=$3 current_start deadline
   deadline=$((SECONDS + PROCESS_TIMEOUT))
   while true; do
-    pid_matches_executable "$pid" "$expected" && return 0
     kill -0 "$pid" 2>/dev/null || return 1
+    current_start=$(process_start_time "$pid") || return 1
+    [[ $current_start == "$original_start" ]] || return 1
+    pid_matches_executable "$pid" "$expected" && return 0
     (( SECONDS < deadline )) || return 1
     "$SLEEP" "$PROCESS_INTERVAL"
   done
@@ -344,12 +360,16 @@ discover_unmanaged() {
 }
 
 port_is_listening() {
+  local output status
   if [[ -n $PORT_CHECK ]]; then
     "$PORT_CHECK" "$ONEBOT_PORT"
-  elif command -v ss >/dev/null 2>&1; then
-    [[ -n $(ss -H -ltn "sport = :$ONEBOT_PORT" 2>/dev/null) ]]
   else
-    (exec 3<>"/dev/tcp/127.0.0.1/$ONEBOT_PORT") 2>/dev/null
+    set +e
+    output=$("$SS" -H -ltn "sport = :$ONEBOT_PORT" 2>/dev/null)
+    status=$?
+    set -e
+    (( status == 0 )) || return 2
+    [[ -n $output ]]
   fi
 }
 
@@ -443,10 +463,10 @@ require_all_groups() {
 launch_napcat() {
   "$NAPCAT_LAUNCHER" "$@" &
   local pid=$! start
-  if ! wait_for_identity "$pid" "$QQ_EXECUTABLE"; then
+  start=$(process_start_time "$pid") || die 'failed to capture NapCat process identity'
+  if ! wait_for_expected_executable "$pid" "$QQ_EXECUTABLE" "$start"; then
     die 'NapCat launcher did not transition to the expected QQ executable'
   fi
-  start=$(process_start_time "$pid") || die 'failed to read NapCat process identity'
   pid_matches_identity "$pid" "$QQ_EXECUTABLE" "$start" || \
     die 'NapCat process identity changed before it could be recorded'
   NEW_NAPCAT_PID=$pid
@@ -458,10 +478,10 @@ launch_napcat() {
 launch_worker_foreground() {
   "$WORKER_LAUNCHER" &
   local pid=$! start status
-  if ! wait_for_identity "$pid" "$WORKER_EXECUTABLE"; then
+  start=$(process_start_time "$pid") || die 'failed to capture Worker process identity'
+  if ! wait_for_expected_executable "$pid" "$WORKER_EXECUTABLE" "$start"; then
     die 'Worker launcher did not transition to the expected Worker executable'
   fi
-  start=$(process_start_time "$pid") || die 'failed to read Worker process identity'
   pid_matches_identity "$pid" "$WORKER_EXECUTABLE" "$start" || \
     die 'Worker process identity changed before it could be recorded'
   NEW_WORKER_PID=$pid

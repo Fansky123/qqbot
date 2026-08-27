@@ -125,6 +125,7 @@ write_managed_identity() {
 setup_fixture() {
   local name=$1
   unset QQCODEX_LOCAL_JQ
+  unset QQCODEX_LOCAL_PROCESS_START_TIME QQCODEX_LOCAL_SS
   unset QQCODEX_TEST_JQ_FAIL_ACCOUNT QQCODEX_TEST_NAPCAT_REMOVE_RUN \
     QQCODEX_TEST_PGREP_ERROR QQCODEX_TEST_PORT_ERROR \
     QQCODEX_TEST_WORKER_IGNORE_TERM QQCODEX_TEST_WORKER_REMOVE_RUN
@@ -150,6 +151,7 @@ setup_fixture() {
   QQ_DISCOVERY=$FIXTURE/qq.pids
   WORKER_DISCOVERY=$FIXTURE/worker.pids
   PORT_STATE=$FIXTURE/port.busy
+  PROCESS_START_COUNT=$FIXTURE/process-start.count
   PROBE_MODE_FILE=$FIXTURE/probe.mode
   PROBE_COUNT_FILE=$FIXTURE/probe.count
   PROBE_ARGS=$FIXTURE/probe.args
@@ -258,6 +260,26 @@ set -euo pipefail
 [[ ${QQCODEX_TEST_PORT_ERROR-0} == 0 ]] || exit 2
 [[ $(<"$QQCODEX_TEST_PORT_STATE") == 1 ]]
 EOF
+  cat >"$FIXTURE/fake-ss" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+exit "${QQCODEX_TEST_SS_STATUS:-0}"
+EOF
+  cat >"$FIXTURE/fake-process-start-time" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+count=0
+if [[ -r $QQCODEX_TEST_PROCESS_START_COUNT ]]; then
+  read -r count <"$QQCODEX_TEST_PROCESS_START_COUNT" || true
+fi
+count=$((count + 1))
+printf '%s\n' "$count" >"$QQCODEX_TEST_PROCESS_START_COUNT"
+if (( count == 1 )); then
+  printf '%s\n' 100
+else
+  printf '%s\n' 101
+fi
+EOF
   cat >"$FIXTURE/fake-jq" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -267,7 +289,8 @@ fi
 exec "$QQCODEX_TEST_REAL_JQ" "$@"
 EOF
   chmod 0700 "$PROBE" "$NAPCAT_LAUNCHER" "$WORKER_LAUNCHER" \
-    "$FIXTURE/fake-pgrep" "$FIXTURE/fake-port-check" "$FIXTURE/fake-jq"
+    "$FIXTURE/fake-pgrep" "$FIXTURE/fake-port-check" "$FIXTURE/fake-ss" \
+    "$FIXTURE/fake-process-start-time" "$FIXTURE/fake-jq"
 
   export QQCODEX_LOCAL_PROJECT_ROOT=$PROJECT_ROOT
   export QQCODEX_LOCAL_NAPCAT_ROOT=$NAPCAT_ROOT
@@ -312,6 +335,7 @@ EOF
   export QQCODEX_TEST_QQ_DISCOVERY=$QQ_DISCOVERY
   export QQCODEX_TEST_WORKER_DISCOVERY=$WORKER_DISCOVERY
   export QQCODEX_TEST_PORT_STATE=$PORT_STATE
+  export QQCODEX_TEST_PROCESS_START_COUNT=$PROCESS_START_COUNT
   export QQCODEX_TEST_WEBUI=$WEBUI
   export QQCODEX_TEST_REAL_JQ
   QQCODEX_TEST_REAL_JQ=$(command -v jq)
@@ -462,6 +486,29 @@ test_pid_record_failures_cleanup() {
   wait_for_dead "$worker_pid"
   assert_no_secret_output
   pass 'verified children are cleaned up when atomic PID recording fails'
+}
+
+test_transition_pid_reuse_is_not_managed() {
+  setup_fixture transition-pid-reuse
+  export QQCODEX_LOCAL_PROCESS_START_TIME=$FIXTURE/fake-process-start-time
+  printf 'error\n' >"$PROBE_MODE_FILE"
+
+  capture transition-reuse start
+  assert_eq 1 "$LAST_STATUS" 'transition PID reuse status'
+  assert_contains "$LAST_ERR" 'did not transition to the expected QQ executable' \
+    'transition PID reuse report'
+  assert_file_absent "$RUN_DIR/napcat.pid" 'transition PID reuse PID file'
+  assert_file_absent "$NAPCAT_START" 'transition PID reuse identity file'
+  assert_file_absent "$WORKER_ARGS" 'Worker after transition PID reuse'
+  wait_for_file "$QQCODEX_TEST_NAPCAT_SPAWNED"
+  reused_pid=$(<"$QQCODEX_TEST_NAPCAT_SPAWNED")
+  track_pid "$reused_pid"
+  kill -0 "$reused_pid" 2>/dev/null || fail 'transition PID reuse was signalled'
+
+  kill -TERM "$reused_pid"
+  wait_for_dead "$reused_pid"
+  assert_no_secret_output
+  pass 'launcher transition rejects changed PID identity without signalling it'
 }
 
 test_first_account_commit_rollback() {
@@ -788,6 +835,30 @@ test_discovery_errors_fail_closed() {
   pass 'preflight fails closed when process or port discovery fails'
 }
 
+test_default_ss_errors_fail_closed() {
+  setup_fixture default-ss-error
+  export QQCODEX_LOCAL_PORT_CHECK=
+  export QQCODEX_LOCAL_SS=$FIXTURE/fake-ss
+  export QQCODEX_TEST_SS_STATUS=2
+  printf 'error\n' >"$PROBE_MODE_FILE"
+
+  capture ss-error start
+  assert_eq 1 "$LAST_STATUS" 'default ss error status'
+  assert_contains "$LAST_ERR" 'port discovery failed' 'default ss error report'
+  assert_file_absent "$NAPCAT_ARGS" 'NapCat after default ss error'
+  assert_file_absent "$WORKER_ARGS" 'Worker after default ss error'
+  assert_no_secret_output
+
+  setup_fixture default-ss-missing
+  export QQCODEX_LOCAL_PORT_CHECK=
+  export QQCODEX_LOCAL_SS=$FIXTURE/missing-ss
+  capture ss-missing start
+  assert_eq 1 "$LAST_STATUS" 'missing default ss status'
+  assert_contains "$LAST_ERR" 'port discovery command is unavailable' 'missing default ss report'
+  assert_file_absent "$NAPCAT_ARGS" 'NapCat without default ss command'
+  pass 'default ss discovery fails closed without launching NapCat'
+}
+
 test_status_states() {
   setup_fixture status-stopped
   capture stopped status
@@ -846,6 +917,7 @@ test_start_first_account
 test_start_saved_mismatch
 test_missing_groups
 test_pid_record_failures_cleanup
+test_transition_pid_reuse_is_not_managed
 test_first_account_commit_rollback
 test_cleanup_timeout_keeps_managed_pid
 test_switch_success
@@ -857,6 +929,7 @@ test_stop_process_identity
 test_stop_timeout_keeps_managed_pid
 test_unmanaged_conflicts
 test_discovery_errors_fail_closed
+test_default_ss_errors_fail_closed
 test_status_states
 test_usage
 
