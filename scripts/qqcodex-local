@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+set +x
 set -euo pipefail
 umask 077
 
@@ -32,6 +33,8 @@ SS=${QQCODEX_LOCAL_SS:-ss}
 PROC_ROOT=${QQCODEX_LOCAL_PROC_ROOT:-/proc}
 PROCESS_START_TIME=${QQCODEX_LOCAL_PROCESS_START_TIME:-}
 JQ=${QQCODEX_LOCAL_JQ:-jq}
+FLOCK=${QQCODEX_LOCAL_FLOCK:-flock}
+LOCK_FILE=${QQCODEX_LOCAL_LOCK_FILE:-$RUN_DIR/launcher.lock}
 
 NAPCAT_PID_FILE=$RUN_DIR/napcat.pid
 WORKER_PID_FILE=$RUN_DIR/worker.pid
@@ -51,6 +54,12 @@ NEW_NAPCAT_PID=
 NEW_WORKER_PID=
 NEW_NAPCAT_START=
 NEW_WORKER_START=
+SPAWNED_NAPCAT_PID=
+SPAWNED_WORKER_PID=
+SPAWNED_NAPCAT_START=
+SPAWNED_WORKER_START=
+LOCK_FD=
+LOCK_HELD=0
 
 # A caller-provided value must never reach NapCat or Worker.
 unset NAPCAT_ACCESS_TOKEN
@@ -73,16 +82,74 @@ command_available() {
   fi
 }
 
-require_readable() {
-  [[ -f $1 && -r $1 ]] || die "$2 is not a readable file: $1"
-}
-
 require_executable() {
   [[ -f $1 && -x $1 ]] || die "$2 is not executable: $1"
 }
 
-is_nonnegative_integer() {
-  [[ $1 =~ ^[0-9]+$ ]]
+file_is_owned_regular() {
+  local file=$1 require_private=$2 owner mode
+  [[ -f $file && ! -L $file && -r $file ]] || return 1
+  owner=$(stat -c '%u' -- "$file" 2>/dev/null) || return 1
+  [[ $owner == "$EUID" ]] || return 1
+  if [[ $require_private == 1 ]]; then
+    mode=$(stat -c '%a' -- "$file" 2>/dev/null) || return 1
+    [[ $mode =~ ^[0-7]{3,4}$ ]] || return 1
+    (( (8#$mode & 077) == 0 )) || return 1
+  fi
+}
+
+require_owned_regular() {
+  local suffix=
+  [[ $3 == 0 ]] || suffix=' with private permissions'
+  file_is_owned_regular "$1" "$3" || \
+    die "$2 must be a readable, owned, regular non-symlink file$suffix: $1"
+}
+
+validate_bounded_integer() {
+  local value=$1 maximum=$2 label=$3 normalized
+  [[ $value =~ ^[0-9]+$ ]] || die "$label must be a bounded decimal integer"
+  normalized=$value
+  while [[ $normalized == 0* && ${#normalized} -gt 1 ]]; do
+    normalized=${normalized#0}
+  done
+  (( ${#normalized} < ${#maximum} )) || {
+    (( ${#normalized} == ${#maximum} )) && [[ $normalized < $maximum || $normalized == "$maximum" ]]
+  } || die "$label exceeds maximum $maximum"
+}
+
+validate_positive_duration() {
+  local value=$1 maximum=$2 label=$3 whole fraction normalized
+  [[ $value =~ ^[0-9]+([.][0-9]+)?$ ]] || \
+    die "$label must be a finite positive decimal interval"
+  whole=${value%%.*}
+  fraction=
+  [[ $value == *.* ]] && fraction=${value#*.}
+  normalized=$whole
+  while [[ $normalized == 0* && ${#normalized} -gt 1 ]]; do
+    normalized=${normalized#0}
+  done
+  (( ${#normalized} <= ${#maximum} )) || die "$label exceeds maximum $maximum"
+  if (( 10#$normalized > maximum )); then
+    die "$label exceeds maximum $maximum"
+  fi
+  if (( 10#$normalized == maximum )) && [[ ${fraction//0/} != '' ]]; then
+    die "$label exceeds maximum $maximum"
+  fi
+  if (( 10#$normalized == 0 )) && [[ ${fraction//0/} == '' ]]; then
+    die "$label must be a finite positive decimal interval"
+  fi
+}
+
+validate_runtime_inputs() {
+  validate_bounded_integer "$LOGIN_TIMEOUT" 86400 'login timeout'
+  validate_bounded_integer "$STATUS_TIMEOUT" 86400 'status timeout'
+  validate_bounded_integer "$PROCESS_TIMEOUT" 86400 'process timeout'
+  validate_bounded_integer "$STOP_TIMEOUT" 86400 'stop timeout'
+  validate_positive_duration "$PROBE_INTERVAL" 60 'probe interval'
+  validate_positive_duration "$PROCESS_INTERVAL" 60 'process interval'
+  validate_bounded_integer "$ONEBOT_PORT" 65535 'OneBot port'
+  (( 10#$ONEBOT_PORT > 0 )) || die 'OneBot port must be between 1 and 65535'
+  command_available "$FLOCK" || die "flock command is unavailable: $FLOCK"
 }
 
 is_positive_pid() {
@@ -115,9 +182,60 @@ ensure_run_dir() {
   chmod 0700 -- "$RUN_DIR"
 }
 
+validate_lock_file() {
+  local run_resolved lock_dir_resolved owner mode
+  run_resolved=$(resolved_path "$RUN_DIR") || die "cannot resolve run directory: $RUN_DIR"
+  lock_dir_resolved=$(resolved_path "$(dirname -- "$LOCK_FILE")") || \
+    die "cannot resolve lock directory: $(dirname -- "$LOCK_FILE")"
+  [[ $lock_dir_resolved == "$run_resolved" ]] || die 'lock file must be inside the run directory'
+  [[ -f $LOCK_FILE && ! -L $LOCK_FILE ]] || die "lock path is not a regular file: $LOCK_FILE"
+  owner=$(stat -c '%u' -- "$LOCK_FILE") || die "cannot inspect lock file: $LOCK_FILE"
+  [[ $owner == "$EUID" ]] || die "lock file is not owned by the effective user: $LOCK_FILE"
+  mode=$(stat -c '%a' -- "$LOCK_FILE") || die "cannot inspect lock file: $LOCK_FILE"
+  [[ $mode =~ ^[0-7]{3,4}$ ]] || die "lock file has an invalid mode: $LOCK_FILE"
+  (( (8#$mode & 077) == 0 )) || die "lock file is not private: $LOCK_FILE"
+}
+
+prepare_lock_file() {
+  ensure_run_dir
+  if [[ ! -e $LOCK_FILE && ! -L $LOCK_FILE ]]; then
+    if (set -o noclobber; : >"$LOCK_FILE") 2>/dev/null; then
+      chmod 0600 -- "$LOCK_FILE"
+    fi
+  fi
+  validate_lock_file
+}
+
+acquire_command_lock() {
+  local mode=$1
+  prepare_lock_file
+  exec {LOCK_FD}<>"$LOCK_FILE" || die "cannot open lock file: $LOCK_FILE"
+  if [[ $mode == shared ]]; then
+    "$FLOCK" -n -s "$LOCK_FD" || {
+      exec {LOCK_FD}>&-
+      LOCK_FD=
+      die 'another qqcodex-local command is in progress'
+    }
+  else
+    "$FLOCK" -n "$LOCK_FD" || {
+      exec {LOCK_FD}>&-
+      LOCK_FD=
+      die 'another qqcodex-local command is in progress'
+    }
+  fi
+  LOCK_HELD=1
+}
+
+release_command_lock() {
+  [[ $LOCK_HELD == 1 ]] || return 0
+  "$FLOCK" -u "$LOCK_FD" || true
+  exec {LOCK_FD}>&-
+  LOCK_FD=
+  LOCK_HELD=0
+}
+
 validate_webui() {
-  require_readable "$WEBUI" 'NapCat WebUI configuration'
-  [[ ! -L $WEBUI ]] || die 'NapCat WebUI configuration must not be a symbolic link'
+  require_owned_regular "$WEBUI" 'NapCat WebUI configuration' 1
   "$JQ" -e 'type == "object"' "$WEBUI" >/dev/null 2>&1 || \
     die "NapCat WebUI configuration must be a JSON object"
 }
@@ -136,18 +254,12 @@ preflight_files() {
   else
     command_available "$SS" || die "port discovery command is unavailable: $SS"
   fi
-  is_nonnegative_integer "$LOGIN_TIMEOUT" || die 'login timeout must be a non-negative integer'
-  is_nonnegative_integer "$STATUS_TIMEOUT" || die 'status timeout must be a non-negative integer'
-  is_nonnegative_integer "$PROCESS_TIMEOUT" || die 'process timeout must be a non-negative integer'
-  is_nonnegative_integer "$STOP_TIMEOUT" || die 'stop timeout must be a non-negative integer'
-  [[ $ONEBOT_PORT =~ ^[1-9][0-9]*$ ]] && (( ONEBOT_PORT <= 65535 )) || \
-    die 'OneBot port must be between 1 and 65535'
   ensure_run_dir
-  require_readable "$CONFIG" 'Worker configuration'
+  require_owned_regular "$CONFIG" 'Worker configuration' 0
   require_executable "$PROBE" 'OneBot probe'
   require_executable "$NAPCAT_LAUNCHER" 'NapCat launcher'
   require_executable "$WORKER_LAUNCHER" 'Worker launcher'
-  require_readable "$TOKEN_FILE" 'NapCat access token'
+  require_owned_regular "$TOKEN_FILE" 'NapCat access token' 1
   [[ -s $TOKEN_FILE ]] || die 'NapCat access token is empty'
   require_executable "$QQ_EXECUTABLE" 'expected QQ executable'
   require_executable "$WORKER_EXECUTABLE" 'expected Worker executable'
@@ -252,7 +364,7 @@ atomic_copy() {
   local source=$1 target=$2 mode=$3 dir base temp
   dir=$(dirname -- "$target")
   base=$(basename -- "$target")
-  [[ -d $dir && -f $source ]] || return 1
+  [[ -d $dir && -f $source && ! -L $source ]] || return 1
   temp=$(mktemp "$dir/.$base.XXXXXX") || return 1
   if ! cp -- "$source" "$temp" || ! chmod "$mode" "$temp" || ! mv -f -- "$temp" "$target"; then
     rm -f -- "$temp"
@@ -283,8 +395,20 @@ wait_for_expected_executable() {
     [[ $current_start == "$original_start" ]] || return 1
     pid_matches_executable "$pid" "$expected" && return 0
     (( SECONDS < deadline )) || return 1
-    "$SLEEP" "$PROCESS_INTERVAL"
+    sleep_until_deadline "$PROCESS_INTERVAL" "$deadline"
   done
+}
+
+sleep_until_deadline() {
+  local interval=$1 deadline=$2 remaining whole
+  remaining=$((deadline - SECONDS))
+  (( remaining > 0 )) || return 0
+  whole=${interval%%.*}
+  if (( 10#$whole >= remaining )); then
+    "$SLEEP" "$remaining"
+  else
+    "$SLEEP" "$interval"
+  fi
 }
 
 terminate_pid_file() {
@@ -311,7 +435,7 @@ terminate_tracked_pid() {
   deadline=$((SECONDS + STOP_TIMEOUT))
   while pid_matches_identity "$pid" "$expected" "$recorded_start"; do
     (( SECONDS < deadline )) || break
-    "$SLEEP" "$PROCESS_INTERVAL"
+    sleep_until_deadline "$PROCESS_INTERVAL" "$deadline"
   done
   if pid_matches_identity "$pid" "$expected" "$recorded_start"; then
     printf '%s did not stop after TERM (PID %s)\n' "$label" "$pid" >&2
@@ -320,6 +444,38 @@ terminate_tracked_pid() {
   if ! kill -0 "$pid" 2>/dev/null; then
     wait "$pid" 2>/dev/null || true
   fi
+}
+
+pid_matches_start_identity() {
+  local pid=$1 recorded_start=$2 current_start
+  is_positive_pid "$pid" || return 1
+  is_positive_pid "$recorded_start" || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  current_start=$(process_start_time "$pid") || return 1
+  [[ $current_start == "$recorded_start" ]]
+}
+
+process_is_zombie() {
+  local pid=$1 stat_line fields
+  stat_line=$(<"$PROC_ROOT/$pid/stat") || return 1
+  fields=${stat_line##*) }
+  [[ ${fields%% *} == Z ]]
+}
+
+terminate_owned_child() {
+  local pid=$1 recorded_start=$2 label=$3 deadline
+  pid_matches_start_identity "$pid" "$recorded_start" || return 0
+  kill -TERM "$pid" 2>/dev/null || true
+  deadline=$((SECONDS + STOP_TIMEOUT))
+  while pid_matches_start_identity "$pid" "$recorded_start" && ! process_is_zombie "$pid"; do
+    (( SECONDS < deadline )) || break
+    sleep_until_deadline "$PROCESS_INTERVAL" "$deadline"
+  done
+  if pid_matches_start_identity "$pid" "$recorded_start" && ! process_is_zombie "$pid"; then
+    printf '%s direct child did not stop after TERM (PID %s)\n' "$label" "$pid" >&2
+    return 1
+  fi
+  wait "$pid" 2>/dev/null || true
 }
 
 remove_pid_file_for() {
@@ -410,7 +566,7 @@ run_probe_once() {
   token=$(<"$TOKEN_FILE")
   [[ -n $token ]] || return 1
   set +e
-  output=$(NAPCAT_ACCESS_TOKEN=$token "$TIMEOUT" --foreground "$attempt_timeout" \
+  output=$(NAPCAT_ACCESS_TOKEN=$token "$TIMEOUT" --kill-after=1s "$attempt_timeout" \
     "$PROBE" -config "$CONFIG" 2>/dev/null)
   status=$?
   set -e
@@ -441,7 +597,7 @@ probe_until_online() {
       return 0
     fi
     (( SECONDS < deadline )) || return 1
-    "$SLEEP" "$PROBE_INTERVAL"
+    sleep_until_deadline "$PROBE_INTERVAL" "$deadline"
   done
 }
 
@@ -463,7 +619,9 @@ require_all_groups() {
 launch_napcat() {
   "$NAPCAT_LAUNCHER" "$@" &
   local pid=$! start
+  SPAWNED_NAPCAT_PID=$pid
   start=$(process_start_time "$pid") || die 'failed to capture NapCat process identity'
+  SPAWNED_NAPCAT_START=$start
   if ! wait_for_expected_executable "$pid" "$QQ_EXECUTABLE" "$start"; then
     die 'NapCat launcher did not transition to the expected QQ executable'
   fi
@@ -478,7 +636,9 @@ launch_napcat() {
 launch_worker_foreground() {
   "$WORKER_LAUNCHER" &
   local pid=$! start status
+  SPAWNED_WORKER_PID=$pid
   start=$(process_start_time "$pid") || die 'failed to capture Worker process identity'
+  SPAWNED_WORKER_START=$start
   if ! wait_for_expected_executable "$pid" "$WORKER_EXECUTABLE" "$start"; then
     die 'Worker launcher did not transition to the expected Worker executable'
   fi
@@ -488,6 +648,7 @@ launch_worker_foreground() {
   NEW_WORKER_START=$start
   atomic_write_managed_pid "$WORKER_PID_FILE" "$WORKER_START_FILE" "$pid" "$start" || \
     die 'failed to record Worker PID'
+  release_command_lock
   set +e
   wait "$pid"
   status=$?
@@ -496,35 +657,48 @@ launch_worker_foreground() {
 }
 
 snapshot_switch_state() {
-  cp -- "$WEBUI" "$WEBUI_SNAPSHOT"
-  chmod 0600 "$WEBUI_SNAPSHOT"
   if [[ -e $ACCOUNT_FILE || -L $ACCOUNT_FILE ]]; then
-    [[ -f $ACCOUNT_FILE && ! -L $ACCOUNT_FILE && -r $ACCOUNT_FILE ]] || \
-      die 'saved account is not a readable regular file'
-    cp -- "$ACCOUNT_FILE" "$ACCOUNT_SNAPSHOT"
-    chmod 0600 "$ACCOUNT_SNAPSHOT"
+    require_owned_regular "$ACCOUNT_FILE" 'saved account' 1
     ACCOUNT_WAS_PRESENT=1
   else
-    rm -f -- "$ACCOUNT_SNAPSHOT"
     ACCOUNT_WAS_PRESENT=0
+  fi
+
+  [[ ! -d $WEBUI_SNAPSHOT && ! -d $ACCOUNT_SNAPSHOT ]] || \
+    die 'transaction snapshot path must not be a directory'
+  rm -f -- "$WEBUI_SNAPSHOT" "$ACCOUNT_SNAPSHOT"
+  atomic_copy "$WEBUI" "$WEBUI_SNAPSHOT" 0600 || \
+    die 'failed to snapshot NapCat WebUI configuration'
+  if [[ $ACCOUNT_WAS_PRESENT == 1 ]]; then
+    if ! atomic_copy "$ACCOUNT_FILE" "$ACCOUNT_SNAPSHOT" 0600; then
+      rm -f -- "$WEBUI_SNAPSHOT"
+      die 'failed to snapshot saved account'
+    fi
   fi
   ROLLBACK_ACTIVE=1
 }
 
 rollback_switch_state() {
+  local failed=0
   [[ $ROLLBACK_ACTIVE == 1 ]] || return 0
-  if [[ -f $WEBUI_SNAPSHOT ]]; then
-    atomic_copy "$WEBUI_SNAPSHOT" "$WEBUI" 0600 || \
-      printf '%s\n' 'failed to restore NapCat WebUI snapshot' >&2
+  if [[ ! -f $WEBUI_SNAPSHOT || -L $WEBUI_SNAPSHOT ]] || \
+    ! atomic_copy "$WEBUI_SNAPSHOT" "$WEBUI" 0600; then
+    printf '%s\n' 'failed to restore NapCat WebUI snapshot; snapshots retained' >&2
+    failed=1
   fi
   if [[ $ACCOUNT_WAS_PRESENT == 1 ]]; then
-    if [[ -f $ACCOUNT_SNAPSHOT ]]; then
-      atomic_copy "$ACCOUNT_SNAPSHOT" "$ACCOUNT_FILE" 0600 || \
-        printf '%s\n' 'failed to restore saved account snapshot' >&2
+    if [[ ! -f $ACCOUNT_SNAPSHOT || -L $ACCOUNT_SNAPSHOT ]] || \
+      ! atomic_copy "$ACCOUNT_SNAPSHOT" "$ACCOUNT_FILE" 0600; then
+      printf '%s\n' 'failed to restore saved account snapshot; snapshots retained' >&2
+      failed=1
     fi
   else
-    rm -f -- "$ACCOUNT_FILE"
+    if ! rm -f -- "$ACCOUNT_FILE"; then
+      printf '%s\n' 'failed to restore absence of saved account; snapshots retained' >&2
+      failed=1
+    fi
   fi
+  (( failed == 0 )) || return 1
   rm -f -- "$WEBUI_SNAPSHOT" "$ACCOUNT_SNAPSHOT"
   ROLLBACK_ACTIVE=0
 }
@@ -545,11 +719,18 @@ cleanup() {
     remove_pid_file_for "$WORKER_PID_FILE" "$WORKER_START_FILE" \
       "$NEW_WORKER_PID" "$NEW_WORKER_START"
   fi
+  if [[ -z $NEW_WORKER_PID ]]; then
+    terminate_owned_child "$SPAWNED_WORKER_PID" "$SPAWNED_WORKER_START" 'Worker'
+  fi
   if terminate_tracked_pid "$NEW_NAPCAT_PID" "$QQ_EXECUTABLE" "$NEW_NAPCAT_START" 'NapCat'; then
     remove_pid_file_for "$NAPCAT_PID_FILE" "$NAPCAT_START_FILE" \
       "$NEW_NAPCAT_PID" "$NEW_NAPCAT_START"
   fi
+  if [[ -z $NEW_NAPCAT_PID ]]; then
+    terminate_owned_child "$SPAWNED_NAPCAT_PID" "$SPAWNED_NAPCAT_START" 'NapCat'
+  fi
   rollback_switch_state
+  release_command_lock
   return "$status"
 }
 
@@ -563,8 +744,7 @@ install_cleanup() {
 read_saved_account() {
   local saved
   [[ -e $ACCOUNT_FILE ]] || return 1
-  [[ -f $ACCOUNT_FILE && ! -L $ACCOUNT_FILE && -r $ACCOUNT_FILE ]] || \
-    die 'saved account is not a readable regular file'
+  require_owned_regular "$ACCOUNT_FILE" 'saved account' 1
   saved=$(read_positive_decimal_file "$ACCOUNT_FILE") || \
     die 'saved account is not a canonical decimal ID'
   printf '%s\n' "$saved"
@@ -572,6 +752,7 @@ read_saved_account() {
 
 start_command() {
   local saved=
+  acquire_command_lock exclusive
   preflight_files
   refuse_managed_processes
   refuse_unmanaged_conflicts
@@ -595,6 +776,7 @@ start_command() {
 }
 
 switch_command() {
+  acquire_command_lock exclusive
   preflight_files
   stop_managed_processes
   refuse_unmanaged_conflicts
@@ -613,9 +795,12 @@ switch_command() {
 }
 
 status_command() {
-  local saved= napcat_pid= worker_pid= online_hint=0
-  if [[ -f $ACCOUNT_FILE && ! -L $ACCOUNT_FILE && -r $ACCOUNT_FILE ]]; then
-    if saved=$(read_positive_decimal_file "$ACCOUNT_FILE"); then
+  local saved= napcat_pid= worker_pid= online_hint=0 status
+  acquire_command_lock shared
+  if [[ -e $ACCOUNT_FILE || -L $ACCOUNT_FILE ]]; then
+    if ! file_is_owned_regular "$ACCOUNT_FILE" 1; then
+      printf '%s\n' 'saved account: unsafe'
+    elif saved=$(read_positive_decimal_file "$ACCOUNT_FILE"); then
       printf 'saved account: %s\n' "$saved"
     else
       printf '%s\n' 'saved account: invalid'
@@ -636,22 +821,42 @@ status_command() {
     printf '%s\n' 'Worker: stopped'
   fi
 
-  if command_available "$PGREP"; then
+  if ! command_available "$PGREP"; then
+    printf '%s\n' 'QQ process discovery: unknown (tool unavailable)'
+    printf '%s\n' 'Worker process discovery: unknown (tool unavailable)'
+  else
     if discover_unmanaged "$QQ_EXECUTABLE" "$napcat_pid"; then
       printf 'unmanaged QQ process: PID %s\n' "$DISCOVERED_PIDS"
       online_hint=1
+    else
+      status=$?
+      (( status == 1 )) || printf '%s\n' 'QQ process discovery: unknown (tool failure)'
     fi
     if discover_unmanaged "$WORKER_EXECUTABLE" "$worker_pid"; then
       printf 'unmanaged Worker process: PID %s\n' "$DISCOVERED_PIDS"
+    else
+      status=$?
+      (( status == 1 )) || printf '%s\n' 'Worker process discovery: unknown (tool failure)'
     fi
   fi
-  if port_is_listening; then
-    online_hint=1
+  if { [[ -n $PORT_CHECK ]] && ! command_available "$PORT_CHECK"; } || \
+    { [[ -z $PORT_CHECK ]] && ! command_available "$SS"; }; then
+    printf '%s\n' 'OneBot listener discovery: unknown (tool unavailable)'
+  else
+    if port_is_listening; then
+      online_hint=1
+    else
+      status=$?
+      (( status == 1 )) || printf '%s\n' 'OneBot listener discovery: unknown (tool failure)'
+    fi
   fi
+
+  release_command_lock
 
   if (( online_hint == 1 )) && command_available "$JQ" && \
     command_available "$TIMEOUT" && \
-    [[ -x $PROBE && -r $CONFIG && -r $TOKEN_FILE && -s $TOKEN_FILE ]]; then
+    [[ -x $PROBE && -s $TOKEN_FILE ]] && \
+    file_is_owned_regular "$CONFIG" 0 && file_is_owned_regular "$TOKEN_FILE" 1; then
     if probe_until_online "$STATUS_TIMEOUT" && load_probe_identity; then
       printf 'detected account: %s, nickname: %s\n' "$PROBE_SELF_ID" "$PROBE_NICKNAME_JSON"
     else
@@ -665,13 +870,19 @@ status_command() {
 }
 
 stop_command() {
-  ensure_run_dir
+  acquire_command_lock exclusive
   stop_managed_processes
+  release_command_lock
   return 0
 }
 
 main() {
   (( $# == 1 )) || usage
+  case "$1" in
+    start|switch-account|status|stop) ;;
+    *) usage ;;
+  esac
+  validate_runtime_inputs
   case "$1" in
     start) start_command ;;
     switch-account) switch_command ;;

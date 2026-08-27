@@ -128,7 +128,8 @@ setup_fixture() {
   unset QQCODEX_LOCAL_PROCESS_START_TIME QQCODEX_LOCAL_SS
   unset QQCODEX_TEST_JQ_FAIL_ACCOUNT QQCODEX_TEST_NAPCAT_REMOVE_RUN \
     QQCODEX_TEST_PGREP_ERROR QQCODEX_TEST_PORT_ERROR \
-    QQCODEX_TEST_WORKER_IGNORE_TERM QQCODEX_TEST_WORKER_REMOVE_RUN
+    QQCODEX_TEST_WORKER_IGNORE_TERM QQCODEX_TEST_WORKER_REMOVE_RUN \
+    QQCODEX_TEST_NAPCAT_WRONG_EXEC QQCODEX_TEST_NAPCAT_HANG
   FIXTURE=$SUITE_ROOT/$name
   PROJECT_ROOT=$FIXTURE/project
   NAPCAT_ROOT=$FIXTURE/napcat
@@ -146,6 +147,7 @@ setup_fixture() {
   WEBUI=$FIXTURE/state/webui.json
   ACCOUNT=$FIXTURE/state/bot-uin
   RUN_DIR=$FIXTURE/state/run
+  LOCK_FILE=$RUN_DIR/launcher.lock
   NAPCAT_START=$RUN_DIR/napcat.start
   WORKER_START=$RUN_DIR/worker.start
   QQ_DISCOVERY=$FIXTURE/qq.pids
@@ -155,6 +157,8 @@ setup_fixture() {
   PROBE_MODE_FILE=$FIXTURE/probe.mode
   PROBE_COUNT_FILE=$FIXTURE/probe.count
   PROBE_ARGS=$FIXTURE/probe.args
+  PROBE_PARENT=$FIXTURE/probe.parent
+  PROBE_CHILD=$FIXTURE/probe.child
   NAPCAT_ARGS=$FIXTURE/napcat.args
   NAPCAT_WEBUI_ACCOUNT=$FIXTURE/napcat.webui-account
   WORKER_ARGS=$FIXTURE/worker.args
@@ -199,6 +203,12 @@ mode=$(<"$QQCODEX_TEST_PROBE_MODE")
   error) exit 1 ;;
   invalid) printf '%s\n' '{"self_id":123,"nickname":"bad","group_ids":[],"missing_group_ids":[]}' ; exit 0 ;;
   hang) exec /bin/sleep 60 ;;
+  ignore-term)
+    printf '%s\n' "$$" >"$QQCODEX_TEST_PROBE_PARENT"
+    /bin/bash -c 'trap "" TERM; printf "%s\n" "$$" >"$QQCODEX_TEST_PROBE_CHILD"; while :; do /bin/sleep 1; done' &
+    trap '' TERM
+    while :; do /bin/sleep 1; done
+    ;;
   retry-once) (( count > 1 )) || exit 1 ;;
   *) exit 92 ;;
 esac
@@ -216,7 +226,14 @@ if [[ -v NAPCAT_ACCESS_TOKEN ]]; then
   printf '%s\n' "$NAPCAT_ACCESS_TOKEN" >"$QQCODEX_TEST_NAPCAT_ENV_LEAK"
 fi
 if [[ ${QQCODEX_TEST_NAPCAT_REMOVE_RUN-0} == 1 ]]; then
+  rm -f -- "$QQCODEX_LOCAL_RUN_ROOT/launcher.lock"
   rmdir -- "$QQCODEX_LOCAL_RUN_ROOT"
+fi
+if [[ ${QQCODEX_TEST_NAPCAT_WRONG_EXEC-0} == 1 ]]; then
+  exec /bin/sleep 60
+fi
+if [[ ${QQCODEX_TEST_NAPCAT_HANG-0} == 1 ]]; then
+  while :; do /bin/sleep 1; done
 fi
 exec "$QQCODEX_TEST_QQ_EXEC" 60
 EOF
@@ -230,7 +247,8 @@ if [[ -v NAPCAT_ACCESS_TOKEN ]]; then
   printf '%s\n' "$NAPCAT_ACCESS_TOKEN" >"$QQCODEX_TEST_WORKER_ENV_LEAK"
 fi
 if [[ ${QQCODEX_TEST_WORKER_REMOVE_RUN-0} == 1 ]]; then
-  rm -f -- "$QQCODEX_LOCAL_RUN_ROOT/napcat.pid"
+  rm -f -- "$QQCODEX_LOCAL_RUN_ROOT/napcat.pid" \
+    "$QQCODEX_LOCAL_RUN_ROOT/napcat.start" "$QQCODEX_LOCAL_RUN_ROOT/launcher.lock"
   rmdir -- "$QQCODEX_LOCAL_RUN_ROOT"
 fi
 if [[ ${QQCODEX_TEST_WORKER_IGNORE_TERM-0} == 1 ]]; then
@@ -314,6 +332,9 @@ EOF
   export QQCODEX_LOCAL_STOP_TIMEOUT=1
   export QQCODEX_LOCAL_PROBE_INTERVAL=0.02
   export QQCODEX_LOCAL_PROCESS_INTERVAL=0.02
+  export QQCODEX_LOCAL_FLOCK
+  QQCODEX_LOCAL_FLOCK=$(command -v flock)
+  export QQCODEX_LOCAL_LOCK_FILE=$LOCK_FILE
   export QQCODEX_LOCAL_PGREP=$FIXTURE/fake-pgrep
   export QQCODEX_LOCAL_PORT_CHECK=$FIXTURE/fake-port-check
 
@@ -322,6 +343,8 @@ EOF
   export QQCODEX_TEST_PROBE_MODE=$PROBE_MODE_FILE
   export QQCODEX_TEST_PROBE_COUNT=$PROBE_COUNT_FILE
   export QQCODEX_TEST_PROBE_ARGS=$PROBE_ARGS
+  export QQCODEX_TEST_PROBE_PARENT=$PROBE_PARENT
+  export QQCODEX_TEST_PROBE_CHILD=$PROBE_CHILD
   export QQCODEX_TEST_NAPCAT_ARGS=$NAPCAT_ARGS
   export QQCODEX_TEST_NAPCAT_WEBUI_ACCOUNT=$NAPCAT_WEBUI_ACCOUNT
   export QQCODEX_TEST_WORKER_ARGS=$WORKER_ARGS
@@ -413,6 +436,7 @@ test_start_first_account() {
   assert_eq 600 "$(stat -c '%a' "$NAPCAT_START")" 'NapCat identity file mode'
   assert_eq 600 "$(stat -c '%a' "$RUN_DIR/worker.pid")" 'Worker PID file mode'
   assert_eq 600 "$(stat -c '%a' "$WORKER_START")" 'Worker identity file mode'
+  assert_eq 600 "$(stat -c '%a' "$LOCK_FILE")" 'transaction lock file mode'
   assert_eq '<-config>' "$(sed -n '1p' "$PROBE_ARGS")" 'probe flag'
   assert_eq "<$CONFIG>" "$(sed -n '2p' "$PROBE_ARGS")" 'probe config path'
   assert_eq '<>' "$(<"$WORKER_ARGS")" 'Worker receives no token arguments'
@@ -662,6 +686,75 @@ test_switch_cancel_rollback() {
   pass 'cancelled switch restores exact state and stops the new NapCat child'
 }
 
+test_concurrent_mutation_is_refused() {
+  setup_fixture concurrent-mutation
+  printf 'error\n' >"$PROBE_MODE_FILE"
+  export QQCODEX_LOCAL_LOGIN_TIMEOUT=10
+  export QQCODEX_LOCAL_PROBE_INTERVAL=0.1
+
+  start_background locked-start start
+  first_wrapper=$WRAPPER_PID
+  wait_for_file "$RUN_DIR/napcat.pid"
+  napcat_pid=$(<"$RUN_DIR/napcat.pid")
+  track_pid "$napcat_pid"
+
+  capture concurrent-switch switch-account
+  assert_eq 1 "$LAST_STATUS" 'concurrent switch status'
+  assert_contains "$LAST_ERR" 'another qqcodex-local command is in progress' \
+    'concurrent mutation report'
+  assert_eq '<>' "$(<"$NAPCAT_ARGS")" 'concurrent switch must not relaunch NapCat'
+  kill -0 "$napcat_pid" 2>/dev/null || fail 'concurrent switch stopped the active transaction child'
+
+  stop_wrapper "$first_wrapper"
+  wait_for_dead "$napcat_pid"
+  assert_no_secret_output
+  pass 'concurrent start and switch transactions do not overlap'
+}
+
+test_snapshot_symlinks_are_replaced_safely() {
+  setup_fixture snapshot-symlinks
+  printf '111111\n' >"$ACCOUNT"
+  chmod 0600 "$ACCOUNT"
+  webui_external=$FIXTURE/webui.external
+  account_external=$FIXTURE/account.external
+  printf 'webui sentinel\n' >"$webui_external"
+  printf 'account sentinel\n' >"$account_external"
+  ln -s "$webui_external" "$RUN_DIR/webui.snapshot"
+  ln -s "$account_external" "$RUN_DIR/account.snapshot"
+  printf 'error\n' >"$PROBE_MODE_FILE"
+
+  capture hostile-snapshots switch-account
+  assert_eq 1 "$LAST_STATUS" 'hostile snapshot status'
+  assert_eq 'webui sentinel' "$(<"$webui_external")" 'WebUI snapshot external target'
+  assert_eq 'account sentinel' "$(<"$account_external")" 'account snapshot external target'
+  [[ ! -L $RUN_DIR/webui.snapshot ]] || fail 'WebUI snapshot symlink survived'
+  [[ ! -L $RUN_DIR/account.snapshot ]] || fail 'account snapshot symlink survived'
+  assert_no_secret_output
+  pass 'hostile snapshot symlinks cannot redirect transaction state'
+}
+
+test_lock_file_is_private_and_not_followed() {
+  setup_fixture lock-symlink
+  lock_target=$FIXTURE/lock.target
+  printf 'lock sentinel\n' >"$lock_target"
+  rm -f -- "$LOCK_FILE"
+  ln -s "$lock_target" "$LOCK_FILE"
+  capture lock-symlink stop
+  assert_eq 1 "$LAST_STATUS" 'lock symlink status'
+  assert_contains "$LAST_ERR" 'lock path' 'lock symlink report'
+  assert_eq 'lock sentinel' "$(<"$lock_target")" 'lock symlink external target'
+
+  setup_fixture lock-outside
+  outside_lock=$FIXTURE/outside.lock
+  : >"$outside_lock"
+  chmod 0600 "$outside_lock"
+  export QQCODEX_LOCAL_LOCK_FILE=$outside_lock
+  capture lock-outside stop
+  assert_eq 1 "$LAST_STATUS" 'outside lock status'
+  assert_contains "$LAST_ERR" 'inside the run directory' 'outside lock report'
+  pass 'transaction lock is private, non-symlinked, and confined to the run directory'
+}
+
 test_hanging_probe_obeys_timeout() {
   setup_fixture hanging-probe
   printf '111111\n' >"$ACCOUNT"
@@ -687,6 +780,133 @@ test_hanging_probe_obeys_timeout() {
   wait_for_dead "$napcat_pid"
   assert_no_secret_output
   pass 'a hanging probe is bounded by the configured login timeout'
+}
+
+test_term_ignoring_probe_is_killed() {
+  setup_fixture term-ignoring-probe
+  printf '111111\n' >"$ACCOUNT"
+  chmod 0600 "$ACCOUNT"
+  printf 'ignore-term\n' >"$PROBE_MODE_FILE"
+  export QQCODEX_LOCAL_LOGIN_TIMEOUT=0
+  LAST_OUT=$FIXTURE/ignore-term.out
+  LAST_ERR=$FIXTURE/ignore-term.err
+
+  set +e
+  "$(command -v timeout)" 4 "$LAUNCHER" switch-account >"$LAST_OUT" 2>"$LAST_ERR"
+  LAST_STATUS=$?
+  set -e
+  assert_eq 1 "$LAST_STATUS" 'TERM-ignoring probe timeout status'
+  wait_for_file "$PROBE_PARENT"
+  wait_for_file "$PROBE_CHILD"
+  probe_parent=$(<"$PROBE_PARENT")
+  probe_child=$(<"$PROBE_CHILD")
+  track_pid "$probe_parent"
+  track_pid "$probe_child"
+  wait_for_dead "$probe_parent"
+  wait_for_dead "$probe_child"
+  assert_file_absent "$WORKER_ARGS" 'Worker after TERM-ignoring probe'
+  assert_no_secret_output
+  pass 'TERM-ignoring probe process groups are forcibly bounded without token leaks'
+}
+
+test_central_input_validation() {
+  setup_fixture invalid-status-timeout
+  injection_marker=$FIXTURE/arithmetic-injection
+  export QQCODEX_LOCAL_STATUS_TIMEOUT="1+\$(touch $injection_marker)"
+  capture invalid-status status
+  assert_eq 1 "$LAST_STATUS" 'malformed status timeout status'
+  assert_contains "$LAST_ERR" 'status timeout' 'malformed status timeout report'
+  assert_file_absent "$injection_marker" 'status arithmetic injection marker'
+
+  setup_fixture invalid-stop-timeout
+  injection_marker=$FIXTURE/arithmetic-injection
+  export QQCODEX_LOCAL_LOGIN_TIMEOUT="1+\$(touch $injection_marker)"
+  capture invalid-stop stop
+  assert_eq 1 "$LAST_STATUS" 'malformed stop timeout status'
+  assert_contains "$LAST_ERR" 'login timeout' 'malformed stop timeout report'
+  assert_file_absent "$injection_marker" 'stop arithmetic injection marker'
+
+  local case_name variable value
+  for case_name in zero-probe negative-probe infinite-process huge-process; do
+    setup_fixture "invalid-$case_name"
+    case "$case_name" in
+      zero-probe) variable=QQCODEX_LOCAL_PROBE_INTERVAL; value=0 ;;
+      negative-probe) variable=QQCODEX_LOCAL_PROBE_INTERVAL; value=-1 ;;
+      infinite-process) variable=QQCODEX_LOCAL_PROCESS_INTERVAL; value=infinity ;;
+      huge-process) variable=QQCODEX_LOCAL_PROCESS_INTERVAL; value=61 ;;
+    esac
+    export "$variable=$value"
+    capture invalid-interval status
+    assert_eq 1 "$LAST_STATUS" "$case_name status"
+    assert_contains "$LAST_ERR" 'interval' "$case_name report"
+  done
+  pass 'all subcommands reject malformed arithmetic and unsafe intervals centrally'
+}
+
+test_sensitive_files_are_refused() {
+  setup_fixture token-symlink
+  token_target=$FIXTURE/token.target
+  printf '%s\n' 'ultra-secret-token' >"$token_target"
+  rm -f -- "$TOKEN_FILE"
+  ln -s "$token_target" "$TOKEN_FILE"
+  printf 'error\n' >"$PROBE_MODE_FILE"
+  capture token-symlink start
+  assert_eq 1 "$LAST_STATUS" 'token symlink status'
+  assert_contains "$LAST_ERR" 'access token' 'token symlink report'
+  assert_file_absent "$NAPCAT_ARGS" 'NapCat with token symlink'
+  assert_eq 'ultra-secret-token' "$(<"$token_target")" 'token symlink external target'
+  assert_no_secret_output
+
+  setup_fixture token-permissions
+  chmod 0644 "$TOKEN_FILE"
+  printf 'error\n' >"$PROBE_MODE_FILE"
+  capture token-mode start
+  assert_eq 1 "$LAST_STATUS" 'world-readable token status'
+  assert_contains "$LAST_ERR" 'access token' 'world-readable token report'
+  assert_file_absent "$NAPCAT_ARGS" 'NapCat with world-readable token'
+  assert_no_secret_output
+  pass 'token input must be private, owned, regular, and non-symlinked'
+}
+
+test_xtrace_does_not_expose_token() {
+  setup_fixture xtrace-token
+  printf '111111\n' >"$ACCOUNT"
+  chmod 0600 "$ACCOUNT"
+  LAST_OUT=$FIXTURE/xtrace.out
+  LAST_ERR=$FIXTURE/xtrace.err
+  set +e
+  bash -x "$LAUNCHER" start >"$LAST_OUT" 2>"$LAST_ERR"
+  LAST_STATUS=$?
+  set -e
+  assert_eq 1 "$LAST_STATUS" 'xtrace start status'
+  assert_contains "$LAST_ERR" 'switch-account' 'xtrace exercised authenticated probe path'
+  assert_no_secret_output
+  pass 'xtrace is disabled before any token can be read'
+}
+
+test_failed_launcher_transition_cleans_owned_child() {
+  local case_name toggle spawned
+  for case_name in wrong-exec hanging-launcher; do
+    setup_fixture "$case_name"
+    export QQCODEX_LOCAL_PROCESS_TIMEOUT=0
+    if [[ $case_name == wrong-exec ]]; then
+      toggle=QQCODEX_TEST_NAPCAT_WRONG_EXEC
+    else
+      toggle=QQCODEX_TEST_NAPCAT_HANG
+    fi
+    export "$toggle=1"
+    capture failed-transition start
+    assert_eq 1 "$LAST_STATUS" "$case_name transition status"
+    assert_contains "$LAST_ERR" 'did not transition' "$case_name transition report"
+    wait_for_file "$QQCODEX_TEST_NAPCAT_SPAWNED"
+    spawned=$(<"$QQCODEX_TEST_NAPCAT_SPAWNED")
+    track_pid "$spawned"
+    wait_for_dead "$spawned"
+    assert_file_absent "$RUN_DIR/napcat.pid" "$case_name managed PID file"
+    assert_file_absent "$WORKER_ARGS" "$case_name Worker invocation"
+    assert_no_secret_output
+  done
+  pass 'failed launcher transitions terminate only their original direct children'
 }
 
 test_symlinked_state_is_refused() {
@@ -895,8 +1115,19 @@ test_status_states() {
   capture unmanaged status
   assert_eq 0 "$LAST_STATUS" 'unmanaged status exit code'
   assert_contains "$LAST_OUT" 'unmanaged QQ' 'status unmanaged QQ report'
+
+  export QQCODEX_TEST_PGREP_ERROR=1
+  capture discovery-unknown status
+  assert_eq 0 "$LAST_STATUS" 'status process discovery failure exit code'
+  assert_contains "$LAST_OUT" 'unknown' 'status process discovery failure report'
+  unset QQCODEX_TEST_PGREP_ERROR
+
+  export QQCODEX_TEST_PORT_ERROR=1
+  capture port-unknown status
+  assert_eq 0 "$LAST_STATUS" 'status port discovery failure exit code'
+  assert_contains "$LAST_OUT" 'unknown' 'status port discovery failure report'
   assert_no_secret_output
-  pass 'status reports stopped, online, mismatch, and unmanaged states safely'
+  pass 'status reports stopped, online, mismatch, unmanaged, and unknown discovery states safely'
 }
 
 test_usage() {
@@ -909,6 +1140,10 @@ test_usage() {
     assert_eq 2 "$LAST_STATUS" "usage exit status for [$args]"
     assert_eq "$expected" "$(<"$LAST_ERR")" "usage text for [$args]"
   done
+  export QQCODEX_LOCAL_STATUS_TIMEOUT='not-a-number'
+  capture unknown-invalid-env unknown
+  assert_eq 2 "$LAST_STATUS" 'unknown command usage precedes runtime validation'
+  assert_eq "$expected" "$(<"$LAST_ERR")" 'unknown command exact usage with invalid environment'
   assert_no_secret_output
   pass 'missing, unknown, and extra arguments return exact usage with exit 2'
 }
@@ -923,7 +1158,15 @@ test_cleanup_timeout_keeps_managed_pid
 test_switch_success
 test_switch_rollbacks
 test_switch_cancel_rollback
+test_concurrent_mutation_is_refused
+test_snapshot_symlinks_are_replaced_safely
+test_lock_file_is_private_and_not_followed
 test_hanging_probe_obeys_timeout
+test_term_ignoring_probe_is_killed
+test_central_input_validation
+test_sensitive_files_are_refused
+test_xtrace_does_not_expose_token
+test_failed_launcher_transition_cleans_owned_child
 test_symlinked_state_is_refused
 test_stop_process_identity
 test_stop_timeout_keeps_managed_pid
