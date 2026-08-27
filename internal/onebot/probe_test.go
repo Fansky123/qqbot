@@ -3,6 +3,7 @@ package onebot
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
@@ -63,18 +64,26 @@ func TestProbeRejectsInvalidLoginInfo(t *testing.T) {
 		{name: "null nickname", data: `{"user_id":42,"nickname":null}`},
 		{name: "non-string nickname", data: `{"user_id":42,"nickname":true}`},
 		{name: "long nickname", data: `{"user_id":42,"nickname":"` + strings.Repeat("x", maxNicknameRunes+1) + `"}`},
+		{name: "null data", data: `null`},
+		{name: "array data", data: `[]`},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			server := newWebSocketServer(t, func(ctx context.Context, conn *websocket.Conn, _ *http.Request) {
 				action := readProbeAction(t, ctx, conn, "get_login_info")
 				_ = wsjson.Write(ctx, conn, ActionResponse{Status: "ok", RetCode: 0, Data: json.RawMessage(test.data), Echo: action.Echo})
+				var next ActionRequest
+				if err := wsjson.Read(ctx, conn, &next); err == nil {
+					t.Errorf("unexpected action after invalid login info: %#v", next)
+				}
 			})
 			defer server.Close()
 
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 			defer cancel()
-			if _, err := Probe(ctx, webSocketURL(server.URL), "token"); err == nil {
+			if _, err := Probe(ctx, webSocketURL(server.URL), "probe-secret"); err == nil {
 				t.Fatal("Probe accepted invalid login info")
+			} else if strings.Contains(err.Error(), "probe-secret") {
+				t.Fatalf("Probe error exposed token: %v", err)
 			}
 		})
 	}
@@ -243,6 +252,20 @@ func TestProbeValidatesInputs(t *testing.T) {
 				t.Fatal("Probe accepted invalid input")
 			}
 		})
+	}
+}
+
+func TestProbeReturnsPreCanceledContext(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := Probe(ctx, "ws://127.0.0.1:1", "probe-secret")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Probe error = %v, want context canceled", err)
+	}
+	if strings.Contains(err.Error(), "probe-secret") {
+		t.Fatalf("Probe error exposed token: %v", err)
 	}
 }
 
