@@ -284,6 +284,34 @@ func TestValidateMessageRunes(t *testing.T) {
 	}
 }
 
+func TestValidateSelfID(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		selfID  string
+		wantErr bool
+	}{
+		{selfID: "auto"},
+		{selfID: "3289886218"},
+		{selfID: "", wantErr: true},
+		{selfID: "+1", wantErr: true},
+		{selfID: "-1", wantErr: true},
+		{selfID: "01", wantErr: true},
+		{selfID: "abc", wantErr: true},
+		{selfID: "18446744073709551616", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.selfID, func(t *testing.T) {
+			cfg := validConfig(t)
+			cfg.OneBot.SelfID = tt.selfID
+			if err := Validate(cfg); (err != nil) != tt.wantErr {
+				t.Fatalf("Validate() error = %v, want error: %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestLoadErrors(t *testing.T) {
 	t.Parallel()
 

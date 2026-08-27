@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"unicode"
 )
@@ -106,6 +107,9 @@ func Validate(cfg Config) error {
 	if cfg.OneBot.URL == "" || cfg.OneBot.AccessTokenEnv == "" || cfg.OneBot.SelfID == "" {
 		return fmt.Errorf("onebot URL, access token environment variable, and self ID are required")
 	}
+	if err := validateOneBotSelfID(cfg.OneBot.SelfID); err != nil {
+		return err
+	}
 	if cfg.Codex.Binary == "" {
 		return fmt.Errorf("codex binary is required")
 	}
@@ -165,6 +169,17 @@ func Validate(cfg Config) error {
 		if project.LogRetentionDays <= 0 {
 			return fmt.Errorf("project %q log retention must be positive", project.ID)
 		}
+	}
+	return nil
+}
+
+func validateOneBotSelfID(value string) error {
+	if value == "auto" {
+		return nil
+	}
+	number, err := strconv.ParseUint(value, 10, 64)
+	if err != nil || strconv.FormatUint(number, 10) != value {
+		return fmt.Errorf("onebot self ID must be auto or a canonical unsigned decimal integer")
 	}
 	return nil
 }

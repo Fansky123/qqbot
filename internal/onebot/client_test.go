@@ -954,11 +954,353 @@ func TestClientCancellationWhileBacklogFullReturnsPromptly(t *testing.T) {
 	}
 }
 
+func TestClientAutoSelfIDDiscoversIdentityBeforeDispatch(t *testing.T) {
+	login := make(chan ActionRequest, 1)
+	server := newWebSocketServer(t, func(ctx context.Context, conn *websocket.Conn, _ *http.Request) {
+		var action ActionRequest
+		if wsjson.Read(ctx, conn, &action) != nil {
+			return
+		}
+		login <- action
+		if wsjson.Write(ctx, conn, loginInfoResponse(action.Echo, "3289886218")) != nil {
+			return
+		}
+		_ = wsjson.Write(ctx, conn, groupEventForSelf(1, "3289886218", []any{
+			map[string]any{"type": "at", "data": map[string]any{"qq": "3289886218"}},
+			map[string]any{"type": "text", "data": map[string]any{"text": "discovered"}},
+		}))
+		<-ctx.Done()
+	})
+	defer server.Close()
+
+	client := &Client{URL: webSocketURL(server.URL), Token: "token", SelfID: "auto", MessageRunes: 1200}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runErr := make(chan error, 1)
+	messages := make(chan GroupMessage, 1)
+	go func() {
+		runErr <- client.Run(ctx, func(_ context.Context, message GroupMessage) error {
+			messages <- message
+			return nil
+		})
+	}()
+
+	if got := receive(t, login); got.Action != "get_login_info" || got.Echo == "" {
+		t.Fatalf("login action = %#v", got)
+	}
+	message := receive(t, messages)
+	if message.SelfID != "3289886218" || message.Text != "discovered" || !message.Mentioned {
+		t.Fatalf("message = %#v", message)
+	}
+	if client.SelfID != "auto" {
+		t.Fatalf("Client.SelfID = %q, want auto", client.SelfID)
+	}
+
+	cancel()
+	if err := receive(t, runErr); err != nil {
+		t.Fatalf("Run returned %v", err)
+	}
+}
+
+func TestClientAutoSelfIDDiscardsEventsBeforeIdentity(t *testing.T) {
+	server := newWebSocketServer(t, func(ctx context.Context, conn *websocket.Conn, _ *http.Request) {
+		var action ActionRequest
+		if wsjson.Read(ctx, conn, &action) != nil {
+			return
+		}
+		if wsjson.Write(ctx, conn, groupEventForSelf(1, "42", nil)) != nil {
+			return
+		}
+		if wsjson.Write(ctx, conn, loginInfoResponse(action.Echo, "42")) != nil {
+			return
+		}
+		_ = wsjson.Write(ctx, conn, groupEventForSelf(2, "42", nil))
+		<-ctx.Done()
+	})
+	defer server.Close()
+
+	client := &Client{URL: webSocketURL(server.URL), Token: "token", SelfID: "auto", MessageRunes: 1200}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runErr := make(chan error, 1)
+	messages := make(chan GroupMessage, 1)
+	go func() {
+		runErr <- client.Run(ctx, func(_ context.Context, message GroupMessage) error {
+			messages <- message
+			return nil
+		})
+	}()
+
+	if message := receive(t, messages); message.MessageID != "2" {
+		t.Fatalf("message ID = %q, want 2", message.MessageID)
+	}
+	cancel()
+	if err := receive(t, runErr); err != nil {
+		t.Fatalf("Run returned %v", err)
+	}
+}
+
+func TestClientAutoSelfIDFiltersEventsAndMentions(t *testing.T) {
+	server := newWebSocketServer(t, func(ctx context.Context, conn *websocket.Conn, _ *http.Request) {
+		var action ActionRequest
+		if wsjson.Read(ctx, conn, &action) != nil {
+			return
+		}
+		if wsjson.Write(ctx, conn, loginInfoResponse(action.Echo, "42")) != nil {
+			return
+		}
+		for _, event := range []map[string]any{
+			groupEventForSelf(1, "43", nil),
+			groupEventForSelf(2, "42", []any{map[string]any{"type": "at", "data": map[string]any{"qq": "43"}}}),
+			groupEventForSelf(3, "42", []any{map[string]any{"type": "at", "data": map[string]any{"qq": "all"}}}),
+			groupEventForSelf(4, "42", []any{map[string]any{"type": "at", "data": map[string]any{"qq": "42"}}}),
+		} {
+			if wsjson.Write(ctx, conn, event) != nil {
+				return
+			}
+		}
+		<-ctx.Done()
+	})
+	defer server.Close()
+
+	client := &Client{URL: webSocketURL(server.URL), Token: "token", SelfID: "auto", MessageRunes: 1200}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runErr := make(chan error, 1)
+	messages := make(chan GroupMessage, 3)
+	go func() {
+		runErr <- client.Run(ctx, func(_ context.Context, message GroupMessage) error {
+			messages <- message
+			return nil
+		})
+	}()
+
+	for _, want := range []struct {
+		id        string
+		mentioned bool
+	}{
+		{id: "2"},
+		{id: "3"},
+		{id: "4", mentioned: true},
+	} {
+		message := receive(t, messages)
+		if string(message.MessageID) != want.id || message.Mentioned != want.mentioned {
+			t.Fatalf("message = %#v, want ID %q and mentioned %v", message, want.id, want.mentioned)
+		}
+	}
+	cancel()
+	if err := receive(t, runErr); err != nil {
+		t.Fatalf("Run returned %v", err)
+	}
+}
+
+func TestClientReconnectsWithNewSelfID(t *testing.T) {
+	var connections atomic.Int32
+	secondConnected := make(chan struct{}, 1)
+	server := newWebSocketServer(t, func(ctx context.Context, conn *websocket.Conn, _ *http.Request) {
+		connection := connections.Add(1)
+		var action ActionRequest
+		if wsjson.Read(ctx, conn, &action) != nil {
+			return
+		}
+		selfID := "100"
+		if connection == 2 {
+			selfID = "200"
+		}
+		if wsjson.Write(ctx, conn, loginInfoResponse(action.Echo, selfID)) != nil {
+			return
+		}
+		if connection == 1 {
+			return
+		}
+		secondConnected <- struct{}{}
+		if wsjson.Write(ctx, conn, groupEventForSelf(1, "100", nil)) != nil {
+			return
+		}
+		_ = wsjson.Write(ctx, conn, groupEventForSelf(2, "200", nil))
+		<-ctx.Done()
+	})
+	defer server.Close()
+
+	client := &Client{URL: webSocketURL(server.URL), Token: "token", SelfID: "auto", MessageRunes: 1200}
+	delays := make(chan time.Duration, 1)
+	client.sleep = func(_ context.Context, delay time.Duration) error {
+		delays <- delay
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runErr := make(chan error, 1)
+	messages := make(chan GroupMessage, 1)
+	go func() {
+		runErr <- client.Run(ctx, func(_ context.Context, message GroupMessage) error {
+			messages <- message
+			return nil
+		})
+	}()
+
+	if got := receive(t, delays); got != time.Second {
+		t.Fatalf("reconnect delay = %s, want %s", got, time.Second)
+	}
+	receive(t, secondConnected)
+	if message := receive(t, messages); message.MessageID != "2" || message.SelfID != "200" {
+		t.Fatalf("message = %#v", message)
+	}
+	cancel()
+	if err := receive(t, runErr); err != nil {
+		t.Fatalf("Run returned %v", err)
+	}
+}
+
+func TestClientAutoSelfIDRetriesAfterLoginFailure(t *testing.T) {
+	for _, response := range []struct {
+		name  string
+		write func(context.Context, *websocket.Conn, string) error
+	}{
+		{
+			name: "failed response",
+			write: func(ctx context.Context, conn *websocket.Conn, echo string) error {
+				return wsjson.Write(ctx, conn, ActionResponse{Status: "failed", RetCode: 1, Echo: echo})
+			},
+		},
+		{
+			name: "malformed response",
+			write: func(ctx context.Context, conn *websocket.Conn, echo string) error {
+				return wsjson.Write(ctx, conn, map[string]any{"status": "ok", "echo": echo})
+			},
+		},
+	} {
+		t.Run(response.name, func(t *testing.T) {
+			var connections atomic.Int32
+			server := newWebSocketServer(t, func(ctx context.Context, conn *websocket.Conn, _ *http.Request) {
+				connection := connections.Add(1)
+				var action ActionRequest
+				if wsjson.Read(ctx, conn, &action) != nil {
+					return
+				}
+				if connection == 1 {
+					if wsjson.Write(ctx, conn, groupEventForSelf(1, "42", nil)) != nil {
+						return
+					}
+					_ = response.write(ctx, conn, action.Echo)
+					return
+				}
+				if wsjson.Write(ctx, conn, loginInfoResponse(action.Echo, "42")) != nil {
+					return
+				}
+				_ = wsjson.Write(ctx, conn, groupEventForSelf(2, "42", nil))
+				<-ctx.Done()
+			})
+			defer server.Close()
+
+			client := &Client{URL: webSocketURL(server.URL), Token: "token", SelfID: "auto", MessageRunes: 1200}
+			delays := make(chan time.Duration, 1)
+			client.sleep = func(_ context.Context, delay time.Duration) error {
+				delays <- delay
+				return nil
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			runErr := make(chan error, 1)
+			messages := make(chan GroupMessage, 1)
+			go func() {
+				runErr <- client.Run(ctx, func(_ context.Context, message GroupMessage) error {
+					messages <- message
+					return nil
+				})
+			}()
+
+			if got := receive(t, delays); got != time.Second {
+				t.Fatalf("reconnect delay = %s, want %s", got, time.Second)
+			}
+			if message := receive(t, messages); message.MessageID != "2" {
+				t.Fatalf("message ID = %q, want 2", message.MessageID)
+			}
+			cancel()
+			if err := receive(t, runErr); err != nil {
+				t.Fatalf("Run returned %v", err)
+			}
+		})
+	}
+}
+
+func TestClientFixedSelfIDDoesNotRequestLoginInfo(t *testing.T) {
+	actions := make(chan ActionRequest, 1)
+	server := newWebSocketServer(t, func(ctx context.Context, conn *websocket.Conn, _ *http.Request) {
+		if wsjson.Write(ctx, conn, groupEventForSelf(1, "4", nil)) != nil {
+			return
+		}
+		var action ActionRequest
+		if wsjson.Read(ctx, conn, &action) != nil {
+			return
+		}
+		actions <- action
+		_ = wsjson.Write(ctx, conn, ActionResponse{Status: "ok", RetCode: 0, Echo: action.Echo})
+		<-ctx.Done()
+	})
+	defer server.Close()
+
+	client := &Client{URL: webSocketURL(server.URL), Token: "token", SelfID: "4", MessageRunes: 1200}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runErr := make(chan error, 1)
+	messages := make(chan GroupMessage, 1)
+	go func() {
+		runErr <- client.Run(ctx, func(_ context.Context, message GroupMessage) error {
+			messages <- message
+			return nil
+		})
+	}()
+	receive(t, messages)
+	if err := client.Send(context.Background(), "2", "fixed"); err != nil {
+		t.Fatal(err)
+	}
+	if got := receive(t, actions); got.Action != "send_group_msg" {
+		t.Fatalf("first action = %q, want send_group_msg", got.Action)
+	}
+	cancel()
+	if err := receive(t, runErr); err != nil {
+		t.Fatalf("Run returned %v", err)
+	}
+}
+
+func TestClientValidateAutoSelfID(t *testing.T) {
+	client := &Client{URL: "ws://127.0.0.1:1", Token: "token", SelfID: "auto", MessageRunes: 1200}
+	cfg, err := client.validate(func(context.Context, GroupMessage) error { return nil })
+	if err != nil || cfg.selfID != "" || client.SelfID != "auto" {
+		t.Fatalf("validate() = %#v, %v; Client.SelfID = %q", cfg, err, client.SelfID)
+	}
+	for _, selfID := range []string{"", "+1", "-1", "abc", "18446744073709551616"} {
+		client.SelfID = selfID
+		if _, err := client.validate(func(context.Context, GroupMessage) error { return nil }); err == nil {
+			t.Fatalf("validate with self ID %q succeeded", selfID)
+		}
+	}
+}
+
 func groupEvent(messageID int) map[string]any {
 	return map[string]any{
 		"post_type": "message", "message_type": "group",
 		"message_id": messageID, "group_id": 2, "user_id": 3, "self_id": 4,
 		"message": []any{map[string]any{"type": "text", "data": map[string]any{"text": fmt.Sprintf("event-%d", messageID)}}},
+	}
+}
+
+func groupEventForSelf(messageID int, selfID string, message []any) map[string]any {
+	if message == nil {
+		message = []any{map[string]any{"type": "text", "data": map[string]any{"text": fmt.Sprintf("event-%d", messageID)}}}
+	}
+	return map[string]any{
+		"post_type": "message", "message_type": "group",
+		"message_id": messageID, "group_id": 2, "user_id": 3, "self_id": selfID,
+		"message": message,
+	}
+}
+
+func loginInfoResponse(echo, selfID string) ActionResponse {
+	return ActionResponse{
+		Status: "ok", RetCode: 0, Echo: echo,
+		Data: json.RawMessage(fmt.Sprintf(`{"user_id":%q,"nickname":"bot"}`, selfID)),
 	}
 }
 

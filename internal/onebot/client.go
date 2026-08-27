@@ -183,7 +183,7 @@ func (c *Client) validate(handler Handler) (clientConfig, error) {
 	if err != nil || parsed.Host == "" || (parsed.Scheme != "ws" && parsed.Scheme != "wss") || parsed.User != nil {
 		return clientConfig{}, errors.New("onebot WebSocket URL is invalid")
 	}
-	selfID, err := normalizeID(c.SelfID)
+	selfID, err := resolveConfiguredSelfID(c.SelfID)
 	if err != nil {
 		return clientConfig{}, errors.New("onebot self ID is invalid")
 	}
@@ -191,6 +191,13 @@ func (c *Client) validate(handler Handler) (clientConfig, error) {
 		return clientConfig{}, errors.New("onebot message rune limit must be positive")
 	}
 	return clientConfig{url: c.URL, token: c.Token, selfID: selfID, messageRunes: c.MessageRunes}, nil
+}
+
+func resolveConfiguredSelfID(value string) (string, error) {
+	if value == "auto" {
+		return "", nil
+	}
+	return normalizeID(value)
 }
 
 func (c *Client) start() error {
@@ -223,6 +230,20 @@ func (c *Client) serve(ctx context.Context, cfg clientConfig, events chan<- Grou
 	}
 	conn.SetReadLimit(maxEventBytes)
 	connectedAt := c.currentTime()
+	resolvedSelfID := cfg.selfID
+	if resolvedSelfID == "" {
+		loginData, err := performAction(ctx, conn, LoginInfoAction)
+		if err != nil {
+			conn.CloseNow()
+			return connectedAt
+		}
+		selfID, _, err := decodeLoginInfo(loginData)
+		if err != nil {
+			conn.CloseNow()
+			return connectedAt
+		}
+		resolvedSelfID = string(selfID)
+	}
 	session := newClientSession(ctx, conn, cfg.messageRunes)
 
 	c.mu.Lock()
@@ -255,7 +276,7 @@ func (c *Client) serve(ctx context.Context, cfg clientConfig, events chan<- Grou
 		if session.handleResponse(raw) {
 			continue
 		}
-		message, accepted, err := DecodeGroupMessage(raw, cfg.selfID)
+		message, accepted, err := DecodeGroupMessage(raw, resolvedSelfID)
 		if err != nil || !accepted {
 			continue
 		}

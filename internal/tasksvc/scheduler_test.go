@@ -1577,7 +1577,7 @@ func newSchedulerFixture(t *testing.T, p1Concurrency int) *schedulerFixture {
 	t.Cleanup(func() { _ = db.Close() })
 	cfg := config.Config{
 		MessageWorkers: 1,
-		OneBot:         config.OneBotConfig{URL: "ws://127.0.0.1", AccessTokenEnv: "NAPCAT_ACCESS_TOKEN", SelfID: "bot", MessageRunes: 1200},
+		OneBot:         config.OneBotConfig{URL: "ws://127.0.0.1", AccessTokenEnv: "NAPCAT_ACCESS_TOKEN", SelfID: "10000", MessageRunes: 1200},
 		DatabasePath:   dbPath,
 		LogDir:         filepath.Join(root, "logs"),
 		WorktreeRoot:   filepath.Join(root, "worktrees"),
