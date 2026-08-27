@@ -1224,6 +1224,147 @@ func TestClientAutoSelfIDRetriesAfterLoginFailure(t *testing.T) {
 	}
 }
 
+func TestClientAutoSelfIDTimeoutRetriesWithoutDispatch(t *testing.T) {
+	var connections atomic.Int32
+	actions := make(chan ActionRequest, 2)
+	server := newWebSocketServer(t, func(ctx context.Context, conn *websocket.Conn, _ *http.Request) {
+		connections.Add(1)
+		var action ActionRequest
+		if wsjson.Read(ctx, conn, &action) != nil {
+			return
+		}
+		actions <- action
+		_ = wsjson.Write(ctx, conn, groupEventForSelf(1, "42", nil))
+		var ignored json.RawMessage
+		_ = wsjson.Read(ctx, conn, &ignored)
+	})
+	defer server.Close()
+
+	client := &Client{URL: webSocketURL(server.URL), Token: "token", SelfID: "auto", MessageRunes: 1200}
+	client.identifyTimeout = 20 * time.Millisecond
+	delays := make(chan time.Duration, 2)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client.sleep = func(ctx context.Context, delay time.Duration) error {
+		delays <- delay
+		if len(delays) == 2 {
+			cancel()
+			return ctx.Err()
+		}
+		return nil
+	}
+	runErr := make(chan error, 1)
+	messages := make(chan GroupMessage, 1)
+	go func() {
+		runErr <- client.Run(ctx, func(_ context.Context, message GroupMessage) error {
+			messages <- message
+			return nil
+		})
+	}()
+
+	for range 2 {
+		if action := receive(t, actions); action.Action != "get_login_info" {
+			t.Fatalf("action = %q, want get_login_info", action.Action)
+		}
+	}
+	if got := receive(t, delays); got != time.Second {
+		t.Fatalf("first reconnect delay = %s, want %s", got, time.Second)
+	}
+	if got := receive(t, delays); got != 2*time.Second {
+		t.Fatalf("second reconnect delay = %s, want %s", got, 2*time.Second)
+	}
+	if got := connections.Load(); got < 2 {
+		t.Fatalf("connections = %d, want at least 2", got)
+	}
+	if err := receive(t, runErr); err != nil {
+		t.Fatalf("Run returned %v", err)
+	}
+	select {
+	case message := <-messages:
+		t.Fatalf("unexpected message: %#v", message)
+	default:
+	}
+}
+
+func TestClientIdentityFailureDoesNotResetBackoff(t *testing.T) {
+	server := newWebSocketServer(t, func(ctx context.Context, conn *websocket.Conn, _ *http.Request) {
+		var action ActionRequest
+		if wsjson.Read(ctx, conn, &action) != nil {
+			return
+		}
+		_ = wsjson.Write(ctx, conn, ActionResponse{Status: "failed", RetCode: 1, Echo: action.Echo})
+	})
+	defer server.Close()
+
+	client := &Client{URL: webSocketURL(server.URL), Token: "token", SelfID: "auto", MessageRunes: 1200}
+	var nowCalls atomic.Int32
+	client.now = func() time.Time {
+		return time.Unix(int64(nowCalls.Add(1))*31, 0)
+	}
+	delays := make(chan time.Duration, 2)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client.sleep = func(ctx context.Context, delay time.Duration) error {
+		delays <- delay
+		if len(delays) == 2 {
+			cancel()
+			return ctx.Err()
+		}
+		return nil
+	}
+	runErr := make(chan error, 1)
+	go func() { runErr <- client.Run(ctx, func(context.Context, GroupMessage) error { return nil }) }()
+
+	if got := receive(t, delays); got != time.Second {
+		t.Fatalf("first reconnect delay = %s, want %s", got, time.Second)
+	}
+	if got := receive(t, delays); got != 2*time.Second {
+		t.Fatalf("second reconnect delay = %s, want %s", got, 2*time.Second)
+	}
+	if got := nowCalls.Load(); got != 0 {
+		t.Fatalf("clock calls after failed identification = %d, want 0", got)
+	}
+	if err := receive(t, runErr); err != nil {
+		t.Fatalf("Run returned %v", err)
+	}
+}
+
+func TestClientIdentityHealthBeginsAfterSuccessfulDiscovery(t *testing.T) {
+	login := make(chan ActionRequest, 1)
+	respond := make(chan struct{})
+	server := newWebSocketServer(t, func(ctx context.Context, conn *websocket.Conn, _ *http.Request) {
+		var action ActionRequest
+		if wsjson.Read(ctx, conn, &action) != nil {
+			return
+		}
+		login <- action
+		select {
+		case <-respond:
+		case <-ctx.Done():
+			return
+		}
+		_ = wsjson.Write(ctx, conn, loginInfoResponse(action.Echo, "42"))
+	})
+	defer server.Close()
+
+	var clock atomic.Int64
+	client := &Client{URL: webSocketURL(server.URL), Token: "token", SelfID: "auto", MessageRunes: 1200}
+	client.now = func() time.Time { return time.Unix(clock.Load(), 0) }
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	served := make(chan time.Time, 1)
+	go func() {
+		served <- client.serve(ctx, clientConfig{url: client.URL, token: client.Token, messageRunes: client.MessageRunes}, make(chan GroupMessage))
+	}()
+
+	receive(t, login)
+	clock.Store(10)
+	close(respond)
+	if got, want := receive(t, served), time.Unix(10, 0); !got.Equal(want) {
+		t.Fatalf("connectedAt = %s, want %s", got, want)
+	}
+}
+
 func TestClientFixedSelfIDDoesNotRequestLoginInfo(t *testing.T) {
 	actions := make(chan ActionRequest, 1)
 	server := newWebSocketServer(t, func(ctx context.Context, conn *websocket.Conn, _ *http.Request) {

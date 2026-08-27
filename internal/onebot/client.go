@@ -18,9 +18,10 @@ import (
 )
 
 const (
-	maxEventBytes       = 1 << 20
-	eventQueueSize      = 64
-	defaultHealthyAfter = 30 * time.Second
+	maxEventBytes          = 1 << 20
+	eventQueueSize         = 64
+	defaultHealthyAfter    = 30 * time.Second
+	defaultIdentifyTimeout = 10 * time.Second
 )
 
 var (
@@ -43,9 +44,10 @@ type Client struct {
 	running bool
 	active  *clientSession
 
-	sleep        func(context.Context, time.Duration) error
-	now          func() time.Time
-	healthyAfter time.Duration
+	sleep           func(context.Context, time.Duration) error
+	now             func() time.Time
+	healthyAfter    time.Duration
+	identifyTimeout time.Duration
 }
 
 type clientConfig struct {
@@ -229,21 +231,26 @@ func (c *Client) serve(ctx context.Context, cfg clientConfig, events chan<- Grou
 		return time.Time{}
 	}
 	conn.SetReadLimit(maxEventBytes)
-	connectedAt := c.currentTime()
 	resolvedSelfID := cfg.selfID
 	if resolvedSelfID == "" {
-		loginData, err := performAction(ctx, conn, LoginInfoAction)
-		if err != nil {
-			conn.CloseNow()
-			return connectedAt
+		identifyTimeout := c.identifyTimeout
+		if identifyTimeout <= 0 {
+			identifyTimeout = defaultIdentifyTimeout
 		}
-		selfID, _, err := decodeLoginInfo(loginData)
+		identifyCtx, cancel := context.WithTimeout(ctx, identifyTimeout)
+		loginData, err := performAction(identifyCtx, conn, LoginInfoAction)
+		var selfID ID
+		if err == nil {
+			selfID, _, err = decodeLoginInfo(loginData)
+		}
+		cancel()
 		if err != nil {
-			conn.CloseNow()
-			return connectedAt
+			_ = conn.CloseNow()
+			return time.Time{}
 		}
 		resolvedSelfID = string(selfID)
 	}
+	connectedAt := c.currentTime()
 	session := newClientSession(ctx, conn, cfg.messageRunes)
 
 	c.mu.Lock()
