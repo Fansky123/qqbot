@@ -1,0 +1,664 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+USAGE='usage: qqcodex-local {start|switch-account|status|stop}'
+
+PROJECT_ROOT=${QQCODEX_LOCAL_PROJECT_ROOT:-/home/fanfan007/文档/go/qqbot}
+NAPCAT_ROOT=${QQCODEX_LOCAL_NAPCAT_ROOT:-/home/fanfan007/.local/share/napcat}
+WORKER_ROOT=${QQCODEX_LOCAL_WORKER_ROOT:-/home/fanfan007/.local/share/qqcodex-worker}
+CONFIG=${QQCODEX_LOCAL_CONFIG:-$PROJECT_ROOT/configs/qqcodex.local.json}
+PROBE=${QQCODEX_LOCAL_PROBE:-$PROJECT_ROOT/bin/qqcodex-probe}
+NAPCAT_LAUNCHER=${QQCODEX_LOCAL_NAPCAT_LAUNCHER:-$NAPCAT_ROOT/start-napcat.sh}
+WORKER_LAUNCHER=${QQCODEX_LOCAL_WORKER_LAUNCHER:-$WORKER_ROOT/start-worker.sh}
+TOKEN_FILE=${QQCODEX_LOCAL_TOKEN_FILE:-${QQCODEX_LOCAL_TOKEN:-$WORKER_ROOT/napcat-access-token}}
+WEBUI=${QQCODEX_LOCAL_WEBUI_CONFIG:-${QQCODEX_LOCAL_WEBUI:-$NAPCAT_ROOT/napcat/config/webui.json}}
+ACCOUNT_FILE=${QQCODEX_LOCAL_ACCOUNT_FILE:-${QQCODEX_LOCAL_ACCOUNT:-$NAPCAT_ROOT/bot-uin}}
+RUN_DIR=${QQCODEX_LOCAL_RUN_ROOT:-${QQCODEX_LOCAL_RUN_DIR:-$WORKER_ROOT/run}}
+QQ_EXECUTABLE=${QQCODEX_LOCAL_QQ_EXECUTABLE:-/opt/QQ/qq}
+WORKER_EXECUTABLE=${QQCODEX_LOCAL_WORKER_EXECUTABLE:-$PROJECT_ROOT/bin/qqcodex}
+ONEBOT_PORT=${QQCODEX_LOCAL_ONEBOT_PORT:-3001}
+LOGIN_TIMEOUT=${QQCODEX_LOCAL_LOGIN_TIMEOUT:-300}
+STATUS_TIMEOUT=${QQCODEX_LOCAL_STATUS_TIMEOUT:-3}
+PROCESS_TIMEOUT=${QQCODEX_LOCAL_PROCESS_TIMEOUT:-10}
+STOP_TIMEOUT=${QQCODEX_LOCAL_STOP_TIMEOUT:-10}
+PROBE_INTERVAL=${QQCODEX_LOCAL_PROBE_INTERVAL:-1}
+PROCESS_INTERVAL=${QQCODEX_LOCAL_PROCESS_INTERVAL:-0.1}
+SLEEP=${QQCODEX_LOCAL_SLEEP:-sleep}
+TIMEOUT=${QQCODEX_LOCAL_TIMEOUT:-timeout}
+PGREP=${QQCODEX_LOCAL_PGREP:-pgrep}
+PORT_CHECK=${QQCODEX_LOCAL_PORT_CHECK:-}
+PROC_ROOT=${QQCODEX_LOCAL_PROC_ROOT:-/proc}
+JQ=${QQCODEX_LOCAL_JQ:-jq}
+
+NAPCAT_PID_FILE=$RUN_DIR/napcat.pid
+WORKER_PID_FILE=$RUN_DIR/worker.pid
+NAPCAT_START_FILE=$RUN_DIR/napcat.start
+WORKER_START_FILE=$RUN_DIR/worker.start
+WEBUI_SNAPSHOT=$RUN_DIR/webui.snapshot
+ACCOUNT_SNAPSHOT=$RUN_DIR/account.snapshot
+
+PROBE_JSON=
+PROBE_SELF_ID=
+PROBE_NICKNAME_JSON=
+DISCOVERED_PIDS=
+ROLLBACK_ACTIVE=0
+ACCOUNT_WAS_PRESENT=0
+CLEANING_UP=0
+NEW_NAPCAT_PID=
+NEW_WORKER_PID=
+NEW_NAPCAT_START=
+NEW_WORKER_START=
+
+# A caller-provided value must never reach NapCat or Worker.
+unset NAPCAT_ACCESS_TOKEN
+
+usage() {
+  printf '%s\n' "$USAGE" >&2
+  exit 2
+}
+
+die() {
+  printf '%s\n' "$*" >&2
+  exit 1
+}
+
+command_available() {
+  if [[ $1 == */* ]]; then
+    [[ -x $1 ]]
+  else
+    command -v -- "$1" >/dev/null 2>&1
+  fi
+}
+
+require_readable() {
+  [[ -f $1 && -r $1 ]] || die "$2 is not a readable file: $1"
+}
+
+require_executable() {
+  [[ -f $1 && -x $1 ]] || die "$2 is not executable: $1"
+}
+
+is_nonnegative_integer() {
+  [[ $1 =~ ^[0-9]+$ ]]
+}
+
+is_positive_pid() {
+  [[ $1 =~ ^[1-9][0-9]*$ ]]
+}
+
+is_canonical_account() {
+  [[ $1 =~ ^[1-9][0-9]*$ ]]
+}
+
+read_positive_decimal_file() {
+  local file=$1 value= extra= fd
+  exec {fd}<"$file" || return 1
+  if ! IFS= read -r value <&"$fd"; then
+    exec {fd}<&-
+    return 1
+  fi
+  if IFS= read -r extra <&"$fd" || [[ -n $extra ]]; then
+    exec {fd}<&-
+    return 1
+  fi
+  exec {fd}<&-
+  is_positive_pid "$value" || return 1
+  printf '%s\n' "$value"
+}
+
+ensure_run_dir() {
+  mkdir -p -- "$RUN_DIR"
+  [[ -d $RUN_DIR && ! -L $RUN_DIR ]] || die "run path is not a directory: $RUN_DIR"
+  chmod 0700 -- "$RUN_DIR"
+}
+
+validate_webui() {
+  require_readable "$WEBUI" 'NapCat WebUI configuration'
+  [[ ! -L $WEBUI ]] || die 'NapCat WebUI configuration must not be a symbolic link'
+  "$JQ" -e 'type == "object"' "$WEBUI" >/dev/null 2>&1 || \
+    die "NapCat WebUI configuration must be a JSON object"
+}
+
+preflight_files() {
+  command_available "$JQ" || die "jq is required"
+  command_available "$SLEEP" || die "sleep command is unavailable: $SLEEP"
+  command_available "$TIMEOUT" || die "timeout command is unavailable: $TIMEOUT"
+  command_available "$PGREP" || die "process discovery command is unavailable: $PGREP"
+  if [[ -n $PORT_CHECK ]]; then
+    command_available "$PORT_CHECK" || die "port discovery command is unavailable: $PORT_CHECK"
+  fi
+  is_nonnegative_integer "$LOGIN_TIMEOUT" || die 'login timeout must be a non-negative integer'
+  is_nonnegative_integer "$STATUS_TIMEOUT" || die 'status timeout must be a non-negative integer'
+  is_nonnegative_integer "$PROCESS_TIMEOUT" || die 'process timeout must be a non-negative integer'
+  is_nonnegative_integer "$STOP_TIMEOUT" || die 'stop timeout must be a non-negative integer'
+  [[ $ONEBOT_PORT =~ ^[1-9][0-9]*$ ]] && (( ONEBOT_PORT <= 65535 )) || \
+    die 'OneBot port must be between 1 and 65535'
+  ensure_run_dir
+  require_readable "$CONFIG" 'Worker configuration'
+  require_executable "$PROBE" 'OneBot probe'
+  require_executable "$NAPCAT_LAUNCHER" 'NapCat launcher'
+  require_executable "$WORKER_LAUNCHER" 'Worker launcher'
+  require_readable "$TOKEN_FILE" 'NapCat access token'
+  [[ -s $TOKEN_FILE ]] || die 'NapCat access token is empty'
+  require_executable "$QQ_EXECUTABLE" 'expected QQ executable'
+  require_executable "$WORKER_EXECUTABLE" 'expected Worker executable'
+  validate_webui
+}
+
+resolved_path() {
+  readlink -f -- "$1" 2>/dev/null
+}
+
+pid_matches_executable() {
+  local pid=$1 expected=$2 actual expected_resolved
+  is_positive_pid "$pid" || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  actual=$(resolved_path "$PROC_ROOT/$pid/exe") || return 1
+  expected_resolved=$(resolved_path "$expected") || return 1
+  [[ $actual == "$expected_resolved" ]]
+}
+
+process_start_time() {
+  local pid=$1 stat_line fields
+  is_positive_pid "$pid" || return 1
+  stat_line=$(<"$PROC_ROOT/$pid/stat") || return 1
+  fields=${stat_line##*) }
+  # shellcheck disable=SC2086
+  set -- $fields
+  is_positive_pid "${20-}" || return 1
+  printf '%s\n' "${20}"
+}
+
+pid_matches_identity() {
+  local pid=$1 expected=$2 recorded_start=$3 current_start
+  pid_matches_executable "$pid" "$expected" || return 1
+  current_start=$(process_start_time "$pid") || return 1
+  [[ $current_start == "$recorded_start" ]]
+}
+
+verified_pid_file() {
+  local pid_file=$1 start_file=$2 expected=$3 label=$4 pid= recorded_start=
+  [[ -e $pid_file ]] || return 1
+  if [[ ! -f $pid_file || -L $pid_file || ! -f $start_file || -L $start_file ]] || \
+    ! pid=$(read_positive_decimal_file "$pid_file") || \
+    ! recorded_start=$(read_positive_decimal_file "$start_file"); then
+    printf '%s PID file mismatch (unreadable); removed\n' "$label" >&2
+    rm -f -- "$pid_file" "$start_file"
+    return 2
+  fi
+  if ! kill -0 "$pid" 2>/dev/null; then
+    printf '%s PID file mismatch (stale PID); removed\n' "$label" >&2
+    rm -f -- "$pid_file" "$start_file"
+    return 2
+  fi
+  if ! pid_matches_identity "$pid" "$expected" "$recorded_start"; then
+    printf '%s PID identity mismatch; PID file removed without signalling process %s\n' \
+      "$label" "$pid" >&2
+    rm -f -- "$pid_file" "$start_file"
+    return 2
+  fi
+  printf '%s\n' "$pid"
+}
+
+atomic_write_text() {
+  local target=$1 mode=$2 text=$3 dir base temp
+  dir=$(dirname -- "$target")
+  base=$(basename -- "$target")
+  [[ -d $dir ]] || return 1
+  temp=$(mktemp "$dir/.$base.XXXXXX") || return 1
+  if ! printf '%s' "$text" >"$temp" || ! chmod "$mode" "$temp" || ! mv -f -- "$temp" "$target"; then
+    rm -f -- "$temp"
+    return 1
+  fi
+}
+
+atomic_write_account() {
+  local account=$1
+  is_canonical_account "$account" || return 1
+  atomic_write_text "$ACCOUNT_FILE" 0600 "$account"$'\n'
+}
+
+atomic_write_pid() {
+  local pid_file=$1 pid=$2
+  is_positive_pid "$pid" || return 1
+  atomic_write_text "$pid_file" 0600 "$pid"$'\n'
+}
+
+atomic_write_managed_pid() {
+  local pid_file=$1 start_file=$2 pid=$3 start=$4
+  atomic_write_text "$start_file" 0600 "$start"$'\n' || return 1
+  if ! atomic_write_pid "$pid_file" "$pid"; then
+    rm -f -- "$start_file"
+    return 1
+  fi
+}
+
+atomic_copy() {
+  local source=$1 target=$2 mode=$3 dir base temp
+  dir=$(dirname -- "$target")
+  base=$(basename -- "$target")
+  [[ -d $dir && -f $source ]] || return 1
+  temp=$(mktemp "$dir/.$base.XXXXXX") || return 1
+  if ! cp -- "$source" "$temp" || ! chmod "$mode" "$temp" || ! mv -f -- "$temp" "$target"; then
+    rm -f -- "$temp"
+    return 1
+  fi
+}
+
+atomic_update_webui() {
+  local account=$1 dir base temp
+  "$JQ" -e 'type == "object"' "$WEBUI" >/dev/null 2>&1 || return 1
+  dir=$(dirname -- "$WEBUI")
+  base=$(basename -- "$WEBUI")
+  temp=$(mktemp "$dir/.$base.XXXXXX") || return 1
+  if ! "$JQ" --arg account "$account" '.autoLoginAccount = $account' "$WEBUI" >"$temp" || \
+    ! "$JQ" -e 'type == "object"' "$temp" >/dev/null 2>&1 || \
+    ! chmod 0600 "$temp" || ! mv -f -- "$temp" "$WEBUI"; then
+    rm -f -- "$temp"
+    return 1
+  fi
+}
+
+wait_for_identity() {
+  local pid=$1 expected=$2 deadline
+  deadline=$((SECONDS + PROCESS_TIMEOUT))
+  while true; do
+    pid_matches_executable "$pid" "$expected" && return 0
+    kill -0 "$pid" 2>/dev/null || return 1
+    (( SECONDS < deadline )) || return 1
+    "$SLEEP" "$PROCESS_INTERVAL"
+  done
+}
+
+terminate_pid_file() {
+  local pid_file=$1 start_file=$2 expected=$3 label=$4 pid recorded_start
+  if ! pid=$(verified_pid_file "$pid_file" "$start_file" "$expected" "$label"); then
+    return 0
+  fi
+  recorded_start=$(read_positive_decimal_file "$start_file") || return 0
+  if ! pid_matches_identity "$pid" "$expected" "$recorded_start"; then
+    printf '%s PID identity mismatch before signal; PID file removed\n' "$label" >&2
+    rm -f -- "$pid_file" "$start_file"
+    return 0
+  fi
+  terminate_tracked_pid "$pid" "$expected" "$recorded_start" "$label" || return 1
+  rm -f -- "$pid_file" "$start_file"
+}
+
+terminate_tracked_pid() {
+  local pid=$1 expected=$2 recorded_start=$3 label=$4 deadline
+  is_positive_pid "$pid" || return 0
+  is_positive_pid "$recorded_start" || return 0
+  pid_matches_identity "$pid" "$expected" "$recorded_start" || return 0
+  kill -TERM "$pid" 2>/dev/null || true
+  deadline=$((SECONDS + STOP_TIMEOUT))
+  while pid_matches_identity "$pid" "$expected" "$recorded_start"; do
+    (( SECONDS < deadline )) || break
+    "$SLEEP" "$PROCESS_INTERVAL"
+  done
+  if pid_matches_identity "$pid" "$expected" "$recorded_start"; then
+    printf '%s did not stop after TERM (PID %s)\n' "$label" "$pid" >&2
+    return 1
+  fi
+  if ! kill -0 "$pid" 2>/dev/null; then
+    wait "$pid" 2>/dev/null || true
+  fi
+}
+
+remove_pid_file_for() {
+  local pid_file=$1 start_file=$2 pid=$3 start=$4 recorded= recorded_start=
+  [[ -f $pid_file && ! -L $pid_file ]] || return 0
+  recorded=$(read_positive_decimal_file "$pid_file") || return 0
+  recorded_start=$(read_positive_decimal_file "$start_file") || return 0
+  if [[ $recorded == "$pid" && $recorded_start == "$start" ]]; then
+    rm -f -- "$pid_file" "$start_file"
+  fi
+  return 0
+}
+
+stop_managed_processes() {
+  terminate_pid_file "$WORKER_PID_FILE" "$WORKER_START_FILE" "$WORKER_EXECUTABLE" 'Worker'
+  terminate_pid_file "$NAPCAT_PID_FILE" "$NAPCAT_START_FILE" "$QQ_EXECUTABLE" 'NapCat'
+}
+
+discover_unmanaged() {
+  local expected=$1 excluded_pid=${2:-} output status pid found=()
+  set +e
+  output=$("$PGREP" -x -- "$(basename -- "$expected")" 2>/dev/null)
+  status=$?
+  set -e
+  if (( status == 1 )); then
+    DISCOVERED_PIDS=
+    return 1
+  fi
+  (( status == 0 )) || return 2
+  while IFS= read -r pid; do
+    is_positive_pid "$pid" || continue
+    [[ -n $excluded_pid && $pid == "$excluded_pid" ]] && continue
+    kill -0 "$pid" 2>/dev/null || continue
+    found+=("$pid")
+  done <<<"$output"
+  DISCOVERED_PIDS=${found[*]}
+  [[ -n $DISCOVERED_PIDS ]]
+}
+
+port_is_listening() {
+  if [[ -n $PORT_CHECK ]]; then
+    "$PORT_CHECK" "$ONEBOT_PORT"
+  elif command -v ss >/dev/null 2>&1; then
+    [[ -n $(ss -H -ltn "sport = :$ONEBOT_PORT" 2>/dev/null) ]]
+  else
+    (exec 3<>"/dev/tcp/127.0.0.1/$ONEBOT_PORT") 2>/dev/null
+  fi
+}
+
+refuse_managed_processes() {
+  local pid
+  if pid=$(verified_pid_file "$NAPCAT_PID_FILE" "$NAPCAT_START_FILE" "$QQ_EXECUTABLE" 'NapCat'); then
+    die "managed NapCat is already running (PID $pid)"
+  fi
+  if pid=$(verified_pid_file "$WORKER_PID_FILE" "$WORKER_START_FILE" "$WORKER_EXECUTABLE" 'Worker'); then
+    die "managed Worker is already running (PID $pid)"
+  fi
+}
+
+refuse_unmanaged_conflicts() {
+  local status
+  if discover_unmanaged "$QQ_EXECUTABLE"; then
+    die "unmanaged QQ process detected (PID $DISCOVERED_PIDS)"
+  else
+    status=$?
+    (( status == 1 )) || die 'QQ process discovery failed'
+  fi
+  if discover_unmanaged "$WORKER_EXECUTABLE"; then
+    die "unmanaged Worker process detected (PID $DISCOVERED_PIDS)"
+  else
+    status=$?
+    (( status == 1 )) || die 'Worker process discovery failed'
+  fi
+  if port_is_listening; then
+    die "listener already exists on 127.0.0.1:$ONEBOT_PORT"
+  else
+    status=$?
+    (( status == 1 )) || die 'loopback port discovery failed'
+  fi
+}
+
+run_probe_once() {
+  local attempt_timeout=$1 token output status
+  token=$(<"$TOKEN_FILE")
+  [[ -n $token ]] || return 1
+  set +e
+  output=$(NAPCAT_ACCESS_TOKEN=$token "$TIMEOUT" --foreground "$attempt_timeout" \
+    "$PROBE" -config "$CONFIG" 2>/dev/null)
+  status=$?
+  set -e
+  unset NAPCAT_ACCESS_TOKEN
+  token=
+  (( status == 0 )) || return 1
+  "$JQ" -e '
+    type == "object" and
+    (.self_id | type == "string") and
+    (.nickname | type == "string") and
+    (.group_ids | type == "array" and all(.[]; type == "string")) and
+    (.missing_group_ids | type == "array" and all(.[]; type == "string"))
+  ' <<<"$output" >/dev/null 2>&1 || return 1
+  PROBE_JSON=$output
+}
+
+probe_until_online() {
+  local timeout=$1 deadline remaining attempt_timeout
+  deadline=$((SECONDS + timeout))
+  while true; do
+    remaining=$((deadline - SECONDS))
+    if (( remaining > 0 )); then
+      attempt_timeout=${remaining}s
+    else
+      attempt_timeout=0.1s
+    fi
+    if run_probe_once "$attempt_timeout"; then
+      return 0
+    fi
+    (( SECONDS < deadline )) || return 1
+    "$SLEEP" "$PROBE_INTERVAL"
+  done
+}
+
+load_probe_identity() {
+  PROBE_SELF_ID=$("$JQ" -r '.self_id' <<<"$PROBE_JSON")
+  is_canonical_account "$PROBE_SELF_ID" || return 1
+  PROBE_NICKNAME_JSON=$("$JQ" -c '.nickname' <<<"$PROBE_JSON")
+}
+
+require_all_groups() {
+  local missing found=0
+  while IFS= read -r missing; do
+    printf 'missing required group: %s\n' "$missing" >&2
+    found=1
+  done < <("$JQ" -r '.missing_group_ids[] | @json' <<<"$PROBE_JSON")
+  (( found == 0 ))
+}
+
+launch_napcat() {
+  "$NAPCAT_LAUNCHER" "$@" &
+  local pid=$! start
+  if ! wait_for_identity "$pid" "$QQ_EXECUTABLE"; then
+    die 'NapCat launcher did not transition to the expected QQ executable'
+  fi
+  start=$(process_start_time "$pid") || die 'failed to read NapCat process identity'
+  pid_matches_identity "$pid" "$QQ_EXECUTABLE" "$start" || \
+    die 'NapCat process identity changed before it could be recorded'
+  NEW_NAPCAT_PID=$pid
+  NEW_NAPCAT_START=$start
+  atomic_write_managed_pid "$NAPCAT_PID_FILE" "$NAPCAT_START_FILE" "$pid" "$start" || \
+    die 'failed to record NapCat PID'
+}
+
+launch_worker_foreground() {
+  "$WORKER_LAUNCHER" &
+  local pid=$! start status
+  if ! wait_for_identity "$pid" "$WORKER_EXECUTABLE"; then
+    die 'Worker launcher did not transition to the expected Worker executable'
+  fi
+  start=$(process_start_time "$pid") || die 'failed to read Worker process identity'
+  pid_matches_identity "$pid" "$WORKER_EXECUTABLE" "$start" || \
+    die 'Worker process identity changed before it could be recorded'
+  NEW_WORKER_PID=$pid
+  NEW_WORKER_START=$start
+  atomic_write_managed_pid "$WORKER_PID_FILE" "$WORKER_START_FILE" "$pid" "$start" || \
+    die 'failed to record Worker PID'
+  set +e
+  wait "$pid"
+  status=$?
+  set -e
+  return "$status"
+}
+
+snapshot_switch_state() {
+  cp -- "$WEBUI" "$WEBUI_SNAPSHOT"
+  chmod 0600 "$WEBUI_SNAPSHOT"
+  if [[ -e $ACCOUNT_FILE || -L $ACCOUNT_FILE ]]; then
+    [[ -f $ACCOUNT_FILE && ! -L $ACCOUNT_FILE && -r $ACCOUNT_FILE ]] || \
+      die 'saved account is not a readable regular file'
+    cp -- "$ACCOUNT_FILE" "$ACCOUNT_SNAPSHOT"
+    chmod 0600 "$ACCOUNT_SNAPSHOT"
+    ACCOUNT_WAS_PRESENT=1
+  else
+    rm -f -- "$ACCOUNT_SNAPSHOT"
+    ACCOUNT_WAS_PRESENT=0
+  fi
+  ROLLBACK_ACTIVE=1
+}
+
+rollback_switch_state() {
+  [[ $ROLLBACK_ACTIVE == 1 ]] || return 0
+  if [[ -f $WEBUI_SNAPSHOT ]]; then
+    atomic_copy "$WEBUI_SNAPSHOT" "$WEBUI" 0600 || \
+      printf '%s\n' 'failed to restore NapCat WebUI snapshot' >&2
+  fi
+  if [[ $ACCOUNT_WAS_PRESENT == 1 ]]; then
+    if [[ -f $ACCOUNT_SNAPSHOT ]]; then
+      atomic_copy "$ACCOUNT_SNAPSHOT" "$ACCOUNT_FILE" 0600 || \
+        printf '%s\n' 'failed to restore saved account snapshot' >&2
+    fi
+  else
+    rm -f -- "$ACCOUNT_FILE"
+  fi
+  rm -f -- "$WEBUI_SNAPSHOT" "$ACCOUNT_SNAPSHOT"
+  ROLLBACK_ACTIVE=0
+}
+
+commit_switch_state() {
+  ROLLBACK_ACTIVE=0
+  rm -f -- "$WEBUI_SNAPSHOT" "$ACCOUNT_SNAPSHOT"
+}
+
+cleanup() {
+  local status=$?
+  (( CLEANING_UP == 0 )) || return "$status"
+  CLEANING_UP=1
+  trap - EXIT INT TERM HUP
+  unset NAPCAT_ACCESS_TOKEN
+  set +e
+  if terminate_tracked_pid "$NEW_WORKER_PID" "$WORKER_EXECUTABLE" "$NEW_WORKER_START" 'Worker'; then
+    remove_pid_file_for "$WORKER_PID_FILE" "$WORKER_START_FILE" \
+      "$NEW_WORKER_PID" "$NEW_WORKER_START"
+  fi
+  if terminate_tracked_pid "$NEW_NAPCAT_PID" "$QQ_EXECUTABLE" "$NEW_NAPCAT_START" 'NapCat'; then
+    remove_pid_file_for "$NAPCAT_PID_FILE" "$NAPCAT_START_FILE" \
+      "$NEW_NAPCAT_PID" "$NEW_NAPCAT_START"
+  fi
+  rollback_switch_state
+  return "$status"
+}
+
+install_cleanup() {
+  trap cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+}
+
+read_saved_account() {
+  local saved
+  [[ -e $ACCOUNT_FILE ]] || return 1
+  [[ -f $ACCOUNT_FILE && ! -L $ACCOUNT_FILE && -r $ACCOUNT_FILE ]] || \
+    die 'saved account is not a readable regular file'
+  saved=$(read_positive_decimal_file "$ACCOUNT_FILE") || \
+    die 'saved account is not a canonical decimal ID'
+  printf '%s\n' "$saved"
+}
+
+start_command() {
+  local saved=
+  preflight_files
+  refuse_managed_processes
+  refuse_unmanaged_conflicts
+  install_cleanup
+  launch_napcat
+  probe_until_online "$LOGIN_TIMEOUT" || die 'OneBot probe timed out before login completed'
+  require_all_groups || die 'required QQ groups are unavailable'
+  load_probe_identity || die 'detected QQ account is not a canonical decimal ID'
+  if saved=$(read_saved_account); then
+    if [[ $saved != "$PROBE_SELF_ID" ]]; then
+      die "detected account $PROBE_SELF_ID differs from saved account $saved; use switch-account"
+    fi
+  else
+    snapshot_switch_state
+    atomic_write_account "$PROBE_SELF_ID" || die 'failed to save detected QQ account'
+    atomic_update_webui "$PROBE_SELF_ID" || die 'failed to update NapCat automatic login account'
+    commit_switch_state
+  fi
+  printf 'account %s, nickname %s\n' "$PROBE_SELF_ID" "$PROBE_NICKNAME_JSON"
+  launch_worker_foreground
+}
+
+switch_command() {
+  preflight_files
+  stop_managed_processes
+  refuse_unmanaged_conflicts
+  install_cleanup
+  snapshot_switch_state
+  atomic_update_webui '' || die 'failed to disable NapCat automatic login'
+  launch_napcat --scan
+  probe_until_online "$LOGIN_TIMEOUT" || die 'OneBot probe timed out before scanned login completed'
+  require_all_groups || die 'required QQ groups are unavailable'
+  load_probe_identity || die 'detected QQ account is not a canonical decimal ID'
+  atomic_write_account "$PROBE_SELF_ID" || die 'failed to save switched QQ account'
+  atomic_update_webui "$PROBE_SELF_ID" || die 'failed to commit NapCat automatic login account'
+  commit_switch_state
+  printf 'account %s, nickname %s\n' "$PROBE_SELF_ID" "$PROBE_NICKNAME_JSON"
+  launch_worker_foreground
+}
+
+status_command() {
+  local saved= napcat_pid= worker_pid= online_hint=0
+  if [[ -f $ACCOUNT_FILE && ! -L $ACCOUNT_FILE && -r $ACCOUNT_FILE ]]; then
+    if saved=$(read_positive_decimal_file "$ACCOUNT_FILE"); then
+      printf 'saved account: %s\n' "$saved"
+    else
+      printf '%s\n' 'saved account: invalid'
+    fi
+  else
+    printf '%s\n' 'saved account: none'
+  fi
+
+  if napcat_pid=$(verified_pid_file "$NAPCAT_PID_FILE" "$NAPCAT_START_FILE" "$QQ_EXECUTABLE" 'NapCat'); then
+    printf 'NapCat: running (PID %s)\n' "$napcat_pid"
+    online_hint=1
+  else
+    printf '%s\n' 'NapCat: stopped'
+  fi
+  if worker_pid=$(verified_pid_file "$WORKER_PID_FILE" "$WORKER_START_FILE" "$WORKER_EXECUTABLE" 'Worker'); then
+    printf 'Worker: running (PID %s)\n' "$worker_pid"
+  else
+    printf '%s\n' 'Worker: stopped'
+  fi
+
+  if command_available "$PGREP"; then
+    if discover_unmanaged "$QQ_EXECUTABLE" "$napcat_pid"; then
+      printf 'unmanaged QQ process: PID %s\n' "$DISCOVERED_PIDS"
+      online_hint=1
+    fi
+    if discover_unmanaged "$WORKER_EXECUTABLE" "$worker_pid"; then
+      printf 'unmanaged Worker process: PID %s\n' "$DISCOVERED_PIDS"
+    fi
+  fi
+  if port_is_listening; then
+    online_hint=1
+  fi
+
+  if (( online_hint == 1 )) && command_available "$JQ" && \
+    command_available "$TIMEOUT" && \
+    [[ -x $PROBE && -r $CONFIG && -r $TOKEN_FILE && -s $TOKEN_FILE ]]; then
+    if probe_until_online "$STATUS_TIMEOUT" && load_probe_identity; then
+      printf 'detected account: %s, nickname: %s\n' "$PROBE_SELF_ID" "$PROBE_NICKNAME_JSON"
+    else
+      printf '%s\n' 'OneBot: offline'
+    fi
+  else
+    printf '%s\n' 'OneBot: offline'
+  fi
+  unset NAPCAT_ACCESS_TOKEN
+  return 0
+}
+
+stop_command() {
+  ensure_run_dir
+  stop_managed_processes
+  return 0
+}
+
+main() {
+  (( $# == 1 )) || usage
+  case "$1" in
+    start) start_command ;;
+    switch-account) switch_command ;;
+    status) status_command ;;
+    stop) stop_command ;;
+    *) usage ;;
+  esac
+}
+
+main "$@"
