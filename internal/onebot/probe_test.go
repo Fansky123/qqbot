@@ -137,11 +137,22 @@ func TestProbeRejectsFailedAndMalformedMatchingResponses(t *testing.T) {
 	t.Parallel()
 
 	for _, test := range []struct {
-		name     string
-		response any
+		name       string
+		response   any
+		contains   []string
+		notContain string
 	}{
-		{name: "failed", response: ActionResponse{Status: "failed", RetCode: 1404, Wording: "invalid params"}},
-		{name: "malformed", response: map[string]any{"status": true, "retcode": 0}},
+		{
+			name:       "failed",
+			response:   ActionResponse{Status: "failed", RetCode: 1404, Message: "fallback message", Wording: "wording takes precedence"},
+			contains:   []string{"onebot action failed", `status="failed"`, "retcode=1404", "wording takes precedence"},
+			notContain: "fallback message",
+		},
+		{
+			name:     "malformed",
+			response: map[string]any{"status": true, "retcode": 0},
+			contains: []string{"malformed OneBot action response"},
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			server := newWebSocketServer(t, func(ctx context.Context, conn *websocket.Conn, _ *http.Request) {
@@ -159,8 +170,20 @@ func TestProbeRejectsFailedAndMalformedMatchingResponses(t *testing.T) {
 
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 			defer cancel()
-			if _, err := Probe(ctx, webSocketURL(server.URL), "token"); err == nil {
+			if _, err := Probe(ctx, webSocketURL(server.URL), "probe-secret"); err == nil {
 				t.Fatal("Probe accepted unsuccessful action response")
+			} else {
+				for _, want := range test.contains {
+					if !strings.Contains(err.Error(), want) {
+						t.Fatalf("Probe error = %q, want %q", err, want)
+					}
+				}
+				if test.notContain != "" && strings.Contains(err.Error(), test.notContain) {
+					t.Fatalf("Probe error did not prefer wording: %q", err)
+				}
+				if strings.Contains(err.Error(), "probe-secret") {
+					t.Fatalf("Probe error exposed token: %v", err)
+				}
 			}
 		})
 	}
@@ -188,16 +211,39 @@ func TestProbeIgnoresUnrelatedResponseEcho(t *testing.T) {
 func TestProbeRejectsOversizeResponse(t *testing.T) {
 	t.Parallel()
 
+	data, err := json.Marshal(map[string]any{
+		"user_id":  1,
+		"nickname": "Alice",
+		"padding":  strings.Repeat("x", maxEventBytes),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	server := newWebSocketServer(t, func(ctx context.Context, conn *websocket.Conn, _ *http.Request) {
-		_ = readProbeAction(t, ctx, conn, "get_login_info")
-		_ = wsjson.Write(ctx, conn, map[string]any{"padding": strings.Repeat("x", maxEventBytes)})
+		login := readProbeAction(t, ctx, conn, "get_login_info")
+		if err := wsjson.Write(ctx, conn, ActionResponse{Status: "ok", RetCode: 0, Data: data, Echo: login.Echo}); err != nil {
+			return
+		}
+		var groups ActionRequest
+		if err := wsjson.Read(ctx, conn, &groups); err != nil {
+			return
+		}
+		if groups.Action != "get_group_list" {
+			t.Errorf("action after oversized login response = %#v", groups)
+			return
+		}
+		_ = wsjson.Write(ctx, conn, ActionResponse{Status: "ok", RetCode: 0, Data: json.RawMessage(`[]`), Echo: groups.Echo})
 	})
 	defer server.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if _, err := Probe(ctx, webSocketURL(server.URL), "token"); err == nil {
+	if _, err := Probe(ctx, webSocketURL(server.URL), "probe-secret"); err == nil {
 		t.Fatal("Probe accepted an oversized response")
+	} else if !errors.Is(err, websocket.ErrMessageTooBig) {
+		t.Fatalf("Probe error = %v, want message-too-big error", err)
+	} else if strings.Contains(err.Error(), "probe-secret") {
+		t.Fatalf("Probe error exposed token: %v", err)
 	}
 }
 
