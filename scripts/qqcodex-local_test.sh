@@ -769,7 +769,7 @@ test_concurrent_mutation_is_refused() {
   pass 'concurrent start and switch transactions do not overlap'
 }
 
-test_snapshot_symlinks_are_replaced_safely() {
+test_existing_snapshot_symlinks_are_preserved_and_refused() {
   setup_fixture snapshot-symlinks
   printf '111111\n' >"$ACCOUNT"
   chmod 0600 "$ACCOUNT"
@@ -783,12 +783,45 @@ test_snapshot_symlinks_are_replaced_safely() {
 
   capture hostile-snapshots switch-account
   assert_eq 1 "$LAST_STATUS" 'hostile snapshot status'
+  assert_contains "$LAST_ERR" 'recovery snapshots already exist' 'hostile snapshot refusal report'
   assert_eq 'webui sentinel' "$(<"$webui_external")" 'WebUI snapshot external target'
   assert_eq 'account sentinel' "$(<"$account_external")" 'account snapshot external target'
-  [[ ! -L $RUN_DIR/webui.snapshot ]] || fail 'WebUI snapshot symlink survived'
-  [[ ! -L $RUN_DIR/account.snapshot ]] || fail 'account snapshot symlink survived'
+  [[ -L $RUN_DIR/webui.snapshot ]] || fail 'WebUI recovery snapshot symlink was removed'
+  [[ -L $RUN_DIR/account.snapshot ]] || fail 'account recovery snapshot symlink was removed'
+  assert_file_absent "$NAPCAT_ARGS" 'NapCat with pre-existing snapshot symlinks'
   assert_no_secret_output
-  pass 'hostile snapshot symlinks cannot redirect transaction state'
+  pass 'pre-existing snapshot symlinks are preserved and refused safely'
+}
+
+test_existing_recovery_snapshots_block_new_switch() {
+  setup_fixture retained-recovery-state
+  printf '111111\n' >"$ACCOUNT"
+  chmod 0600 "$ACCOUNT"
+  cp "$WEBUI" "$FIXTURE/webui.before"
+  cp "$ACCOUNT" "$FIXTURE/account.before"
+  printf '%s\n' '{"autoLoginAccount":"999999","recovery":"keep"}' >"$RUN_DIR/webui.snapshot"
+  printf '999999\n' >"$RUN_DIR/account.snapshot"
+  chmod 0600 "$RUN_DIR/webui.snapshot" "$RUN_DIR/account.snapshot"
+  cp "$RUN_DIR/webui.snapshot" "$FIXTURE/webui.snapshot.before"
+  cp "$RUN_DIR/account.snapshot" "$FIXTURE/account.snapshot.before"
+
+  capture retained-recovery switch-account
+  assert_eq 1 "$LAST_STATUS" 'retained recovery switch status'
+  assert_contains "$LAST_ERR" 'recovery snapshots already exist' 'retained recovery refusal report'
+  assert_contains "$LAST_ERR" 'recover or remove' 'retained recovery instruction'
+  cmp -s "$FIXTURE/webui.before" "$WEBUI" || fail 'retained recovery attempt changed WebUI'
+  cmp -s "$FIXTURE/account.before" "$ACCOUNT" || fail 'retained recovery attempt changed account'
+  cmp -s "$FIXTURE/webui.snapshot.before" "$RUN_DIR/webui.snapshot" || \
+    fail 'retained WebUI recovery snapshot changed'
+  cmp -s "$FIXTURE/account.snapshot.before" "$RUN_DIR/account.snapshot" || \
+    fail 'retained account recovery snapshot changed'
+  assert_eq 600 "$(stat -c '%a' "$RUN_DIR/webui.snapshot")" 'retained WebUI snapshot mode'
+  assert_eq 600 "$(stat -c '%a' "$RUN_DIR/account.snapshot")" 'retained account snapshot mode'
+  assert_file_absent "$NAPCAT_ARGS" 'NapCat with retained recovery state'
+  unlink "$RUN_DIR/webui.snapshot"
+  unlink "$RUN_DIR/account.snapshot"
+  assert_no_secret_output
+  pass 'retained recovery snapshots block a new switch without state mutation'
 }
 
 test_lock_file_is_private_and_not_followed() {
@@ -1209,6 +1242,39 @@ test_stop_timeout_keeps_managed_pid() {
   pass 'TERM-resistant managed processes keep their PID file without escalation'
 }
 
+test_stop_attempts_napcat_after_worker_timeout() {
+  setup_fixture stop-partial-timeout
+  cp /bin/bash "$WORKER_EXEC"
+  chmod 0700 "$WORKER_EXEC"
+  worker_ready=$FIXTURE/stubborn-worker.ready
+  STUBBORN_READY=$worker_ready "$WORKER_EXEC" -c \
+    'trap "" TERM; trap "exit 0" HUP; printf x >"$STUBBORN_READY"; while :; do /bin/sleep 1; done' &
+  stubborn_worker=$!
+  track_pid "$stubborn_worker"
+  wait_for_file "$worker_ready"
+  "$QQ_EXEC" 60 &
+  cooperative_napcat=$!
+  track_pid "$cooperative_napcat"
+  write_managed_identity "$stubborn_worker" "$RUN_DIR/worker.pid" "$WORKER_START"
+  write_managed_identity "$cooperative_napcat" "$RUN_DIR/napcat.pid" "$NAPCAT_START"
+  export QQCODEX_LOCAL_STOP_TIMEOUT=1
+
+  capture partial-stop stop
+  assert_eq 1 "$LAST_STATUS" 'partial stop status'
+  kill -0 "$stubborn_worker" 2>/dev/null || fail 'stop escalated against resistant Worker'
+  assert_eq "$stubborn_worker" "$(<"$RUN_DIR/worker.pid")" 'resistant Worker PID retention'
+  wait_for_dead "$cooperative_napcat"
+  assert_file_absent "$RUN_DIR/napcat.pid" 'cooperative NapCat PID cleanup after Worker timeout'
+  assert_file_absent "$NAPCAT_START" 'cooperative NapCat identity cleanup after Worker timeout'
+  assert_contains "$LAST_ERR" 'Worker did not stop after TERM' 'resistant Worker report'
+
+  kill -HUP "$stubborn_worker"
+  wait "$stubborn_worker" 2>/dev/null || true
+  rm -f -- "$RUN_DIR/worker.pid" "$WORKER_START"
+  assert_no_secret_output
+  pass 'stop attempts cooperative NapCat after a resistant Worker times out'
+}
+
 assert_conflict() {
   local case_name=$1 kind=$2 message=$3
   setup_fixture "$case_name"
@@ -1361,7 +1427,8 @@ test_switch_rollbacks
 test_failed_restore_retains_private_snapshots
 test_switch_cancel_rollback
 test_concurrent_mutation_is_refused
-test_snapshot_symlinks_are_replaced_safely
+test_existing_snapshot_symlinks_are_preserved_and_refused
+test_existing_recovery_snapshots_block_new_switch
 test_lock_file_is_private_and_not_followed
 test_probe_cancellation_is_prompt_and_transactional
 test_status_probe_cancellation_is_prompt_and_probe_only
@@ -1375,6 +1442,7 @@ test_failed_launcher_transition_cleans_owned_child
 test_symlinked_state_is_refused
 test_stop_process_identity
 test_stop_timeout_keeps_managed_pid
+test_stop_attempts_napcat_after_worker_timeout
 test_unmanaged_conflicts
 test_discovery_errors_fail_closed
 test_default_ss_errors_fail_closed

@@ -500,8 +500,12 @@ remove_pid_file_for() {
 }
 
 stop_managed_processes() {
-  terminate_pid_file "$WORKER_PID_FILE" "$WORKER_START_FILE" "$WORKER_EXECUTABLE" 'Worker'
-  terminate_pid_file "$NAPCAT_PID_FILE" "$NAPCAT_START_FILE" "$QQ_EXECUTABLE" 'NapCat'
+  local failed=0
+  terminate_pid_file "$WORKER_PID_FILE" "$WORKER_START_FILE" "$WORKER_EXECUTABLE" 'Worker' || \
+    failed=1
+  terminate_pid_file "$NAPCAT_PID_FILE" "$NAPCAT_START_FILE" "$QQ_EXECUTABLE" 'NapCat' || \
+    failed=1
+  (( failed == 0 ))
 }
 
 discover_unmanaged() {
@@ -701,6 +705,10 @@ launch_worker_foreground() {
 }
 
 snapshot_switch_state() {
+  if [[ -e $WEBUI_SNAPSHOT || -L $WEBUI_SNAPSHOT || \
+    -e $ACCOUNT_SNAPSHOT || -L $ACCOUNT_SNAPSHOT ]]; then
+    die 'recovery snapshots already exist; recover or remove them before retrying'
+  fi
   if [[ -e $ACCOUNT_FILE || -L $ACCOUNT_FILE ]]; then
     require_owned_regular "$ACCOUNT_FILE" 'saved account' 1
     ACCOUNT_WAS_PRESENT=1
@@ -708,9 +716,6 @@ snapshot_switch_state() {
     ACCOUNT_WAS_PRESENT=0
   fi
 
-  [[ ! -d $WEBUI_SNAPSHOT && ! -d $ACCOUNT_SNAPSHOT ]] || \
-    die 'transaction snapshot path must not be a directory'
-  rm -f -- "$WEBUI_SNAPSHOT" "$ACCOUNT_SNAPSHOT"
   atomic_copy "$WEBUI" "$WEBUI_SNAPSHOT" 0600 || \
     die 'failed to snapshot NapCat WebUI configuration'
   if [[ $ACCOUNT_WAS_PRESENT == 1 ]]; then
