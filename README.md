@@ -26,15 +26,26 @@ QQ 群
 
 ## 本地准备
 
-### 1. NapCat 与专用 QQ
+### 1. NapCat 与本地 QQ 账号
 
-1. 准备一个只用于机器人的 QQ 账号，只加入测试群和明确允许的公司群。
+1. 建议准备一个只用于机器人的 QQ 账号，只加入测试群和明确允许的公司群；也可以扫描并切换到其他 QQ 账号。
 2. 在本机安装并登录 NapCat，启用 OneBot 11 WebSocket 服务。
 3. WebSocket 只监听 `127.0.0.1`，设置强 access token，并把消息格式设为 OneBot 11 array message。
 4. 记录机器人 QQ 号、允许的群号、员工 QQ 号和管理员 QQ 号。配置中均使用十进制字符串。
 5. 不要把 NapCat WebSocket 暴露到局域网或公网。
 
-普通 QQ 账号使用第三方机器人框架存在限制登录、风控或封号风险，应用无法消除该风险。先用专用账号和测试群验证，账号异常时立即停止服务。
+普通 QQ 账号使用第三方机器人框架仍有登录受限、风控或封号风险，应用无法消除该风险。先用专用账号和测试群验证，账号异常时立即停止服务。
+
+本地启动器使用 `onebot.self_id: "auto"`；它会探测本次登录的账号，而不是在配置中固定 QQ 号。`allowed_group_ids` 可以配置多个群，但选中的机器人必须已加入每一个配置群；`employee_ids` 与 `admin_ids` 仍是相互独立的白名单。
+
+```bash
+qqcodex-local start
+qqcodex-local switch-account
+qqcodex-local status
+qqcodex-local stop
+```
+
+`start` 会使用并记住上一次成功的账号；`switch-account` 会发起扫码登录，并且只会在所有配置群验证通过后提交新账号。上述命令用于本地账号操作；下文的通用手动启动方式仍适用于服务器和高级运维。
 
 ### 2. Codex 凭据
 

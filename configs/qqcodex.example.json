@@ -2,7 +2,7 @@
   "onebot": {
     "url": "ws://127.0.0.1:3001",
     "access_token_env": "NAPCAT_ACCESS_TOKEN",
-    "self_id": "10001",
+    "self_id": "auto",
     "message_runes": 1200
   },
   "database_path": "/var/lib/qqcodex-worker/tasks.db",
