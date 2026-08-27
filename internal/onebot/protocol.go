@@ -44,8 +44,8 @@ type GroupMessage struct {
 }
 
 type ActionParams struct {
-	GroupID ID        `json:"group_id"`
-	Message []Segment `json:"message"`
+	GroupID ID        `json:"group_id,omitempty"`
+	Message []Segment `json:"message,omitempty"`
 }
 
 type ActionRequest struct {
@@ -61,6 +61,14 @@ type ActionResponse struct {
 	Message string          `json:"message"`
 	Wording string          `json:"wording"`
 	Echo    string          `json:"echo"`
+}
+
+func LoginInfoAction(echo string) ActionRequest {
+	return ActionRequest{Action: "get_login_info", Echo: echo}
+}
+
+func GroupListAction(echo string) ActionRequest {
+	return ActionRequest{Action: "get_group_list", Echo: echo}
 }
 
 func DecodeGroupMessage(raw []byte, selfID string) (GroupMessage, bool, error) {

@@ -247,6 +247,29 @@ func TestProtocolActionRequestAndResponse(t *testing.T) {
 	}
 }
 
+func TestProtocolProbeActions(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name string
+		got  ActionRequest
+		want string
+	}{
+		{name: "login info", got: LoginInfoAction("login-echo"), want: `{"action":"get_login_info","params":{},"echo":"login-echo"}`},
+		{name: "group list", got: GroupListAction("groups-echo"), want: `{"action":"get_group_list","params":{},"echo":"groups-echo"}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			raw, err := json.Marshal(test.got)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := string(raw); got != test.want {
+				t.Fatalf("action JSON = %s, want %s", got, test.want)
+			}
+		})
+	}
+}
+
 func TestProtocolEscapeCQText(t *testing.T) {
 	t.Parallel()
 
