@@ -91,6 +91,7 @@ git -C /srv/qqcodex-ops/repos/order-api fetch origin main rc
 
 ```bash
 go build -o bin/qqcodex ./cmd/qqcodex
+go build -o bin/qqcodex-probe ./cmd/qqcodex-probe
 go build -o bin/qqcodex-ops ./cmd/qqcodex-ops
 
 realpath bin/qqcodex-ops
@@ -99,7 +100,19 @@ realpath configs/ops.local.json
 
 仅做本地假 RC 功能验证时，把 `qqcodex.local.json` 的 `ops_command` 改为上述两个绝对路径，例如 `["/absolute/path/bin/qqcodex-ops", "-config", "/absolute/path/configs/ops.local.json"]`。该方式让两个进程共享当前 OS 身份，不满足真实 RC 隔离要求。
 
-然后启动 worker：
+#### 本地账号启动器
+
+在仓库根目录安装本地启动器：
+
+```bash
+chmod 700 scripts/qqcodex-local
+mkdir -p "$HOME/.local/bin"
+ln -sfn "$(pwd)/scripts/qqcodex-local" "$HOME/.local/bin/qqcodex-local"
+```
+
+本地启动器依赖 Bash、`jq`、GNU `timeout`（coreutils）、`flock`（util-linux）、`pgrep`（procps）和 `ss`（iproute2）。它还要求环境已提供支持 `--scan` 的 `~/.local/share/napcat/start-napcat.sh`、`~/.local/share/qqcodex-worker/start-worker.sh`、受保护的 NapCat token/配置及本地 worker 配置；这些都是机器环境配置文件，通用仓库构建不会生成它们。
+
+服务器或高级运维仍按通用方式手动启动 worker：
 
 ```bash
 export NAPCAT_ACCESS_TOKEN='onebot-access-token'
